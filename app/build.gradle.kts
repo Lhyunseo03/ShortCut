@@ -14,7 +14,7 @@ android {
     defaultConfig {
         applicationId = "com.example.short_cut"
         minSdk = 30
-        targetSdk = 36
+        targetSdk = 33
         versionCode = 1
         versionName = "1.0"
 

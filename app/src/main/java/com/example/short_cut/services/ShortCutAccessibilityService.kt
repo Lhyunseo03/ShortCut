@@ -20,6 +20,9 @@ class ShortCutAccessibilityService : AccessibilityService() {
         const val TARGET_PACKAGE = "com.google.android.youtube"
         const val SHORTS_ACTIVITY = "com.google.android.apps.youtube.app.watchwhile.MainActivity"
         const val LIMIT = 5
+        const val DEBOUNCE_MS = 300L
+        const val NOISE_MS = 1500L
+        const val NORMAL_SCROLL_LIMIT = 5
     }
 
     private var isInShortsMode = false
@@ -27,6 +30,7 @@ class ShortCutAccessibilityService : AccessibilityService() {
     private var lastCountTime = 0L
     private var shortsEnteredTime = 0L
     private var isPopupShowing = false
+    private var normalScrollCount = 0
     private var windowManager: WindowManager? = null
     private var popupView: android.view.View? = null
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -34,16 +38,16 @@ class ShortCutAccessibilityService : AccessibilityService() {
     override fun onServiceConnected() {
         super.onServiceConnected()
         val info = AccessibilityServiceInfo().apply {
-            eventTypes = AccessibilityEvent.TYPE_VIEW_SCROLLED or
-                    AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
+            eventTypes = AccessibilityEvent.TYPES_ALL_MASK
             packageNames = arrayOf(TARGET_PACKAGE)
             feedbackType = AccessibilityServiceInfo.FEEDBACK_GENERIC
-            flags = AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS
+            flags = AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS or
+                    AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS
             notificationTimeout = 50
         }
         serviceInfo = info
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
-        Log.d(TAG, "✅ 서비스 연결됨")
+        Log.d(TAG, "✅ 서비스 연결됨 | API ${android.os.Build.VERSION.SDK_INT}")
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent) {
@@ -56,51 +60,72 @@ class ShortCutAccessibilityService : AccessibilityService() {
             AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED -> {
                 val className = event.className?.toString() ?: ""
                 if (className == "android.widget.FrameLayout") return
+                if (className == "android.view.ViewGroup") return
                 if (className.contains("Dialog")) return
                 if (className.contains("Sheet")) return
                 Log.d(TAG, "📱 화면: $className")
 
                 if (className != SHORTS_ACTIVITY && isInShortsMode) {
                     isInShortsMode = false
+                    normalScrollCount = 0
                     Log.d(TAG, "🏠 쇼츠모드 OFF (다른 화면)")
                 }
             }
 
+            // API 31: TYPE_VIEW_SCROLLED(4096) + itemCount=-1
             AccessibilityEvent.TYPE_VIEW_SCROLLED -> {
                 val itemCount = event.itemCount
-
-                if (itemCount > 0) {
+                if (itemCount != -1) {
                     if (isInShortsMode) {
-                        isInShortsMode = false
-                        Log.d(TAG, "🔄 쇼츠모드 OFF (일반스크롤)")
+                        normalScrollCount++
+                        if (normalScrollCount >= NORMAL_SCROLL_LIMIT) {
+                            isInShortsMode = false
+                            normalScrollCount = 0
+                            Log.d(TAG, "🔄 쇼츠모드 OFF (일반스크롤)")
+                        }
                     }
                     return
                 }
-
-                if (itemCount == -1) {
-                    if (now - lastCountTime < 1000L) return
-
-                    if (!isInShortsMode) {
-                        isInShortsMode = true
-                        shortsEnteredTime = now
-                        lastCountTime = now
-                        Log.d(TAG, "📺 쇼츠 진입!")
-                        return
-                    }
-
-                    if (now - shortsEnteredTime > 1000L) {
-                        lastCountTime = now
-                        totalShortsCount++
-                        Log.d(TAG, "🎯 쇼츠 스냅! $totalShortsCount / $LIMIT")
-
-                        if (totalShortsCount >= LIMIT) {
-                            showPopup()
-                            totalShortsCount = 0
-                            isInShortsMode = false
-                        }
-                    }
-                }
+                normalScrollCount = 0
+                handleShortsScroll(now)
             }
+
+            // API 36: TYPE_WINDOW_CONTENT_CHANGED(2048)
+            // changeTypes=4099 → 쇼츠 진입
+            // changeTypes=0 → 쇼츠 스와이프
+            AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED -> {
+                val changeTypes = event.contentChangeTypes
+                if (changeTypes != 4099 && changeTypes != 0) return
+                Log.d(TAG, "📡 쇼츠 감지! changeTypes=$changeTypes")
+                handleShortsScroll(now)
+            }
+        }
+    }
+
+    private fun handleShortsScroll(now: Long) {
+        if (now - lastCountTime < DEBOUNCE_MS) return
+
+        if (!isInShortsMode) {
+            isInShortsMode = true
+            shortsEnteredTime = now
+            lastCountTime = now
+            Log.d(TAG, "📺 쇼츠 진입!")
+            return
+        }
+
+        if (now - shortsEnteredTime < NOISE_MS) {
+            Log.d(TAG, "⏳ 진입 노이즈 무시")
+            return
+        }
+
+        lastCountTime = now
+        totalShortsCount++
+        Log.d(TAG, "🎯 쇼츠 스냅! $totalShortsCount / $LIMIT")
+
+        if (totalShortsCount >= LIMIT) {
+            showPopup()
+            totalShortsCount = 0
+            isInShortsMode = false
         }
     }
 
