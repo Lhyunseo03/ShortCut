@@ -40,6 +40,9 @@ android {
 }
 
 dependencies {
+    //Socket.IO는 서버랑 Android가 실시간으로 통신하는 도구인데, Android에 기본으로 안 들어있어요.
+    //build.gradle에 한 줄 추가하는 게 바로 그 설치 과정이에요. Sync Now 누르면 Gradle이 인터넷에서 자동으로 받아와요.
+    implementation("io.socket:socket.io-client:2.1.0")
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
     implementation(libs.androidx.activity.compose)

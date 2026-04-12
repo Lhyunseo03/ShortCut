@@ -12,6 +12,10 @@ import android.view.accessibility.AccessibilityEvent
 import android.util.Log
 import android.widget.Button
 import com.example.short_cut.R
+// SocketManager.kt 파일을 이 파일에서 쓰겠다고 선언하는 거예요.
+// 이게 없으면 아래 코드들이 "SocketManager가 뭔지 모르겠다"고 에러 내요.
+import com.example.short_cut.SocketManager
+
 
 class ShortCutAccessibilityService : AccessibilityService() {
 
@@ -35,6 +39,11 @@ class ShortCutAccessibilityService : AccessibilityService() {
     private var popupView: android.view.View? = null
     private val mainHandler = Handler(Looper.getMainLooper())
 
+    //로그인할 때 닉네임을 short_cut_prefs에 저장해뒀으면 그 값을 읽어오고, 없으면 "unknown_user"로 대신 써요.
+    private val userId: String
+        get() = getSharedPreferences("short_cut_prefs", MODE_PRIVATE)
+            .getString("userId", "unknown_user") ?: "unknown_user"
+
     override fun onServiceConnected() {
         super.onServiceConnected()
         val info = AccessibilityServiceInfo().apply {
@@ -48,6 +57,9 @@ class ShortCutAccessibilityService : AccessibilityService() {
         serviceInfo = info
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
         Log.d(TAG, "✅ 서비스 연결됨 | API ${android.os.Build.VERSION.SDK_INT}")
+        // 서비스가 켜지는 순간 서버에 연결해요.
+        // 접근성 서비스가 활성화되자마자 소켓 연결도 같이 시작되는 거예요. 여기서 안 하면 스크롤 감지해도 보낼 곳이 없어요.
+        SocketManager.connect()
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent) {
@@ -120,6 +132,14 @@ class ShortCutAccessibilityService : AccessibilityService() {
 
         lastCountTime = now
         totalShortsCount++
+
+        //쇼츠를 한 번 스와이프할 때마다 서버로 데이터를 전송하는 부분이에요.
+        // totalShortsCount++ 바로 다음에 있어서 카운트가 올라갈 때마다 즉시 서버에 알려줘요.
+        SocketManager.emitScrollEvent(
+            userId      = userId,
+            appPkg      = TARGET_PACKAGE,
+            scrollCount = totalShortsCount
+        )
         Log.d(TAG, "🎯 쇼츠 스냅! $totalShortsCount / $LIMIT")
 
         if (totalShortsCount >= LIMIT) {
@@ -180,5 +200,8 @@ class ShortCutAccessibilityService : AccessibilityService() {
     override fun onDestroy() {
         dismissPopup()
         super.onDestroy()
+        // 서비스가 꺼질 때 소켓 연결도 같이 정리해요.
+        // 이게 없으면 앱을 꺼도 연결이 계속 남아서 배터리랑 네트워크를 낭비해요.
+        SocketManager.disconnect()
     }
 }
