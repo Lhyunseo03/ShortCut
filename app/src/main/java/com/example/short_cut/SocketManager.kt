@@ -23,6 +23,7 @@ object SocketManager {
     //private const val SERVER_URL = "http://10.0.2.2:3000"
     //잠깐 밑에걸로 바꿔놈
     private const val SERVER_URL = "http://localhost:3000"
+    //실제 기기 연결하면 바꿀거에요
 
     private var socket: Socket? = null
     val isConnected: Boolean get() = socket?.connected() == true
@@ -51,7 +52,7 @@ object SocketManager {
                 on(Socket.EVENT_CONNECT_ERROR) { args ->
                     Log.e(TAG, "❌ 연결 오류: ${args.firstOrNull()}")
                 }*/
-
+                //연결 오류 왜나는지 확인하는 코드
                 on(Socket.EVENT_CONNECT_ERROR) { args ->
                     val error = args.firstOrNull()
                     if (error is Exception) {
