@@ -47,8 +47,20 @@ object SocketManager {
                     val reason = args.firstOrNull()?.toString() ?: "unknown"
                     Log.w(TAG, "🔌 연결 해제 — reason: $reason")
                 }
+                /*
                 on(Socket.EVENT_CONNECT_ERROR) { args ->
                     Log.e(TAG, "❌ 연결 오류: ${args.firstOrNull()}")
+                }*/
+
+                on(Socket.EVENT_CONNECT_ERROR) { args ->
+                    val error = args.firstOrNull()
+                    if (error is Exception) {
+                        Log.e(TAG, "❌ 연결 오류: ${error.message}")
+                        Log.e(TAG, "❌ 원인1: ${error.cause?.message}")
+                        Log.e(TAG, "❌ 원인2: ${error.cause?.cause?.message}")
+                    } else {
+                        Log.e(TAG, "❌ 연결 오류: $error")
+                    }
                 }
                 connect()
             }
