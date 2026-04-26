@@ -49,6 +49,7 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun LoginScreen(onLoginSuccess: () -> Unit = {}) {
     var nickname by remember { mutableStateOf("") }
+    val context = LocalContext.current  // SharedPreferences 접근을 위해 context 가져오기
 
     Box(
         modifier = Modifier
@@ -91,7 +92,9 @@ fun LoginScreen(onLoginSuccess: () -> Unit = {}) {
             Button(
                 onClick = {
                     if (nickname.isNotBlank()) {
-                        // TODO: 카카오 로그인 로직 → 완료 후 onLoginSuccess() 호출
+                        // 닉네임을 SharedPreferences에 userId로 저장 → SocketManager에서 읽어서 서버로 전송
+                        val prefs = context.getSharedPreferences("short_cut_prefs", android.content.Context.MODE_PRIVATE)
+                        prefs.edit().putString("userId", nickname.trim()).apply()
                         onLoginSuccess()
                     }
                 },
