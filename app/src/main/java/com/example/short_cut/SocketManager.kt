@@ -22,8 +22,10 @@ object SocketManager {
     // 에뮬레이터:    "http://10.0.2.2:3000"
     //private const val SERVER_URL = "http://10.0.2.2:3000"
     //잠깐 밑에걸로 바꿔놈
-    private const val SERVER_URL = "http://localhost:3000"
+    //private const val SERVER_URL = "http://localhost:3000"
     //실제 기기 연결하면 바꿀거에요
+    private const val SERVER_URL = "https://short-cut-server-production.up.railway.app"
+
 
     private var socket: Socket? = null
     val isConnected: Boolean get() = socket?.connected() == true
@@ -38,6 +40,7 @@ object SocketManager {
                 reconnectionAttempts = 5
                 reconnectionDelay  = 2000L   // 2초 후 재연결 시도
                 timeout            = 10000L  // 10초 연결 타임아웃
+                transports = arrayOf("polling")  // Railway 환경에서 WebSocket 대신 HTTP polling 강제
             }
 
             socket = IO.socket(URI.create(SERVER_URL), options).apply {
