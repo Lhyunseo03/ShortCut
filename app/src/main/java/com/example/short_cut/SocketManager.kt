@@ -32,6 +32,7 @@ object SocketManager {
 
     // ── 연결 ──────────────────────────────────────────────
     fun connect() {
+        Log.d(TAG, "connect() 호출됨 — isConnected: $isConnected")  // ← 추가
         if (isConnected) return
 
         try {
