@@ -13,6 +13,7 @@ import android.view.accessibility.AccessibilityNodeInfo
 import android.util.Log
 import android.widget.Button
 import com.example.short_cut.R
+import com.example.short_cut.SocketManager
 
 class ShortCutAccessibilityService : AccessibilityService() {
 
@@ -49,6 +50,9 @@ class ShortCutAccessibilityService : AccessibilityService() {
         serviceInfo = info
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
         Log.d(TAG, "✅ 서비스 연결됨 | API ${android.os.Build.VERSION.SDK_INT}")
+
+        SocketManager.connect()
+        Log.d(TAG, "🔌 소켓 연결 시도")
     }
 
     private fun getShortsNodeCount(): Int {
@@ -138,6 +142,16 @@ class ShortCutAccessibilityService : AccessibilityService() {
         lastCountTime = now
         totalShortsCount++
         Log.d(TAG, "🎯 쇼츠 스냅! $totalShortsCount / $LIMIT")
+
+        val prefs = getSharedPreferences("short_cut_prefs", MODE_PRIVATE)
+        val userId = prefs.getString("userId", "unknown") ?: "unknown"
+        SocketManager.emitScrollEvent(
+            userId = userId,
+            appPkg = TARGET_PACKAGE,
+            scrollCount = totalShortsCount
+        ) { status, message ->
+            Log.d(TAG, "📡 ACK: $status / $message")
+        }
 
         if (totalShortsCount >= LIMIT) {
             showPopup()
