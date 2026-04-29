@@ -21,7 +21,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.short_cut.ui.theme.ShortCutTheme
 
-// ✅ 화면 상태 정의
+// 화면 상태 정의
 enum class Screen {
     LOGIN, ACCESSIBILITY_GUIDE
 }
@@ -31,7 +31,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         setContent {
             ShortCutTheme {
-                // ✅ 현재 어떤 화면인지 상태로 관리
+                // 현재 어떤 화면인지 상태로 관리
                 var currentScreen by remember { mutableStateOf(Screen.LOGIN) }
 
                 when (currentScreen) {
@@ -45,7 +45,7 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-// ✅ 로그인 화면 - onLoginSuccess 콜백 추가
+// 로그인 화면 - onLoginSuccess 콜백 추가
 @Composable
 fun LoginScreen(onLoginSuccess: () -> Unit = {}) {
     var nickname by remember { mutableStateOf("") }
@@ -70,11 +70,7 @@ fun LoginScreen(onLoginSuccess: () -> Unit = {}) {
                 color = Color(0xFF1A1A1A)
             )
 
-            Text(
-                text = "숏폼 중독, 이제 끊어내세요",
-                fontSize = 14.sp,
-                color = Color(0xFF888888)
-            )
+
 
             Spacer(modifier = Modifier.height(16.dp))
 
@@ -107,7 +103,7 @@ fun LoginScreen(onLoginSuccess: () -> Unit = {}) {
                 )
             ) {
                 Text(
-                    text = "카카오톡으로 시작하기",
+                    text = "등록하기",
                     color = Color(0xFF191919),
                     fontWeight = FontWeight.Bold,
                     fontSize = 16.sp
@@ -117,7 +113,7 @@ fun LoginScreen(onLoginSuccess: () -> Unit = {}) {
     }
 }
 
-// ✅ 새로 추가된 접근성 안내 화면
+//  접근성 안내 화면
 @Composable
 fun AccessibilityGuideScreen() {
     val context = LocalContext.current
@@ -135,7 +131,7 @@ fun AccessibilityGuideScreen() {
             modifier = Modifier.fillMaxWidth()
         ) {
             Text(
-                text = "거의 다 왔어요!",
+                text = "접근성 권한 설정하기",
                 fontSize = 28.sp,
                 fontWeight = FontWeight.ExtraBold,
                 color = Color(0xFF1A1A1A)

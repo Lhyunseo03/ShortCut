@@ -49,10 +49,10 @@ class ShortCutAccessibilityService : AccessibilityService() {
         }
         serviceInfo = info
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
-        Log.d(TAG, "✅ 서비스 연결됨 | API ${android.os.Build.VERSION.SDK_INT}")
+        Log.d(TAG, "서비스 연결 | API ${android.os.Build.VERSION.SDK_INT}")
 
         SocketManager.connect()
-        Log.d(TAG, "🔌 소켓 연결 시도")
+        Log.d(TAG, "소켓 연결")
     }
 
     private fun getShortsNodeCount(): Int {
@@ -99,12 +99,12 @@ class ShortCutAccessibilityService : AccessibilityService() {
                     lastCountTime = now
                     lastNodeCount = nodeCount
                     lastContentDesc = getShortsFingerprint()
-                    Log.d(TAG, "📺 쇼츠 진입! 노드=$nodeCount")
-                    Log.d(TAG, "📝 fingerprint=$lastContentDesc")
+                    Log.d(TAG, "쇼츠 진입 노드=$nodeCount")
+                    Log.d(TAG, "fingerprint=$lastContentDesc")
                 } else if (nodeCount == 0 && isInShortsMode) {
                     isInShortsMode = false
                     lastNodeCount = 0
-                    Log.d(TAG, "🏠 쇼츠모드 OFF")
+                    Log.d(TAG, "쇼츠모드 OFF")
                 }
             }
 
@@ -115,15 +115,15 @@ class ShortCutAccessibilityService : AccessibilityService() {
 
                 if (lastNodeCount == 2 && nodeCount == 1) {
                     val currentDesc = getShortsFingerprint()
-                    Log.d(TAG, "📡 2→1 | 이전=$lastContentDesc")
-                    Log.d(TAG, "📡 2→1 | 현재=$currentDesc")
+                    Log.d(TAG, "2→1 | 이전=$lastContentDesc")
+                    Log.d(TAG, "2→1 | 현재=$currentDesc")
 
                     if (currentDesc != lastContentDesc && currentDesc.isNotEmpty()) {
                         lastContentDesc = currentDesc
-                        Log.d(TAG, "📡 영상 변경 확인!")
+                        Log.d(TAG, "영상 변경 확인")
                         countShorts(now)
                     } else {
-                        Log.d(TAG, "📡 스크롤 취소 (같은 영상)")
+                        Log.d(TAG, "스크롤 취소 (같은 영상)")
                     }
                 }
 
@@ -134,14 +134,14 @@ class ShortCutAccessibilityService : AccessibilityService() {
 
     private fun countShorts(now: Long) {
         if (now - shortsEnteredTime < NOISE_MS) {
-            Log.d(TAG, "⏳ 진입 노이즈 무시")
+            Log.d(TAG, "진입 노이즈 무시")
             return
         }
         if (now - lastCountTime < DEBOUNCE_MS) return
 
         lastCountTime = now
         totalShortsCount++
-        Log.d(TAG, "🎯 쇼츠 스냅! $totalShortsCount / $LIMIT")
+        Log.d(TAG, "쇼츠 스냅 $totalShortsCount / $LIMIT")
 
         val prefs = getSharedPreferences("short_cut_prefs", MODE_PRIVATE)
         val userId = prefs.getString("userId", "unknown") ?: "unknown"
@@ -150,7 +150,7 @@ class ShortCutAccessibilityService : AccessibilityService() {
             appPkg = TARGET_PACKAGE,
             scrollCount = totalShortsCount
         ) { status, message ->
-            Log.d(TAG, "📡 ACK: $status / $message")
+            Log.d(TAG, "ACK: $status / $message")
         }
 
         if (totalShortsCount >= LIMIT) {
@@ -185,12 +185,12 @@ class ShortCutAccessibilityService : AccessibilityService() {
 
             view.findViewById<Button>(R.id.btnIgnore).setOnClickListener {
                 dismissPopup()
-                Log.d(TAG, "⚠️ 사용자가 무시함 → 그룹 알림 예정")
+                Log.d(TAG, "ignore 선택 → 그룹 알림 예정")
             }
 
             windowManager?.addView(view, params)
             popupView = view
-            Log.d(TAG, "🚨 팝업 표시!")
+            Log.d(TAG, "차단 팝업")
         }
     }
 
@@ -204,7 +204,7 @@ class ShortCutAccessibilityService : AccessibilityService() {
 
     override fun onInterrupt() {
         dismissPopup()
-        Log.d(TAG, "⚠️ 서비스 중단됨")
+        Log.d(TAG, "서비스 중단됨")
     }
 
     override fun onDestroy() {

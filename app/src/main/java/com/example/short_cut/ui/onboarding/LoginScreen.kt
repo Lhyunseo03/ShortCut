@@ -52,11 +52,7 @@ fun LoginScreen() {
                 color = Color(0xFF1A1A1A)
             )
 
-            Text(
-                text = "숏폼 중독, 이제 끊어내세요",
-                fontSize = 14.sp,
-                color = Color(0xFF888888)
-            )
+
 
             Spacer(modifier = Modifier.height(16.dp))
 
@@ -84,7 +80,7 @@ fun LoginScreen() {
                 )
             ) {
                 Text(
-                    text = "카카오톡으로 시작하기",
+                    text = "등록하기",
                     color = Color(0xFF191919),
                     fontWeight = FontWeight.Bold,
                     fontSize = 16.sp

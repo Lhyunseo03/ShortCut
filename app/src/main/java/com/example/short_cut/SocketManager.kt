@@ -46,25 +46,25 @@ object SocketManager {
 
             socket = IO.socket(URI.create(SERVER_URL), options).apply {
                 on(Socket.EVENT_CONNECT) {
-                    Log.i(TAG, "✅ 서버 연결됨 — id: ${id()}")
+                    Log.i(TAG, "서버 연결 — id: ${id()}")
                 }
                 on(Socket.EVENT_DISCONNECT) { args ->
                     val reason = args.firstOrNull()?.toString() ?: "unknown"
-                    Log.w(TAG, "🔌 연결 해제 — reason: $reason")
+                    Log.w(TAG, "연결 해제 — reason: $reason")
                 }
                 /*
                 on(Socket.EVENT_CONNECT_ERROR) { args ->
-                    Log.e(TAG, "❌ 연결 오류: ${args.firstOrNull()}")
+                    Log.e(TAG, "연결 오류: ${args.firstOrNull()}")
                 }*/
                 //연결 오류 왜나는지 확인하는 코드
                 on(Socket.EVENT_CONNECT_ERROR) { args ->
                     val error = args.firstOrNull()
                     if (error is Exception) {
-                        Log.e(TAG, "❌ 연결 오류: ${error.message}")
-                        Log.e(TAG, "❌ 원인1: ${error.cause?.message}")
-                        Log.e(TAG, "❌ 원인2: ${error.cause?.cause?.message}")
+                        Log.e(TAG, "연결 오류: ${error.message}")
+                        Log.e(TAG, "원인1: ${error.cause?.message}")
+                        Log.e(TAG, "원인2: ${error.cause?.cause?.message}")
                     } else {
-                        Log.e(TAG, "❌ 연결 오류: $error")
+                        Log.e(TAG, "연결 오류: $error")
                     }
                 }
                 connect()
