@@ -167,8 +167,11 @@ class ShortCutAccessibilityService : AccessibilityService() {
             val inflater = LayoutInflater.from(this)
             val view = inflater.inflate(R.layout.overlay_popup, null)
 
+            val widthInDp = 250
+            val widthInPx = (widthInDp * resources.displayMetrics.density).toInt()
+
             val params = WindowManager.LayoutParams(
-                WindowManager.LayoutParams.WRAP_CONTENT,
+                widthInPx,
                 WindowManager.LayoutParams.WRAP_CONTENT,
                 WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
