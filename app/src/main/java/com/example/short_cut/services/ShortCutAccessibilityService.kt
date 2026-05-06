@@ -127,7 +127,11 @@ class ShortCutAccessibilityService : AccessibilityService() {
         } else {
             Log.d(TAG, "저장된 limit 없음 — 기본값 사용 (hourly: $hourlyLimit, daily: $dailyLimit)")
         }
+        // 테스트용 — limit 설정 UI 구현 후 삭제
+        hourlyLimit = 5
+        dailyLimit = 10
     }
+
 
     // 오늘 자정(00:00:00) 타임스탬프 계산
     private fun getStartOfDayTimestamp(): Long {
