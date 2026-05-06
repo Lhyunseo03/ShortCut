@@ -10,5 +10,6 @@ plugins {
 
     // KSP (Kotlin Symbol Processing) — Room DB 어노테이션 처리에 사용
     // kapt 대신 KSP를 사용하는 이유: 최신 Kotlin과 호환되고 빌드 속도가 더 빠름
-    id("com.google.devtools.ksp") version "2.0.21-1.0.28" apply false
+    // KSP — libs.versions.toml에 정의된 버전 사용 (2.2.10-2.0.2)
+    alias(libs.plugins.ksp) apply false
 }

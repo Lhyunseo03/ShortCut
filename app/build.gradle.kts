@@ -54,9 +54,9 @@ dependencies {
     implementation("io.socket:socket.io-client:2.1.0")
 
     // Room DB — 로컬 데이터베이스 (스크롤 기록, limit 설정 저장용)
-    implementation("androidx.room:room-runtime:2.6.1")  // Room 핵심 라이브러리
-    implementation("androidx.room:room-ktx:2.6.1")      // Kotlin 코루틴 지원 (suspend 함수 사용 가능)
-    ksp("androidx.room:room-compiler:2.6.1")            // DAO 코드 자동 생성 (kapt → ksp로 변경)
+    implementation("androidx.room:room-runtime:2.7.1")  // Room 핵심 라이브러리
+    implementation("androidx.room:room-ktx:2.7.1")      // Kotlin 코루틴 지원 (suspend 함수 사용 가능)
+    ksp("androidx.room:room-compiler:2.7.1")            // DAO 코드 자동 생성 (kapt → ksp로 변경)
 
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
