@@ -1,6 +1,13 @@
 plugins {
+    // Android 앱 모듈 플러그인
     alias(libs.plugins.android.application)
+
+    // Jetpack Compose 컴파일러 플러그인
     alias(libs.plugins.kotlin.compose)
+
+    // KSP — Room DB 어노테이션 처리기
+    // kapt 대신 KSP 사용: 최신 Kotlin과 호환되고 빌드 속도가 더 빠름
+    id("com.google.devtools.ksp")
 }
 
 android {
@@ -40,9 +47,17 @@ android {
 }
 
 dependencies {
-    //Socket.IO는 서버랑 Android가 실시간으로 통신하는 도구인데, Android에 기본으로 안 들어있어요.
-    //build.gradle에 한 줄 추가하는 게 바로 그 설치 과정이에요. Sync Now 누르면 Gradle이 인터넷에서 자동으로 받아와요.
+
+    // Socket.IO — 서버와 Android 간 실시간 통신 라이브러리
+    // Android에 기본 내장이 아니라서 별도로 추가 필요
+    // Sync Now 누르면 Gradle이 인터넷에서 자동으로 받아옴
     implementation("io.socket:socket.io-client:2.1.0")
+
+    // Room DB — 로컬 데이터베이스 (스크롤 기록, limit 설정 저장용)
+    implementation("androidx.room:room-runtime:2.6.1")  // Room 핵심 라이브러리
+    implementation("androidx.room:room-ktx:2.6.1")      // Kotlin 코루틴 지원 (suspend 함수 사용 가능)
+    ksp("androidx.room:room-compiler:2.6.1")            // DAO 코드 자동 생성 (kapt → ksp로 변경)
+
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
     implementation(libs.androidx.activity.compose)
