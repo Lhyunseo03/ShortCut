@@ -58,6 +58,9 @@ dependencies {
     implementation("androidx.room:room-ktx:2.7.1")      // Kotlin 코루틴 지원 (suspend 함수 사용 가능)
     ksp("androidx.room:room-compiler:2.7.1")            // DAO 코드 자동 생성 (kapt → ksp로 변경)
 
+    // OkHttp — REST API HTTP 요청용 라이브러리 (POST /violations 전송에 사용)
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
+
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
     implementation(libs.androidx.activity.compose)

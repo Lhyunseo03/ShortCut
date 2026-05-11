@@ -21,6 +21,11 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.RequestBody.Companion.toRequestBody
+
+// 마지막으로 체크한 hourly 스크롤 횟수 — violation 전송 시 사용
+private var lastHourlyCount = 0
 
 class ShortCutAccessibilityService : AccessibilityService() {
 
@@ -74,6 +79,26 @@ class ShortCutAccessibilityService : AccessibilityService() {
     private var popupView: android.view.View? = null
     private val mainHandler = Handler(Looper.getMainLooper())
 
+    // daily limit 초과 여부 — true이면 하루 동안 팝업 재발생 안 함
+    private var isDailyLimitReached = false
+
+    // ── 배치 전송 ─────────────────────────────────────────────
+    // 아직 서버에 전송하지 않은 누적 스크롤 횟수 — 10개 쌓이거나 5분 경과 시 전송
+    private var batchScrollCount = 0
+
+    // 배치 전송 트리거 횟수 — 이 횟수만큼 누적되면 즉시 전송
+    private val BATCH_SIZE = 10
+
+    // 5분 타이머를 관리하는 핸들러 — 메인 스레드에서 실행
+    private val batchHandler = Handler(Looper.getMainLooper())
+
+    // 5분마다 실행되는 타이머 Runnable
+    // 누적된 스크롤을 전송하고 다시 5분 예약
+    private val batchTimerRunnable = Runnable {
+        flushBatch()         // 누적된 배치 전송
+        scheduleBatchTimer() // 다시 5분 예약
+    }
+
     override fun onServiceConnected() {
         super.onServiceConnected()
         val info = AccessibilityServiceInfo().apply {
@@ -100,10 +125,18 @@ class ShortCutAccessibilityService : AccessibilityService() {
         Log.d(TAG, "서비스 연결 | API ${android.os.Build.VERSION.SDK_INT}")
         SocketManager.connect()
         Log.d(TAG, "소켓 연결")
+
+        // DB 및 소켓 초기화 완료 후 배치 타이머 시작
+        // 5분마다 누적된 스크롤 횟수를 서버로 전송
+        scheduleBatchTimer()
     }
 
     // 서비스 시작 시 Room DB에서 데이터 초기화
     private suspend fun initializeOnStart() {
+        // 테스트용 — limit 설정 UI 구현 후 삭제
+        hourlyLimit = 5
+        dailyLimit = 10
+
         val now = System.currentTimeMillis()
 
         // 1주일 이상 된 스크롤 기록 삭제
@@ -119,6 +152,18 @@ class ShortCutAccessibilityService : AccessibilityService() {
         // 사용자 limit 설정 불러오기 (없으면 기본값 유지)
         val prefs = getSharedPreferences("short_cut_prefs", MODE_PRIVATE)
         val userId = prefs.getString("userId", "unknown") ?: "unknown"
+
+        // userId가 바뀌었으면 Room DB 초기화 (다른 유저 데이터 복원 방지)
+        val lastUserId = prefs.getString("lastUserId", "") ?: ""
+        if (userId != lastUserId) {
+            scrollHistoryDao.deleteOlderThan(System.currentTimeMillis() + 1L) // 전체 삭제
+            prefs.edit().putString("lastUserId", userId).apply()
+            dailyCount = 0
+            isDailyLimitReached = false
+            Log.d(TAG, "userId 변경 감지 → Room DB 초기화 (이전: $lastUserId, 현재: $userId)")
+            return
+        }
+
         val userLimit = userLimitDao.getLimit(userId)
         if (userLimit != null) {
             hourlyLimit = userLimit.hourlyLimit
@@ -127,11 +172,12 @@ class ShortCutAccessibilityService : AccessibilityService() {
         } else {
             Log.d(TAG, "저장된 limit 없음 — 기본값 사용 (hourly: $hourlyLimit, daily: $dailyLimit)")
         }
-        // 테스트용 — limit 설정 UI 구현 후 삭제
-        hourlyLimit = 5
-        dailyLimit = 10
-    }
 
+        // dailyCount가 이미 limit 이상이면 플래그 true로 복원 (앱 재시작 시 팝업 중복 방지)
+        // limit 로드 후에 판단해야 정확함
+        isDailyLimitReached = dailyCount >= dailyLimit
+        Log.d(TAG, "daily limit 플래그 복원: $isDailyLimitReached (dailyCount: $dailyCount, dailyLimit: $dailyLimit)")
+    }
 
     // 오늘 자정(00:00:00) 타임스탬프 계산
     private fun getStartOfDayTimestamp(): Long {
@@ -236,39 +282,47 @@ class ShortCutAccessibilityService : AccessibilityService() {
             // daily 카운트 증가 (메모리 변수)
             dailyCount++
 
+            // 배치 카운터 증가 — BATCH_SIZE(10개) 쌓이면 즉시 서버 전송
+            batchScrollCount++
+            if (batchScrollCount >= BATCH_SIZE) {
+                flushBatch()
+            }
+
             // 최근 1시간 스크롤 횟수 조회 (슬라이딩 윈도우)
             val oneHourAgo = now - (60 * 60 * 1000L)
             val hourlyCount = scrollHistoryDao.countLastHour(oneHourAgo)
+            lastHourlyCount = hourlyCount  // ← 추가
 
             Log.d(TAG, "스크롤 카운트 — hourly: $hourlyCount/$hourlyLimit, daily: $dailyCount/$dailyLimit")
 
             // 소켓 이벤트 전송
             val prefs = getSharedPreferences("short_cut_prefs", MODE_PRIVATE)
             val userId = prefs.getString("userId", "unknown") ?: "unknown"
-            SocketManager.emitScrollEvent(
-                userId = userId,
-                appPkg = TARGET_PACKAGE,
-                scrollCount = hourlyCount
-            ) { status, message ->
-                Log.d(TAG, "ACK: $status / $message")
-            }
+            // 1씩 전송하는 코드 있었는데 지웠어용
 
             // ignore 후 추가 감지 모드인 경우
             if (isPostIgnoreMode) {
                 postIgnoreCount++
                 Log.d(TAG, "post-ignore 카운트: $postIgnoreCount / $POST_IGNORE_THRESHOLD")
 
+                // daily limit 초과 시 post-ignore 모드 중에도 개입
+                if (dailyCount >= dailyLimit && !isDailyLimitReached) {
+                    isDailyLimitReached = true
+                    isPostIgnoreMode = false
+                    postIgnoreCount = 0
+                    Log.d(TAG, "daily limit 초과 (post-ignore 중) → 팝업")
+                    withContext(Dispatchers.Main) { showPopup("daily") }
+                    return@launch
+                }
+
                 if (postIgnoreCount >= POST_IGNORE_THRESHOLD) {
-                    // 10번 더 본 후 binge 상태인지 확인
                     isPostIgnoreMode = false
                     postIgnoreCount = 0
 
                     if (hourlyCount >= hourlyLimit) {
-                        // 아직 binge 상태 → 팝업 다시 표시
                         Log.d(TAG, "post-ignore binge 감지 → 팝업")
-                        withContext(Dispatchers.Main) { showPopup() }
+                        withContext(Dispatchers.Main) { showPopup("hourly") }
                     } else {
-                        // binge 아님 → 일반 모드로 복귀
                         Log.d(TAG, "post-ignore 정상 → 일반 모드 복귀")
                     }
                 }
@@ -278,19 +332,20 @@ class ShortCutAccessibilityService : AccessibilityService() {
             // hourly limit 초과 체크
             if (hourlyCount >= hourlyLimit) {
                 Log.d(TAG, "hourly limit 초과 → 팝업")
-                withContext(Dispatchers.Main) { showPopup() }
+                withContext(Dispatchers.Main) { showPopup("hourly") }
                 return@launch
             }
 
             // daily limit 초과 체크
-            if (dailyCount >= dailyLimit) {
+            if (dailyCount >= dailyLimit && !isDailyLimitReached) {
+                isDailyLimitReached = true
                 Log.d(TAG, "daily limit 초과 → 팝업")
-                withContext(Dispatchers.Main) { showPopup() }
+                withContext(Dispatchers.Main) { showPopup("daily") }
             }
         }
     }
 
-    private fun showPopup() {
+    private fun showPopup(limitType: String) {
         if (isPopupShowing) return
         isPopupShowing = true
 
@@ -314,20 +369,104 @@ class ShortCutAccessibilityService : AccessibilityService() {
 
             view.findViewById<Button>(R.id.btnStop).setOnClickListener {
                 dismissPopup()
+                // stop 선택 → violation 서버 전송
+                sendViolation(limitType, lastHourlyCount, "stop")
                 performGlobalAction(GLOBAL_ACTION_HOME)
             }
 
             view.findViewById<Button>(R.id.btnIgnore).setOnClickListener {
                 dismissPopup()
-                // ignore 선택 → post-ignore 모드 시작
+                // ignore 선택 → violation 서버 전송
+                sendViolation(limitType, lastHourlyCount, "ignore")
                 isPostIgnoreMode = true
                 postIgnoreCount = 0
-                Log.d(TAG, "ignore 선택 → post-ignore 모드 시작 (${POST_IGNORE_THRESHOLD}회 감지)")
+                Log.d(TAG, "ignore 선택 → post-ignore 모드 시작")
             }
 
             windowManager?.addView(view, params)
             popupView = view
             Log.d(TAG, "차단 팝업 표시")
+        }
+    }
+
+    // violation 발생 시 서버로 POST /violations 전송
+    // limitType: "hourly" 또는 "daily", action: "stop" 또는 "ignore"
+    private fun sendViolation(limitType: String, scrollCount: Int, action: String) {
+        val prefs = getSharedPreferences("short_cut_prefs", MODE_PRIVATE)
+        val userId = prefs.getString("userId", "unknown") ?: "unknown"
+
+        val json = """
+        {
+            "userId": "$userId",
+            "timestamp": ${System.currentTimeMillis()},
+            "limitType": "$limitType",
+            "scrollCount": $scrollCount,
+            "action": "$action"
+        }
+    """.trimIndent()
+
+        serviceScope.launch {
+            try {
+                val client = okhttp3.OkHttpClient()
+                val mediaType = "application/json".toMediaType()
+                val body = json.toRequestBody(mediaType)
+                val request = okhttp3.Request.Builder()
+                    .url("https://short-cut-server-production.up.railway.app/violations")
+                    .post(body)
+                    .build()
+
+                val response = client.newCall(request).execute()
+                Log.d(TAG, "violation 전송 완료 — ${response.code}")
+            } catch (e: Exception) {
+                Log.e(TAG, "violation 전송 실패 — ${e.message}")
+            }
+        }
+    }
+
+    // 5분 후 batchTimerRunnable 실행 예약
+// onServiceConnected에서 최초 1회 호출, 이후 타이머가 스스로 재예약
+    private fun scheduleBatchTimer() {
+        batchHandler.postDelayed(batchTimerRunnable, 5 * 60 * 1000L)
+    }
+
+    // 누적된 스크롤 횟수를 서버로 전송하고 카운터 초기화
+// 누적 횟수가 0이면 전송하지 않음 (불필요한 요청 방지)
+    private fun flushBatch() {
+        val count = batchScrollCount
+        if (count <= 0) return
+        batchScrollCount = 0
+        sendUserLog(count)
+    }
+
+    // 서버로 POST /userlog 전송 — 배치 기간 동안 누적된 스크롤 횟수 저장
+// Firestore userLogs에 저장되어 일간/주간/월간 통계에 활용
+    private fun sendUserLog(scrollCount: Int) {
+        val prefs = getSharedPreferences("short_cut_prefs", MODE_PRIVATE)
+        val userId = prefs.getString("userId", "unknown") ?: "unknown"
+
+        val json = """
+        {
+            "userId": "$userId",
+            "timestamp": ${System.currentTimeMillis()},
+            "scrollCount": $scrollCount
+        }
+    """.trimIndent()
+
+        serviceScope.launch {
+            try {
+                val client = okhttp3.OkHttpClient()
+                val mediaType = "application/json".toMediaType()
+                val body = json.toRequestBody(mediaType)
+                val request = okhttp3.Request.Builder()
+                    .url("https://short-cut-server-production.up.railway.app/userlogs")
+                    .post(body)
+                    .build()
+
+                val response = client.newCall(request).execute()
+                Log.d(TAG, "userLog 배치 전송 완료 — scrollCount: $scrollCount, ${response.code}")
+            } catch (e: Exception) {
+                Log.e(TAG, "userLog 배치 전송 실패 — ${e.message}")
+            }
         }
     }
 
@@ -346,6 +485,9 @@ class ShortCutAccessibilityService : AccessibilityService() {
 
     override fun onDestroy() {
         dismissPopup()
+        // 타이머 취소 + 남은 배치 전송 (서비스 종료 전에 실행해야 함)
+        batchHandler.removeCallbacks(batchTimerRunnable)
+        flushBatch()
         super.onDestroy()
     }
 }
