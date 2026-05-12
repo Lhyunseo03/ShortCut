@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(dir *)",
+      "PowerShell(Test-Path *)",
+      "PowerShell(.\\\\gradlew.bat :app:installDebug 2>&1 | Select-Object -Last 80)",
+      "PowerShell($adb = \"$env:LOCALAPPDATA\\\\Android\\\\Sdk\\\\platform-tools\\\\adb.exe\"; & $adb logcat -c; & $adb shell am force-stop com.example.short_cut; & $adb shell am start -n com.example.short_cut/.MainActivity)",
+      "PowerShell(.\\\\gradlew.bat :app:installDebug 2>&1 | Select-Object -Last 40)",
+      "PowerShell($adb = \"$env:LOCALAPPDATA\\\\Android\\\\Sdk\\\\platform-tools\\\\adb.exe\"; & $adb shell am force-stop com.example.short_cut; & $adb shell am start -n com.example.short_cut/.MainActivity)",
+      "PowerShell(.\\\\gradlew.bat :app:installDebug 2>&1 | Select-Object -Last 30)",
+      "PowerShell($adb = \"$env:LOCALAPPDATA\\\\Android\\\\Sdk\\\\platform-tools\\\\adb.exe\"; $log = & $adb logcat -d -b crash 2>&1; $log | Select-Object -Last 80)",
+      "PowerShell(.\\\\gradlew.bat :app:installDebug 2>&1 | Select-Object -Last 15)"
+    ]
+  }
+}

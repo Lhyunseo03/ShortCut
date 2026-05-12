@@ -25,4 +25,21 @@ interface ScrollHistoryDao {
     // 1주일 이상 된 데이터 삭제 — 앱 시작 시 오래된 로그 정리용
     @Query("DELETE FROM scroll_history WHERE timestamp < :oneWeekAgo")
     suspend fun deleteOlderThan(oneWeekAgo: Long)
+
+    // 통계 탭용 — 날짜별 스크롤 횟수 집계 (최근일자 먼저)
+    // timestamp(ms) → 초 단위로 나눠 SQLite date() 에 넘기고 로컬 타임존 기준 날짜로 그룹핑
+    @Query("""
+        SELECT date(timestamp / 1000, 'unixepoch', 'localtime') AS day, COUNT(*) AS count
+        FROM scroll_history
+        GROUP BY day
+        ORDER BY day DESC
+    """)
+    suspend fun countByDay(): List<DailyCount>
 }
+
+// 일자별 스크롤 횟수 — countByDay() 반환 타입
+// day 형식: "YYYY-MM-DD" (SQLite date() 출력)
+data class DailyCount(
+    val day: String,
+    val count: Int
+)
