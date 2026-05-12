@@ -13,3 +13,5 @@
 .externalNativeBuild
 .cxx
 local.properties
+# Firebase 설정 파일 — API 키 포함, 커밋하지 않음
+app/google-services.json

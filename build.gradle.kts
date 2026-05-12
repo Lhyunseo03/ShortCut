@@ -12,4 +12,7 @@ plugins {
     // kapt 대신 KSP를 사용하는 이유: 최신 Kotlin과 호환되고 빌드 속도가 더 빠름
     // KSP — libs.versions.toml에 정의된 버전 사용 (2.2.10-2.0.2)
     alias(libs.plugins.ksp) apply false
+
+    // Google Services 플러그인 — Firebase 연동에 필요 (app/build.gradle.kts에서 활성화)
+    id("com.google.gms.google-services") version "4.4.2" apply false
 }

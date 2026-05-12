@@ -8,6 +8,9 @@ plugins {
     // KSP — Room DB 어노테이션 처리기
     // kapt 대신 KSP 사용: 최신 Kotlin과 호환되고 빌드 속도가 더 빠름
     id("com.google.devtools.ksp")
+
+    // Google Services 플러그인 — Firebase 연동에 필요
+    id("com.google.gms.google-services")
 }
 
 android {
@@ -60,6 +63,18 @@ dependencies {
 
     // OkHttp — REST API HTTP 요청용 라이브러리 (POST /violations 전송에 사용)
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+
+    // Firebase BoM — Firebase 라이브러리 버전 통합 관리
+    implementation(platform("com.google.firebase:firebase-bom:33.7.0"))
+
+    // Firebase Auth — 구글 로그인 인증
+    implementation("com.google.firebase:firebase-auth-ktx")
+
+    // Google Sign-In — 구글 계정 선택 UI 제공
+    implementation("com.google.android.gms:play-services-auth:21.2.0")
+
+    // Firebase Auth tasks — getIdToken await() 사용을 위해 필요
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-play-services:1.7.3")
 
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)

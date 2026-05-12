@@ -21,6 +21,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.tasks.await
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
 
@@ -388,9 +389,22 @@ class ShortCutAccessibilityService : AccessibilityService() {
             Log.d(TAG, "차단 팝업 표시")
         }
     }
+    // Firebase ID 토큰 가져오기
+    // 서버 요청 시 Authorization: Bearer <token> 헤더에 사용
+    // getIdToken(false): 토큰 유효하면 캐시 사용, 만료됐으면 자동 갱신
+    private suspend fun getFirebaseToken(): String? {
+        return try {
+            val user = com.google.firebase.auth.FirebaseAuth.getInstance().currentUser
+            user?.getIdToken(false)?.await()?.token
+        } catch (e: Exception) {
+            Log.e(TAG, "Firebase 토큰 가져오기 실패 — ${e.message}")
+            null
+        }
+    }
 
     // violation 발생 시 서버로 POST /violations 전송
     // limitType: "hourly" 또는 "daily", action: "stop" 또는 "ignore"
+    // Authorization 헤더에 Firebase 토큰 포함 — 서버 미들웨어가 검증
     private fun sendViolation(limitType: String, scrollCount: Int, action: String) {
         val prefs = getSharedPreferences("short_cut_prefs", MODE_PRIVATE)
         val userId = prefs.getString("userId", "unknown") ?: "unknown"
@@ -407,11 +421,19 @@ class ShortCutAccessibilityService : AccessibilityService() {
 
         serviceScope.launch {
             try {
+                // Firebase 토큰 가져오기 — 없으면 인증 실패로 전송 중단
+                val token = getFirebaseToken()
+                if (token == null) {
+                    Log.e(TAG, "violation 전송 실패 — 토큰 없음")
+                    return@launch
+                }
+
                 val client = okhttp3.OkHttpClient()
                 val mediaType = "application/json".toMediaType()
                 val body = json.toRequestBody(mediaType)
                 val request = okhttp3.Request.Builder()
                     .url("https://short-cut-server-production.up.railway.app/violations")
+                    .addHeader("Authorization", "Bearer $token") // Firebase 인증 토큰 헤더
                     .post(body)
                     .build()
 
@@ -419,6 +441,47 @@ class ShortCutAccessibilityService : AccessibilityService() {
                 Log.d(TAG, "violation 전송 완료 — ${response.code}")
             } catch (e: Exception) {
                 Log.e(TAG, "violation 전송 실패 — ${e.message}")
+            }
+        }
+    }
+
+    // 서버로 POST /userlogs 전송 — 배치 기간 동안 누적된 스크롤 횟수 저장
+    // Firestore userLogs에 저장되어 일간/주간/월간 통계에 활용
+    // Authorization 헤더에 Firebase 토큰 포함 — 서버 미들웨어가 검증
+    private fun sendUserLog(scrollCount: Int) {
+        val prefs = getSharedPreferences("short_cut_prefs", MODE_PRIVATE)
+        val userId = prefs.getString("userId", "unknown") ?: "unknown"
+
+        val json = """
+        {
+            "userId": "$userId",
+            "timestamp": ${System.currentTimeMillis()},
+            "scrollCount": $scrollCount
+        }
+    """.trimIndent()
+
+        serviceScope.launch {
+            try {
+                // Firebase 토큰 가져오기 — 없으면 인증 실패로 전송 중단
+                val token = getFirebaseToken()
+                if (token == null) {
+                    Log.e(TAG, "userLog 전송 실패 — 토큰 없음")
+                    return@launch
+                }
+
+                val client = okhttp3.OkHttpClient()
+                val mediaType = "application/json".toMediaType()
+                val body = json.toRequestBody(mediaType)
+                val request = okhttp3.Request.Builder()
+                    .url("https://short-cut-server-production.up.railway.app/userlogs")
+                    .addHeader("Authorization", "Bearer $token") // Firebase 인증 토큰 헤더
+                    .post(body)
+                    .build()
+
+                val response = client.newCall(request).execute()
+                Log.d(TAG, "userLog 배치 전송 완료 — scrollCount: $scrollCount, ${response.code}")
+            } catch (e: Exception) {
+                Log.e(TAG, "userLog 배치 전송 실패 — ${e.message}")
             }
         }
     }
@@ -436,38 +499,6 @@ class ShortCutAccessibilityService : AccessibilityService() {
         if (count <= 0) return
         batchScrollCount = 0
         sendUserLog(count)
-    }
-
-    // 서버로 POST /userlog 전송 — 배치 기간 동안 누적된 스크롤 횟수 저장
-// Firestore userLogs에 저장되어 일간/주간/월간 통계에 활용
-    private fun sendUserLog(scrollCount: Int) {
-        val prefs = getSharedPreferences("short_cut_prefs", MODE_PRIVATE)
-        val userId = prefs.getString("userId", "unknown") ?: "unknown"
-
-        val json = """
-        {
-            "userId": "$userId",
-            "timestamp": ${System.currentTimeMillis()},
-            "scrollCount": $scrollCount
-        }
-    """.trimIndent()
-
-        serviceScope.launch {
-            try {
-                val client = okhttp3.OkHttpClient()
-                val mediaType = "application/json".toMediaType()
-                val body = json.toRequestBody(mediaType)
-                val request = okhttp3.Request.Builder()
-                    .url("https://short-cut-server-production.up.railway.app/userlogs")
-                    .post(body)
-                    .build()
-
-                val response = client.newCall(request).execute()
-                Log.d(TAG, "userLog 배치 전송 완료 — scrollCount: $scrollCount, ${response.code}")
-            } catch (e: Exception) {
-                Log.e(TAG, "userLog 배치 전송 실패 — ${e.message}")
-            }
-        }
     }
 
     private fun dismissPopup() {
