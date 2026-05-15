@@ -7,11 +7,14 @@ import android.os.Handler
 import android.os.Looper
 import android.view.Gravity
 import android.view.LayoutInflater
+import android.view.View
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.util.Log
 import android.widget.Button
+import android.widget.LinearLayout
+import android.widget.TextView
 import com.example.short_cut.R
 import com.example.short_cut.SocketManager
 import com.example.short_cut.db.AppDatabase
@@ -37,15 +40,27 @@ class ShortCutAccessibilityService : AccessibilityService() {
         const val DEBOUNCE_MS = 500L
         const val NOISE_MS = 1500L
 
-        // ignore 후 추가로 볼 수 있는 스크롤 횟수 (고정값)
-        const val POST_IGNORE_THRESHOLD = 10
+        // 그만보기(Stop) 선택 후 쇼츠 진입 차단 시간 — 5분
+        const val STOP_BLOCK_MS = 5 * 60 * 1000L
+
+        // hourly limit 초과 후 추가 popup 발생 간격 (10회당)
+        const val HOURLY_STEP = 10
+
+        // daily limit 초과 후 추가 popup 발생 간격 (100회당)
+        const val DAILY_STEP = 100
+
+        // SharedPreferences 키 — 영구 상태 (서비스 재시작/YT 강제종료 대비)
+        const val PREFS = "short_cut_prefs"
+        const val PK_DAILY_MILESTONE = "dailyMilestone"        // 직전 popup 트리거된 dailyCount 값 (-1=미발생)
+        const val PK_HOURLY_MILESTONE = "hourlyMilestone"      // 직전 popup 트리거된 hourlyCount 값 (-1=미발생)
+        const val PK_STOP_UNTIL = "stopUntilMs"                // 쇼츠 진입 차단 만료 시각 (0=차단 없음)
+        const val PK_PENDING_TYPE = "pendingPopupType"         // "daily"/"hourly"/null — 현재 미응답 popup 종류
+        const val PK_PENDING_OVERAGE = "pendingPopupOverage"   // 현재 미응답 popup 의 overage (0,10,20.../0,100,200...)
+        const val PK_TODAY_START = "todayStartMs"              // 마지막으로 처리한 "오늘 0시" — 날짜 롤오버 감지용
     }
 
     // ── Room DB ───────────────────────────────────────────────
-    // Room DB DAO — 스크롤 기록 저장 및 조회에 사용
     private lateinit var scrollHistoryDao: com.example.short_cut.db.ScrollHistoryDao
-
-    // Room DB DAO — 사용자 limit 설정 조회에 사용
     private lateinit var userLimitDao: com.example.short_cut.db.UserLimitDao
 
     // 코루틴 스코프 — DB 작업은 메인 스레드에서 실행하면 안 되므로 별도 스코프 사용
@@ -53,21 +68,29 @@ class ShortCutAccessibilityService : AccessibilityService() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     // ── Limit 설정 ────────────────────────────────────────────
-    // hourly limit — Room DB에서 로드, 기본값 50
     private var hourlyLimit = 50
-
-    // daily limit — Room DB에서 로드, 기본값 100
     private var dailyLimit = 100
 
     // ── 카운터 ────────────────────────────────────────────────
-    // 오늘 총 스크롤 횟수 — 앱 재시작 시 Room DB에서 복원
+    // 오늘 총 스크롤 횟수 — 앱 재시작 시 Room DB 에서 복원, 자정 롤오버 시 0으로 재로드
     private var dailyCount = 0
 
-    // ignore 후 추가 스크롤 카운터 — 0이면 일반 모드
-    private var postIgnoreCount = 0
+    // 직전 popup 이 발생한 카운트 값. -1 이면 popup 미발생 상태.
+    //  - 다음 daily popup 트리거: max(dailyLimit, dailyMilestone + DAILY_STEP)
+    //  - 다음 hourly popup 트리거: max(hourlyLimit, hourlyMilestone + HOURLY_STEP)
+    private var dailyMilestone = -1
+    private var hourlyMilestone = -1
 
-    // ignore 후 추가 감지 모드 여부
-    private var isPostIgnoreMode = false
+    // 미응답 popup — YT 강제종료 등으로 popup view 가 사라져도 재진입 시 같은 popup 복원
+    // null 이면 미응답 popup 없음
+    private var pendingPopupType: String? = null
+    private var pendingPopupOverage = 0
+
+    // 그만보기(Stop) 선택 후 쇼츠 진입 차단 만료 시각 (Unix ms). 0 = 차단 없음.
+    private var stopUntilMs = 0L
+
+    // 마지막으로 처리한 "오늘 0시" — 자정 롤오버 감지에 사용
+    private var todayStartMs = 0L
 
     // ── 스크롤 감지 상태 ──────────────────────────────────────
     private var isInShortsMode = false
@@ -77,34 +100,26 @@ class ShortCutAccessibilityService : AccessibilityService() {
     private var lastContentDesc = ""
     private var isPopupShowing = false
     private var windowManager: WindowManager? = null
-    private var popupView: android.view.View? = null
+    // popup view 들 — variant 4(stacked) 를 위해 list 로 관리. 단일 popup variant 에서도 list 에 1개로 저장.
+    private val popupViews = mutableListOf<View>()
     private val mainHandler = Handler(Looper.getMainLooper())
 
-    // daily limit 초과 여부 — true이면 하루 동안 팝업 재발생 안 함
-    private var isDailyLimitReached = false
-
     // ── 배치 전송 ─────────────────────────────────────────────
-    // 아직 서버에 전송하지 않은 누적 스크롤 횟수 — 10개 쌓이거나 5분 경과 시 전송
     private var batchScrollCount = 0
-
-    // 배치 전송 트리거 횟수 — 이 횟수만큼 누적되면 즉시 전송
     private val BATCH_SIZE = 10
-
-    // 5분 타이머를 관리하는 핸들러 — 메인 스레드에서 실행
     private val batchHandler = Handler(Looper.getMainLooper())
-
-    // 5분마다 실행되는 타이머 Runnable
-    // 누적된 스크롤을 전송하고 다시 5분 예약
     private val batchTimerRunnable = Runnable {
-        flushBatch()         // 누적된 배치 전송
-        scheduleBatchTimer() // 다시 5분 예약
+        flushBatch()
+        scheduleBatchTimer()
     }
 
     override fun onServiceConnected() {
         super.onServiceConnected()
         val info = AccessibilityServiceInfo().apply {
             eventTypes = AccessibilityEvent.TYPES_ALL_MASK
-            packageNames = arrayOf(TARGET_PACKAGE)
+            // packageNames 를 비워서 다른 앱 이벤트도 받음 — YT 가 포그라운드에서 벗어나면 popup 만 dismiss
+            // (pending 상태는 유지되어 YT/쇼츠 재진입 시 popup 복원)
+            packageNames = null
             feedbackType = AccessibilityServiceInfo.FEEDBACK_GENERIC
             flags = AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS or
                     AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS
@@ -113,12 +128,10 @@ class ShortCutAccessibilityService : AccessibilityService() {
         serviceInfo = info
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
 
-        // Room DB 인스턴스 초기화
         val db = AppDatabase.getDatabase(this)
         scrollHistoryDao = db.scrollHistoryDao()
         userLimitDao = db.userLimitDao()
 
-        // 앱 시작 시 초기화 작업 (코루틴으로 비동기 실행)
         serviceScope.launch {
             initializeOnStart()
         }
@@ -127,57 +140,73 @@ class ShortCutAccessibilityService : AccessibilityService() {
         SocketManager.connect()
         Log.d(TAG, "소켓 연결")
 
-        // DB 및 소켓 초기화 완료 후 배치 타이머 시작
-        // 5분마다 누적된 스크롤 횟수를 서버로 전송
         scheduleBatchTimer()
     }
 
-    // 서비스 시작 시 Room DB에서 데이터 초기화
+    // 서비스 시작 시 Room DB / SharedPreferences 에서 상태 복원
     private suspend fun initializeOnStart() {
-        // 테스트용 — limit 설정 UI 구현 후 삭제
-        hourlyLimit = 5
-        dailyLimit = 10
-
         val now = System.currentTimeMillis()
+        val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
 
         // 1주일 이상 된 스크롤 기록 삭제
         val oneWeekAgo = now - (7 * 24 * 60 * 60 * 1000L)
         scrollHistoryDao.deleteOlderThan(oneWeekAgo)
-        Log.d(TAG, "오래된 스크롤 기록 삭제 완료")
 
-        // 오늘 자정 이후 스크롤 횟수를 Room DB에서 불러와 dailyCount 복원
-        val startOfDay = getStartOfDayTimestamp()
-        dailyCount = scrollHistoryDao.countToday(startOfDay)
+        // 오늘 자정 이후 스크롤 횟수를 Room DB 에서 불러와 dailyCount 복원
+        todayStartMs = getStartOfDayTimestamp()
+        dailyCount = scrollHistoryDao.countToday(todayStartMs)
         Log.d(TAG, "오늘 스크롤 복원: $dailyCount")
 
-        // 사용자 limit 설정 불러오기 (없으면 기본값 유지)
-        val prefs = getSharedPreferences("short_cut_prefs", MODE_PRIVATE)
+        // userId 변경 감지 → 다른 유저 데이터 흔적 제거
         val userId = prefs.getString("userId", "unknown") ?: "unknown"
-
-        // userId가 바뀌었으면 Room DB 초기화 (다른 유저 데이터 복원 방지)
         val lastUserId = prefs.getString("lastUserId", "") ?: ""
         if (userId != lastUserId) {
-            scrollHistoryDao.deleteOlderThan(System.currentTimeMillis() + 1L) // 전체 삭제
-            prefs.edit().putString("lastUserId", userId).apply()
+            scrollHistoryDao.deleteOlderThan(now + 1L) // 전체 삭제
+            prefs.edit()
+                .putString("lastUserId", userId)
+                .remove(PK_DAILY_MILESTONE)
+                .remove(PK_HOURLY_MILESTONE)
+                .remove(PK_PENDING_TYPE)
+                .remove(PK_PENDING_OVERAGE)
+                .remove(PK_STOP_UNTIL)
+                .apply()
             dailyCount = 0
-            isDailyLimitReached = false
-            Log.d(TAG, "userId 변경 감지 → Room DB 초기화 (이전: $lastUserId, 현재: $userId)")
-            return
+            Log.d(TAG, "userId 변경 감지 → 상태 초기화 ($lastUserId → $userId)")
         }
 
+        // pending limit 변경 예약이 만료됐으면 promote
+        userLimitDao.promoteExpiredPending(now)
         val userLimit = userLimitDao.getLimit(userId)
         if (userLimit != null) {
             hourlyLimit = userLimit.hourlyLimit
             dailyLimit = userLimit.dailyLimit
-            Log.d(TAG, "limit 로드 완료 — hourly: $hourlyLimit, daily: $dailyLimit")
-        } else {
-            Log.d(TAG, "저장된 limit 없음 — 기본값 사용 (hourly: $hourlyLimit, daily: $dailyLimit)")
+            Log.d(TAG, "limit 로드 — hourly: $hourlyLimit, daily: $dailyLimit")
         }
 
-        // dailyCount가 이미 limit 이상이면 플래그 true로 복원 (앱 재시작 시 팝업 중복 방지)
-        // limit 로드 후에 판단해야 정확함
-        isDailyLimitReached = dailyCount >= dailyLimit
-        Log.d(TAG, "daily limit 플래그 복원: $isDailyLimitReached (dailyCount: $dailyCount, dailyLimit: $dailyLimit)")
+        // 영구 상태 복원
+        dailyMilestone = prefs.getInt(PK_DAILY_MILESTONE, -1)
+        hourlyMilestone = prefs.getInt(PK_HOURLY_MILESTONE, -1)
+        stopUntilMs = prefs.getLong(PK_STOP_UNTIL, 0L)
+        pendingPopupType = prefs.getString(PK_PENDING_TYPE, null)
+        pendingPopupOverage = prefs.getInt(PK_PENDING_OVERAGE, 0)
+
+        // milestone 유효성 검증 — count 가 milestone 보다 낮으면 stale 이므로 리셋
+        // (자정 롤오버나 hourly 슬라이딩 윈도우로 인해 count 가 줄어든 경우)
+        if (dailyMilestone >= 0 && dailyCount < dailyMilestone) {
+            dailyMilestone = -1
+        }
+        val hourlyAtStart = scrollHistoryDao.countLastHour(now - 60L * 60L * 1000L)
+        if (hourlyMilestone >= 0 && hourlyAtStart < hourlyMilestone) {
+            hourlyMilestone = -1
+        }
+
+        // 만료된 stopUntilMs 정리
+        if (stopUntilMs > 0 && now >= stopUntilMs) {
+            stopUntilMs = 0
+        }
+
+        savePersistedState()
+        Log.d(TAG, "상태 복원 — dailyMilestone=$dailyMilestone, hourlyMilestone=$hourlyMilestone, stopUntilMs=$stopUntilMs, pending=$pendingPopupType($pendingPopupOverage)")
     }
 
     // 오늘 자정(00:00:00) 타임스탬프 계산
@@ -188,6 +217,26 @@ class ShortCutAccessibilityService : AccessibilityService() {
         cal.set(java.util.Calendar.SECOND, 0)
         cal.set(java.util.Calendar.MILLISECOND, 0)
         return cal.timeInMillis
+    }
+
+    // 자정 롤오버 처리 — countShorts() 진입 시 매번 호출
+    // 날짜가 바뀌었으면 dailyCount 와 milestone 을 새 날짜 기준으로 재설정
+    private suspend fun handleDayRolloverIfNeeded(now: Long, userId: String) {
+        val startToday = getStartOfDayTimestamp()
+        if (startToday == todayStartMs) return
+
+        Log.d(TAG, "자정 롤오버 감지 → 상태 재설정")
+        todayStartMs = startToday
+        dailyCount = scrollHistoryDao.countToday(startToday)
+        dailyMilestone = -1
+
+        // pending limit 변경이 있었다면 새 날짜에 맞춰 적용
+        userLimitDao.promoteExpiredPending(now)
+        userLimitDao.getLimit(userId)?.let {
+            hourlyLimit = it.hourlyLimit
+            dailyLimit = it.dailyLimit
+        }
+        savePersistedState()
     }
 
     private fun getShortsNodeCount(): Int {
@@ -203,7 +252,6 @@ class ShortCutAccessibilityService : AccessibilityService() {
         val descs = mutableListOf<String>()
         collectContentDescs(root, descs)
         root.recycle()
-        // 처음 5개만 합쳐서 fingerprint로 사용
         return descs.take(5).joinToString("|")
     }
 
@@ -220,9 +268,35 @@ class ShortCutAccessibilityService : AccessibilityService() {
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent) {
-        if (event.packageName?.toString() != TARGET_PACKAGE) return
-
         val now = System.currentTimeMillis()
+        val pkg = event.packageName?.toString()
+
+        // YT 외 다른 앱으로 전환되면 popup 만 숨김 — pending 은 유지
+        //
+        // 단, 다음 패키지의 이벤트는 무시해야 함:
+        //   - 우리 앱 자신 (popup overlay 를 띄울 때 TYPE_ACCESSIBILITY_OVERLAY 가 발생시키는 이벤트)
+        //   - "android" (시스템 이벤트)
+        //   - null (패키지 미식별 이벤트)
+        // 이걸 무시하지 않으면 popup 띄우자마자 자기 자신이 다른 앱으로 인식되어 즉시 dismiss 됨
+        val ownPackage = packageName
+        val isTransientEvent = pkg == null || pkg == ownPackage || pkg == "android"
+
+        if (!isTransientEvent && pkg != TARGET_PACKAGE) {
+            if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+                if (popupViews.isNotEmpty()) {
+                    Log.d(TAG, "다른 앱($pkg) 전환 → popup 숨김 (pending 유지)")
+                    dismissAllPopups()
+                }
+                if (isInShortsMode) {
+                    isInShortsMode = false
+                    lastNodeCount = 0
+                }
+            }
+            return
+        }
+
+        // 자기 자신/시스템 이벤트는 무시 — popup 이 띄워지면서 발생하는 이벤트를 우리 자신의 상태 변화로 잘못 해석하지 않기 위함
+        if (pkg != TARGET_PACKAGE) return
 
         when (event.eventType) {
 
@@ -235,15 +309,43 @@ class ShortCutAccessibilityService : AccessibilityService() {
                     lastNodeCount = nodeCount
                     lastContentDesc = getShortsFingerprint()
                     Log.d(TAG, "쇼츠 진입 노드=$nodeCount")
+
+                    // 1) 5분 차단 중이면 차단 popup + BACK 으로 쇼츠만 빠져나가게 함
+                    // (HOME 으로 보내면 YT 가 강종 후 쇼츠로 바로 재진입할 때마다 폰 홈으로 튕겨서
+                    //  YT 자체를 못 쓰게 됨 → BACK 으로 YT 안에서 다른 탭으로만 보냄)
+                    if (now < stopUntilMs) {
+                        val remaining = ((stopUntilMs - now) / 1000).toInt() + 1
+                        Log.d(TAG, "차단 기간 중 쇼츠 진입 시도 — 남은 ${remaining}초")
+                        showBlockPopup(remaining)
+                        performGlobalAction(GLOBAL_ACTION_BACK)
+                        return
+                    }
+
+                    // 2) 미응답 popup 이 있으면 재표시 (YT 강제종료 후 재진입 시나리오)
+                    pendingPopupType?.let { type ->
+                        Log.d(TAG, "미응답 popup 재표시 — type=$type, overage=$pendingPopupOverage")
+                        showLimitPopup(type, pendingPopupOverage)
+                    }
                 } else if (nodeCount == 0 && isInShortsMode) {
                     isInShortsMode = false
                     lastNodeCount = 0
+                    // YT 안에서 쇼츠 탭을 벗어나도 popup 은 숨김 — pending 은 유지
+                    if (popupViews.isNotEmpty()) {
+                        Log.d(TAG, "쇼츠 이탈 → popup 숨김 (pending 유지)")
+                        dismissAllPopups()
+                    }
                     Log.d(TAG, "쇼츠모드 OFF")
                 }
             }
 
             AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED -> {
                 if (!isInShortsMode) return
+
+                // 차단 기간 중이면 어떤 스크롤도 무시 + 쇼츠에서 BACK 으로 빠져나감
+                if (now < stopUntilMs) {
+                    performGlobalAction(GLOBAL_ACTION_BACK)
+                    return
+                }
 
                 val nodeCount = getShortsNodeCount()
 
@@ -273,14 +375,16 @@ class ShortCutAccessibilityService : AccessibilityService() {
 
         lastCountTime = now
 
-        // Room DB 저장 및 limit 체크는 코루틴으로 실행
         serviceScope.launch {
-            // 스크롤 이벤트를 Room DB에 저장
-            scrollHistoryDao.insert(
-                ScrollHistory(appPkg = TARGET_PACKAGE, timestamp = now)
-            )
+            val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
+            val userId = prefs.getString("userId", "unknown") ?: "unknown"
 
-            // daily 카운트 증가 (메모리 변수)
+            // 자정 롤오버 처리 (limit/카운트/마일스톤 재로드)
+            handleDayRolloverIfNeeded(now, userId)
+
+            // 스크롤 이벤트를 Room DB 에 저장
+            scrollHistoryDao.insert(ScrollHistory(appPkg = TARGET_PACKAGE, timestamp = now))
+
             dailyCount++
 
             // 배치 카운터 증가 — BATCH_SIZE(10개) 쌓이면 즉시 서버 전송
@@ -292,106 +396,498 @@ class ShortCutAccessibilityService : AccessibilityService() {
             // 최근 1시간 스크롤 횟수 조회 (슬라이딩 윈도우)
             val oneHourAgo = now - (60 * 60 * 1000L)
             val hourlyCount = scrollHistoryDao.countLastHour(oneHourAgo)
-            lastHourlyCount = hourlyCount  // ← 추가
+            lastHourlyCount = hourlyCount
 
             Log.d(TAG, "스크롤 카운트 — hourly: $hourlyCount/$hourlyLimit, daily: $dailyCount/$dailyLimit")
 
-            // 소켓 이벤트 전송
-            val prefs = getSharedPreferences("short_cut_prefs", MODE_PRIVATE)
-            val userId = prefs.getString("userId", "unknown") ?: "unknown"
-            // 1씩 전송하는 코드 있었는데 지웠어용
+            // hourly 가 limit 아래로 떨어졌으면 milestone 리셋
+            // (슬라이딩 윈도우로 옛 카운트가 빠져나가 자연 회복된 경우 — 다음에 다시 limit 도달 시 "첫 팝업" 부터)
+            if (hourlyCount < hourlyLimit && hourlyMilestone >= 0) {
+                hourlyMilestone = -1
+                savePersistedState()
+            }
 
-            // ignore 후 추가 감지 모드인 경우
-            if (isPostIgnoreMode) {
-                postIgnoreCount++
-                Log.d(TAG, "post-ignore 카운트: $postIgnoreCount / $POST_IGNORE_THRESHOLD")
-
-                // daily limit 초과 시 post-ignore 모드 중에도 개입
-                if (dailyCount >= dailyLimit && !isDailyLimitReached) {
-                    isDailyLimitReached = true
-                    isPostIgnoreMode = false
-                    postIgnoreCount = 0
-                    Log.d(TAG, "daily limit 초과 (post-ignore 중) → 팝업")
-                    withContext(Dispatchers.Main) { showPopup("daily") }
+            // hourly 체크 — milestone 단위로 트리거
+            if (hourlyCount >= hourlyLimit) {
+                val nextTrigger = if (hourlyMilestone < 0) hourlyLimit else hourlyMilestone + HOURLY_STEP
+                if (hourlyCount >= nextTrigger) {
+                    hourlyMilestone = nextTrigger
+                    val overage = nextTrigger - hourlyLimit
+                    setPendingPopup("hourly", overage)
+                    withContext(Dispatchers.Main) { showLimitPopup("hourly", overage) }
                     return@launch
                 }
+            }
 
-                if (postIgnoreCount >= POST_IGNORE_THRESHOLD) {
-                    isPostIgnoreMode = false
-                    postIgnoreCount = 0
+            // daily 체크 — milestone 단위로 트리거
+            if (dailyCount >= dailyLimit) {
+                val nextTrigger = if (dailyMilestone < 0) dailyLimit else dailyMilestone + DAILY_STEP
+                if (dailyCount >= nextTrigger) {
+                    dailyMilestone = nextTrigger
+                    val overage = nextTrigger - dailyLimit
+                    setPendingPopup("daily", overage)
+                    withContext(Dispatchers.Main) { showLimitPopup("daily", overage) }
+                }
+            }
+        }
+    }
 
-                    if (hourlyCount >= hourlyLimit) {
-                        Log.d(TAG, "post-ignore binge 감지 → 팝업")
-                        withContext(Dispatchers.Main) { showPopup("hourly") }
+    // ── Popup 빌더 ────────────────────────────────────────────
+
+    // overage(=초과 분) 에 따라 popup 의 제목/본문 결정
+    private fun buildPopupTexts(type: String, overage: Int): Pair<String, String> {
+        return when (type) {
+            "daily" -> {
+                val title = "Daily Limit 초과"
+                val body = if (overage == 0) {
+                    "Daily limit을 초과했습니다.\n계속 보시겠습니까?"
+                } else {
+                    "오늘 목표보다 ${overage}회 더 보셨습니다.\n계속 보시겠습니까?"
+                }
+                title to body
+            }
+            "hourly" -> {
+                val title = "Hourly Limit 초과"
+                val body = if (overage == 0) {
+                    "Hourly limit을 초과했습니다.\n계속 보시겠습니까?"
+                } else {
+                    "${overage}회 더 보셨습니다.\n계속 보시겠습니까?"
+                }
+                title to body
+            }
+            else -> "알림" to ""
+        }
+    }
+
+    // 한도 초과 popup — type 과 모드(normal/hard) 에 따라 다른 popup 으로 분기
+    // hard 모드 + hourly 만 5가지 variant 중 랜덤. daily 와 normal 모드는 표준 popup.
+    private fun showLimitPopup(type: String, overage: Int) {
+        if (type == "hourly" && isHardMode()) {
+            showHourlyPopupHard(overage)
+        } else {
+            showLimitPopupNormal(type, overage)
+        }
+    }
+
+    // 표준 popup (normal 모드 or daily)
+    private fun showLimitPopupNormal(type: String, overage: Int) {
+        val (title, body) = buildPopupTexts(type, overage)
+        mainHandler.post {
+            dismissAllPopups()
+            val view = makeStandardPopupView(
+                title = title,
+                message = body,
+                stopText = "그만보기",
+                ignoreText = "계속보기",
+                onStopClick = { executeStop(type) },
+                onIgnoreClick = { executeIgnore(type) }
+            )
+            addPopupView(view, standardCenterParams(280))
+        }
+    }
+
+    // 5분 차단 안내 popup — 버튼 없이 3초 후 자동 dismiss
+    private fun showBlockPopup(remainingSec: Int) {
+        mainHandler.post {
+            dismissAllPopups()
+            val view = LayoutInflater.from(this).inflate(R.layout.overlay_popup, null)
+            view.findViewById<TextView>(R.id.popupTitle).text = "그만보기를 눌렀습니다"
+            view.findViewById<TextView>(R.id.popupMessage).text = "5분간 진입금지!"
+            view.findViewById<LinearLayout>(R.id.popupButtonRow).visibility = View.GONE
+            addPopupView(view, standardCenterParams(280))
+            mainHandler.postDelayed({ dismissAllPopups() }, 3000L)
+        }
+    }
+
+    // ── 하드 모드 — 5가지 variant 중 랜덤 (hourly 전용) ──────────
+
+    // 사용자가 설정 탭에서 "하드 모드" 선택했는지 확인
+    private fun isHardMode(): Boolean {
+        return getSharedPreferences(PREFS, MODE_PRIVATE).getString("appMode", "normal") == "hard"
+    }
+
+    private fun showHourlyPopupHard(overage: Int) {
+        val variant = (1..5).random()
+        Log.d(TAG, "하드 모드 hourly popup variant=$variant")
+        when (variant) {
+            1 -> showHardCountdown(overage)
+            2 -> showHardVerticalGrid(overage)
+            3 -> showHardSwappedLabels(overage)
+            4 -> showHardStacked(overage)
+            5 -> showHardHorizontalScroll(overage)
+        }
+    }
+
+    // ── Variant 1 — 무시하기 버튼 60초 카운트다운 후 활성화 ──────
+    private fun showHardCountdown(overage: Int) {
+        val type = "hourly"
+        val (title, body) = buildPopupTexts(type, overage)
+        mainHandler.post {
+            dismissAllPopups()
+            val view = LayoutInflater.from(this).inflate(R.layout.overlay_popup, null)
+            view.findViewById<TextView>(R.id.popupTitle).text = title
+            view.findViewById<TextView>(R.id.popupMessage).text = body
+
+            val btnStop = view.findViewById<Button>(R.id.btnStop)
+            val btnIgnore = view.findViewById<Button>(R.id.btnIgnore)
+            val countdownTv = view.findViewById<TextView>(R.id.ignoreCountdown)
+
+            btnStop.text = "그만하기"
+            btnStop.setOnClickListener { executeStop(type) }
+
+            btnIgnore.text = "무시하기"
+            btnIgnore.isEnabled = false
+            btnIgnore.alpha = 0.5f
+            btnIgnore.setOnClickListener { executeIgnore(type) }
+
+            countdownTv.visibility = View.VISIBLE
+            countdownTv.text = "60"
+
+            addPopupView(view, standardCenterParams(280))
+
+            // 1초마다 카운트다운 — popup 이 dismiss 되면 중단
+            val tickRunnable = object : Runnable {
+                var remaining = 60
+                override fun run() {
+                    if (!popupViews.contains(view)) return  // dismiss 됐으면 중단
+                    remaining--
+                    if (remaining > 0) {
+                        countdownTv.text = "$remaining"
+                        mainHandler.postDelayed(this, 1000)
                     } else {
-                        Log.d(TAG, "post-ignore 정상 → 일반 모드 복귀")
+                        countdownTv.visibility = View.GONE
+                        btnIgnore.isEnabled = true
+                        btnIgnore.alpha = 1f
                     }
                 }
-                return@launch
             }
-
-            // hourly limit 초과 체크
-            if (hourlyCount >= hourlyLimit) {
-                Log.d(TAG, "hourly limit 초과 → 팝업")
-                withContext(Dispatchers.Main) { showPopup("hourly") }
-                return@launch
-            }
-
-            // daily limit 초과 체크
-            if (dailyCount >= dailyLimit && !isDailyLimitReached) {
-                isDailyLimitReached = true
-                Log.d(TAG, "daily limit 초과 → 팝업")
-                withContext(Dispatchers.Main) { showPopup("daily") }
-            }
+            mainHandler.postDelayed(tickRunnable, 1000)
         }
     }
 
-    private fun showPopup(limitType: String) {
-        if (isPopupShowing) return
-        isPopupShowing = true
-
+    // ── Variant 2 — 세로 스크롤 10행 × 2버튼, 9행은 그만하기×2, 1행만 그만/무시 쌍 ──
+    private fun showHardVerticalGrid(overage: Int) {
+        val type = "hourly"
+        val (title, body) = buildPopupTexts(type, overage)
         mainHandler.post {
-            val inflater = LayoutInflater.from(this)
-            val view = inflater.inflate(R.layout.overlay_popup, null)
+            dismissAllPopups()
+            val view = LayoutInflater.from(this).inflate(R.layout.overlay_popup_vertical, null)
+            view.findViewById<TextView>(R.id.popupTitle).text = title
+            view.findViewById<TextView>(R.id.popupMessage).text = body
+            val container = view.findViewById<LinearLayout>(R.id.rowsContainer)
 
-            val widthInDp = 250
-            val widthInPx = (widthInDp * resources.displayMetrics.density).toInt()
+            // 첫번째(0) 줄은 제외. 1..9 중 하나가 mixed row.
+            val mixedRowIdx = (1..9).random()
+            // mixed row 의 무시하기 위치 (왼/오 랜덤)
+            val mixedIgnoreOnRight = (0..1).random() == 1
+            val uniformColor = android.graphics.Color.parseColor("#555555")
+            val density = resources.displayMetrics.density
 
-            val params = WindowManager.LayoutParams(
-                widthInPx,
-                WindowManager.LayoutParams.WRAP_CONTENT,
-                WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
-                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                        WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
-                PixelFormat.TRANSLUCENT
-            ).apply {
-                gravity = Gravity.CENTER
+            for (i in 0 until 10) {
+                val row = LinearLayout(this).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    layoutParams = LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.MATCH_PARENT,
+                        LinearLayout.LayoutParams.WRAP_CONTENT
+                    ).apply { setMargins(0, (4 * density).toInt(), 0, (4 * density).toInt()) }
+                }
+
+                val (leftLabel, rightLabel, leftAction, rightAction) = when {
+                    i != mixedRowIdx -> {
+                        // 양쪽 모두 그만하기
+                        Quadruple("그만하기", "그만하기", { executeStop(type) }, { executeStop(type) })
+                    }
+                    mixedIgnoreOnRight -> {
+                        Quadruple("그만하기", "무시하기", { executeStop(type) }, { executeIgnore(type) })
+                    }
+                    else -> {
+                        Quadruple("무시하기", "그만하기", { executeIgnore(type) }, { executeStop(type) })
+                    }
+                }
+
+                val leftBtn = Button(this).apply {
+                    text = leftLabel
+                    setTextColor(android.graphics.Color.WHITE)
+                    setBackgroundColor(uniformColor)
+                    setOnClickListener { leftAction() }
+                    layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                        .apply { setMargins(0, 0, (6 * density).toInt(), 0) }
+                }
+                val rightBtn = Button(this).apply {
+                    text = rightLabel
+                    setTextColor(android.graphics.Color.WHITE)
+                    setBackgroundColor(uniformColor)
+                    setOnClickListener { rightAction() }
+                    layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                }
+                row.addView(leftBtn)
+                row.addView(rightBtn)
+                container.addView(row)
             }
 
-            view.findViewById<Button>(R.id.btnStop).setOnClickListener {
-                dismissPopup()
-                // stop 선택 → violation 서버 전송
-                sendViolation(limitType, lastHourlyCount, "stop")
-                performGlobalAction(GLOBAL_ACTION_HOME)
-            }
-
-            view.findViewById<Button>(R.id.btnIgnore).setOnClickListener {
-                dismissPopup()
-                // ignore 선택 → violation 서버 전송
-                sendViolation(limitType, lastHourlyCount, "ignore")
-                isPostIgnoreMode = true
-                postIgnoreCount = 0
-                Log.d(TAG, "ignore 선택 → post-ignore 모드 시작")
-            }
-
-            windowManager?.addView(view, params)
-            popupView = view
-            Log.d(TAG, "차단 팝업 표시")
+            addPopupView(view, fixedSizeCenterParams(320, 480))
         }
     }
+
+    // ── Variant 3 — 색상 위치 고정, 글자만 swap (red=무시하기, gray=그만하기) ──
+    private fun showHardSwappedLabels(overage: Int) {
+        val type = "hourly"
+        val (title, body) = buildPopupTexts(type, overage)
+        mainHandler.post {
+            dismissAllPopups()
+            // btnStop (red, 왼쪽) 라벨 = "무시하기" → 클릭 시 ignore
+            // btnIgnore (gray, 오른쪽) 라벨 = "그만하기" → 클릭 시 stop
+            val view = makeStandardPopupView(
+                title = title,
+                message = body,
+                stopText = "무시하기",
+                ignoreText = "그만하기",
+                onStopClick = { executeIgnore(type) },  // 라벨 따라 동작
+                onIgnoreClick = { executeStop(type) }
+            )
+            addPopupView(view, standardCenterParams(280))
+        }
+    }
+
+    // ── Variant 4 — 10개 popup 대각선 스택. 1개(랜덤, 첫번째 제외) 만 라벨 swap ──
+    private fun showHardStacked(overage: Int) {
+        val type = "hourly"
+        val (title, body) = buildPopupTexts(type, overage)
+        mainHandler.post {
+            dismissAllPopups()
+
+            val popupCount = 10
+            val trapIdx = (1..9).random()  // 0 (맨 아래) 제외
+            val density = resources.displayMetrics.density
+            val offsetPx = (16 * density).toInt()
+
+            // 각 popup 생성. 맨 아래(idx=0) 부터 맨 위(idx=9) 까지 순서대로 addView.
+            // 따라서 idx=9 가 topmost. 사용자가 클릭하는 건 idx=9 부터 시작.
+            for (idx in 0 until popupCount) {
+                val isTrap = (idx == trapIdx)
+                val view = if (isTrap) {
+                    makeStandardPopupView(
+                        title = title,
+                        message = body,
+                        stopText = "무시하기",  // red 위치에 무시하기 라벨
+                        ignoreText = "그만하기",  // gray 위치에 그만하기 라벨
+                        onStopClick = { handleStackedIgnore(type) },  // 라벨 따라 동작
+                        onIgnoreClick = { executeStop(type) }
+                    )
+                } else {
+                    makeStandardPopupView(
+                        title = title,
+                        message = body,
+                        stopText = "그만하기",
+                        ignoreText = "무시하기",
+                        onStopClick = { executeStop(type) },
+                        onIgnoreClick = { handleStackedIgnore(type) }
+                    )
+                }
+
+                val isTop = (idx == popupCount - 1)
+                val params = standardCenterParams(260).apply {
+                    x = idx * offsetPx
+                    y = idx * offsetPx
+                    if (!isTop) {
+                        // 아래 popup 들은 터치 비활성 — 맨 위만 클릭 가능
+                        flags = flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                    }
+                }
+                addPopupView(view, params)
+            }
+        }
+    }
+
+    // Stacked 모드에서 무시하기 클릭 시: 현재 top popup 하나만 dismiss, 모두 사라지면 ignore 처리
+    private fun handleStackedIgnore(type: String) {
+        if (popupViews.isEmpty()) return
+        val top = popupViews.last()
+        popupViews.remove(top)
+        try { windowManager?.removeView(top) } catch (_: Exception) {}
+
+        if (popupViews.isEmpty()) {
+            // 마지막 popup 도 사라짐 → 진짜 ignore 처리
+            isPopupShowing = false
+            sendViolation(type, lastHourlyCount, "ignore")
+            clearPendingPopup()
+            Log.d(TAG, "스택 popup 전부 처리 → ignore 완료")
+        } else {
+            // 다음 top popup 의 터치를 활성화
+            val newTop = popupViews.last()
+            try {
+                val params = newTop.layoutParams as? WindowManager.LayoutParams
+                if (params != null) {
+                    params.flags = params.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
+                    windowManager?.updateViewLayout(newTop, params)
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "스택 popup 터치 활성화 실패 — ${e.message}")
+            }
+        }
+    }
+
+    // ── Variant 5 — 가로 스크롤 20개 버튼. 1개(랜덤, 첫/두번째 제외) 만 무시하기 ──
+    private fun showHardHorizontalScroll(overage: Int) {
+        val type = "hourly"
+        val (title, body) = buildPopupTexts(type, overage)
+        mainHandler.post {
+            dismissAllPopups()
+            val view = LayoutInflater.from(this).inflate(R.layout.overlay_popup_horizontal, null)
+            view.findViewById<TextView>(R.id.popupTitle).text = title
+            view.findViewById<TextView>(R.id.popupMessage).text = body
+            val container = view.findViewById<LinearLayout>(R.id.buttonsContainer)
+
+            val total = 20
+            val ignoreIdx = (2 until total).random()  // index 2..19 — 첫/두번째 제외
+            val uniformColor = android.graphics.Color.parseColor("#555555")
+            val density = resources.displayMetrics.density
+
+            for (i in 0 until total) {
+                val isIgnoreBtn = (i == ignoreIdx)
+                val btn = Button(this).apply {
+                    text = if (isIgnoreBtn) "무시하기" else "그만하기"
+                    setTextColor(android.graphics.Color.WHITE)
+                    setBackgroundColor(uniformColor)
+                    setOnClickListener {
+                        if (isIgnoreBtn) executeIgnore(type) else executeStop(type)
+                    }
+                    minWidth = (96 * density).toInt()
+                    layoutParams = LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.WRAP_CONTENT,
+                        LinearLayout.LayoutParams.WRAP_CONTENT
+                    ).apply { setMargins((4 * density).toInt(), 0, (4 * density).toInt(), 0) }
+                }
+                container.addView(btn)
+            }
+
+            addPopupView(view, standardCenterParams(320))
+        }
+    }
+
+    // ── 공통 헬퍼 ─────────────────────────────────────────────
+
+    // overlay_popup.xml 을 inflate 해서 라벨/색/콜백 채워 반환
+    private fun makeStandardPopupView(
+        title: String,
+        message: String,
+        stopText: String,
+        ignoreText: String,
+        onStopClick: () -> Unit,
+        onIgnoreClick: () -> Unit
+    ): View {
+        val view = LayoutInflater.from(this).inflate(R.layout.overlay_popup, null)
+        view.findViewById<TextView>(R.id.popupTitle).text = title
+        view.findViewById<TextView>(R.id.popupMessage).text = message
+        view.findViewById<Button>(R.id.btnStop).apply {
+            text = stopText
+            setOnClickListener { onStopClick() }
+        }
+        view.findViewById<Button>(R.id.btnIgnore).apply {
+            text = ignoreText
+            setOnClickListener { onIgnoreClick() }
+        }
+        return view
+    }
+
+    // 화면 중앙, 너비 widthDp dp, 높이 wrap_content 인 popup params
+    private fun standardCenterParams(widthDp: Int): WindowManager.LayoutParams {
+        val widthPx = (widthDp * resources.displayMetrics.density).toInt()
+        return WindowManager.LayoutParams(
+            widthPx,
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+            PixelFormat.TRANSLUCENT
+        ).apply { gravity = Gravity.CENTER }
+    }
+
+    // 화면 중앙, 너비 widthDp / 높이 heightDp 고정 popup params — variant 2 처럼 ScrollView 가 있을 때 사용
+    private fun fixedSizeCenterParams(widthDp: Int, heightDp: Int): WindowManager.LayoutParams {
+        val density = resources.displayMetrics.density
+        return WindowManager.LayoutParams(
+            (widthDp * density).toInt(),
+            (heightDp * density).toInt(),
+            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+            PixelFormat.TRANSLUCENT
+        ).apply { gravity = Gravity.CENTER }
+    }
+
+    // popup view 를 list 에 등록 + WindowManager 에 추가
+    private fun addPopupView(view: View, params: WindowManager.LayoutParams) {
+        try {
+            windowManager?.addView(view, params)
+            popupViews.add(view)
+            isPopupShowing = true
+            Log.d(TAG, "popup add — 현재 ${popupViews.size}개")
+        } catch (e: Exception) {
+            Log.e(TAG, "popup add 실패 — ${e.message}")
+        }
+    }
+
+    // ── 사용자 응답 처리 액션 ─────────────────────────────────
+
+    // 그만하기 — 5분 차단 시작, popup 전부 dismiss, 홈으로 강제 이동
+    private fun executeStop(type: String) {
+        val now = System.currentTimeMillis()
+        stopUntilMs = now + STOP_BLOCK_MS
+        savePersistedState()
+        sendViolation(type, lastHourlyCount, "stop")
+        clearPendingPopup()
+        dismissAllPopups()
+        Log.d(TAG, "그만하기 선택 → 5분 차단 시작")
+        performGlobalAction(GLOBAL_ACTION_HOME)
+    }
+
+    // 무시하기 (variant 4 제외) — popup 전부 dismiss + violation 전송
+    private fun executeIgnore(type: String) {
+        sendViolation(type, lastHourlyCount, "ignore")
+        clearPendingPopup()
+        dismissAllPopups()
+        Log.d(TAG, "무시하기 선택 → 다음 milestone 까지 대기")
+    }
+
+    // popupViews 의 4-튜플 비구조화 분해를 위한 헬퍼
+    private data class Quadruple<A, B, C, D>(val first: A, val second: B, val third: C, val fourth: D)
+
+    // ── 상태 저장 헬퍼 ────────────────────────────────────────
+
+    private fun savePersistedState() {
+        val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
+        prefs.edit()
+            .putInt(PK_DAILY_MILESTONE, dailyMilestone)
+            .putInt(PK_HOURLY_MILESTONE, hourlyMilestone)
+            .putLong(PK_STOP_UNTIL, stopUntilMs)
+            .putLong(PK_TODAY_START, todayStartMs)
+            .apply()
+    }
+
+    // 미응답 popup 기록 — YT 강제종료 후에도 재진입 시 같은 popup 복원
+    private fun setPendingPopup(type: String, overage: Int) {
+        pendingPopupType = type
+        pendingPopupOverage = overage
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+            .putString(PK_PENDING_TYPE, type)
+            .putInt(PK_PENDING_OVERAGE, overage)
+            .apply()
+    }
+
+    // 사용자 응답(Stop/Ignore) 시 pending 해제
+    private fun clearPendingPopup() {
+        pendingPopupType = null
+        pendingPopupOverage = 0
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+            .remove(PK_PENDING_TYPE)
+            .remove(PK_PENDING_OVERAGE)
+            .apply()
+    }
+
+    // ── 서버 통신 ─────────────────────────────────────────────
+
     // Firebase ID 토큰 가져오기
-    // 서버 요청 시 Authorization: Bearer <token> 헤더에 사용
-    // getIdToken(false): 토큰 유효하면 캐시 사용, 만료됐으면 자동 갱신
     private suspend fun getFirebaseToken(): String? {
         return try {
             val user = com.google.firebase.auth.FirebaseAuth.getInstance().currentUser
@@ -403,10 +899,8 @@ class ShortCutAccessibilityService : AccessibilityService() {
     }
 
     // violation 발생 시 서버로 POST /violations 전송
-    // limitType: "hourly" 또는 "daily", action: "stop" 또는 "ignore"
-    // Authorization 헤더에 Firebase 토큰 포함 — 서버 미들웨어가 검증
     private fun sendViolation(limitType: String, scrollCount: Int, action: String) {
-        val prefs = getSharedPreferences("short_cut_prefs", MODE_PRIVATE)
+        val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
         val userId = prefs.getString("userId", "unknown") ?: "unknown"
 
         val json = """
@@ -421,7 +915,6 @@ class ShortCutAccessibilityService : AccessibilityService() {
 
         serviceScope.launch {
             try {
-                // Firebase 토큰 가져오기 — 없으면 인증 실패로 전송 중단
                 val token = getFirebaseToken()
                 if (token == null) {
                     Log.e(TAG, "violation 전송 실패 — 토큰 없음")
@@ -433,7 +926,7 @@ class ShortCutAccessibilityService : AccessibilityService() {
                 val body = json.toRequestBody(mediaType)
                 val request = okhttp3.Request.Builder()
                     .url("https://short-cut-server-production.up.railway.app/violations")
-                    .addHeader("Authorization", "Bearer $token") // Firebase 인증 토큰 헤더
+                    .addHeader("Authorization", "Bearer $token")
                     .post(body)
                     .build()
 
@@ -446,10 +939,8 @@ class ShortCutAccessibilityService : AccessibilityService() {
     }
 
     // 서버로 POST /userlogs 전송 — 배치 기간 동안 누적된 스크롤 횟수 저장
-    // Firestore userLogs에 저장되어 일간/주간/월간 통계에 활용
-    // Authorization 헤더에 Firebase 토큰 포함 — 서버 미들웨어가 검증
     private fun sendUserLog(scrollCount: Int) {
-        val prefs = getSharedPreferences("short_cut_prefs", MODE_PRIVATE)
+        val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
         val userId = prefs.getString("userId", "unknown") ?: "unknown"
 
         val json = """
@@ -462,7 +953,6 @@ class ShortCutAccessibilityService : AccessibilityService() {
 
         serviceScope.launch {
             try {
-                // Firebase 토큰 가져오기 — 없으면 인증 실패로 전송 중단
                 val token = getFirebaseToken()
                 if (token == null) {
                     Log.e(TAG, "userLog 전송 실패 — 토큰 없음")
@@ -474,7 +964,7 @@ class ShortCutAccessibilityService : AccessibilityService() {
                 val body = json.toRequestBody(mediaType)
                 val request = okhttp3.Request.Builder()
                     .url("https://short-cut-server-production.up.railway.app/userlogs")
-                    .addHeader("Authorization", "Bearer $token") // Firebase 인증 토큰 헤더
+                    .addHeader("Authorization", "Bearer $token")
                     .post(body)
                     .build()
 
@@ -486,14 +976,10 @@ class ShortCutAccessibilityService : AccessibilityService() {
         }
     }
 
-    // 5분 후 batchTimerRunnable 실행 예약
-// onServiceConnected에서 최초 1회 호출, 이후 타이머가 스스로 재예약
     private fun scheduleBatchTimer() {
         batchHandler.postDelayed(batchTimerRunnable, 5 * 60 * 1000L)
     }
 
-    // 누적된 스크롤 횟수를 서버로 전송하고 카운터 초기화
-// 누적 횟수가 0이면 전송하지 않음 (불필요한 요청 방지)
     private fun flushBatch() {
         val count = batchScrollCount
         if (count <= 0) return
@@ -501,22 +987,23 @@ class ShortCutAccessibilityService : AccessibilityService() {
         sendUserLog(count)
     }
 
-    private fun dismissPopup() {
-        popupView?.let {
-            windowManager?.removeView(it)
-            popupView = null
-        }
+    // 모든 popup view 제거 — variant 4 stacked 포함 전체 dismiss
+    private fun dismissAllPopups() {
+        val copy = popupViews.toList()
+        popupViews.clear()
         isPopupShowing = false
+        copy.forEach { view ->
+            try { windowManager?.removeView(view) } catch (_: Exception) {}
+        }
     }
 
     override fun onInterrupt() {
-        dismissPopup()
+        dismissAllPopups()
         Log.d(TAG, "서비스 중단됨")
     }
 
     override fun onDestroy() {
-        dismissPopup()
-        // 타이머 취소 + 남은 배치 전송 (서비스 종료 전에 실행해야 함)
+        dismissAllPopups()
         batchHandler.removeCallbacks(batchTimerRunnable)
         flushBatch()
         super.onDestroy()

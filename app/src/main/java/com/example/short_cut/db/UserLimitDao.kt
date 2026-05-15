@@ -19,4 +19,18 @@ interface UserLimitDao {
     // 반환값이 null일 수 있음 — 저장된 설정이 없으면 null 반환
     @Query("SELECT * FROM user_limit WHERE userId = :userId LIMIT 1")
     suspend fun getLimit(userId: String): UserLimit?
+
+    // pending 값이 만료된 경우 (pendingEffectiveAt <= now) — pending 을 현재 limit 으로 승격
+    // 호출: limit 을 읽기 직전에 한 번 호출해서 "다음날부터 적용" 변경 예약을 일괄 반영
+    @Query("""
+        UPDATE user_limit
+        SET hourlyLimit = COALESCE(pendingHourlyLimit, hourlyLimit),
+            dailyLimit  = COALESCE(pendingDailyLimit,  dailyLimit),
+            pendingHourlyLimit = NULL,
+            pendingDailyLimit  = NULL,
+            pendingEffectiveAt = NULL,
+            updatedAt = :now
+        WHERE pendingEffectiveAt IS NOT NULL AND pendingEffectiveAt <= :now
+    """)
+    suspend fun promoteExpiredPending(now: Long)
 }

@@ -26,6 +26,10 @@ interface ScrollHistoryDao {
     @Query("DELETE FROM scroll_history WHERE timestamp < :oneWeekAgo")
     suspend fun deleteOlderThan(oneWeekAgo: Long)
 
+    // 사용자 탈퇴/로그아웃 시 로컬 스크롤 기록 전부 삭제
+    @Query("DELETE FROM scroll_history")
+    suspend fun deleteAll()
+
     // 통계 탭용 — 날짜별 스크롤 횟수 집계 (최근일자 먼저)
     // timestamp(ms) → 초 단위로 나눠 SQLite date() 에 넘기고 로컬 타임존 기준 날짜로 그룹핑
     @Query("""
@@ -35,11 +39,30 @@ interface ScrollHistoryDao {
         ORDER BY day DESC
     """)
     suspend fun countByDay(): List<DailyCount>
+
+    // 일간 통계 탭용 — 특정 하루의 시간대(0~23)별 스크롤 횟수 집계
+    // [startOfDay, endOfDay) 윈도우 안의 행만 보고 시간(0~23) 으로 GROUP BY
+    @Query("""
+        SELECT CAST(strftime('%H', timestamp / 1000, 'unixepoch', 'localtime') AS INTEGER) AS hour,
+               COUNT(*) AS count
+        FROM scroll_history
+        WHERE timestamp >= :startOfDay AND timestamp < :endOfDay
+        GROUP BY hour
+        ORDER BY hour ASC
+    """)
+    suspend fun countByHourForDay(startOfDay: Long, endOfDay: Long): List<HourlyCount>
 }
 
 // 일자별 스크롤 횟수 — countByDay() 반환 타입
 // day 형식: "YYYY-MM-DD" (SQLite date() 출력)
 data class DailyCount(
     val day: String,
+    val count: Int
+)
+
+// 시간대별 스크롤 횟수 — countByHourForDay() 반환 타입
+// hour: 0~23 (로컬 타임존 기준)
+data class HourlyCount(
+    val hour: Int,
     val count: Int
 )
