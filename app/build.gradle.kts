@@ -51,11 +51,6 @@ android {
 
 dependencies {
 
-    // Socket.IO — 서버와 Android 간 실시간 통신 라이브러리
-    // Android에 기본 내장이 아니라서 별도로 추가 필요
-    // Sync Now 누르면 Gradle이 인터넷에서 자동으로 받아옴
-    implementation("io.socket:socket.io-client:2.1.0")
-
     // Room DB — 로컬 데이터베이스 (스크롤 기록, limit 설정 저장용)
     implementation("androidx.room:room-runtime:2.7.1")  // Room 핵심 라이브러리
     implementation("androidx.room:room-ktx:2.7.1")      // Kotlin 코루틴 지원 (suspend 함수 사용 가능)

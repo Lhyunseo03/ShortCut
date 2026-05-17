@@ -16,7 +16,6 @@ import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.TextView
 import com.example.short_cut.R
-import com.example.short_cut.SocketManager
 import com.example.short_cut.db.AppDatabase
 import com.example.short_cut.db.ScrollHistory
 import kotlinx.coroutines.CoroutineScope
@@ -137,8 +136,6 @@ class ShortCutAccessibilityService : AccessibilityService() {
         }
 
         Log.d(TAG, "서비스 연결 | API ${android.os.Build.VERSION.SDK_INT}")
-        SocketManager.connect()
-        Log.d(TAG, "소켓 연결")
 
         scheduleBatchTimer()
     }
@@ -247,6 +244,23 @@ class ShortCutAccessibilityService : AccessibilityService() {
         return count
     }
 
+    // 활성 window 가 아니어도 (댓글 시트, 필터 드롭다운 등 오버레이 뒤에) 쇼츠 컨테이너가 어떤 window 에든
+    // 살아있는지 확인. 쇼츠 모드 이탈 판정에 사용 — 오버레이 뜨자마자 모드 OFF 되는 것 방지.
+    private fun isShortsVisibleInAnyWindow(): Boolean {
+        val ws = try { windows } catch (_: Exception) { null }
+        if (ws.isNullOrEmpty()) return getShortsNodeCount() > 0  // API 폴백
+        for (w in ws) {
+            val root = w.root ?: continue
+            try {
+                val nodes = root.findAccessibilityNodeInfosByViewId(SHORTS_NODE_ID)
+                if ((nodes?.size ?: 0) > 0) return true
+            } finally {
+                root.recycle()
+            }
+        }
+        return false
+    }
+
     private fun getShortsFingerprint(): String {
         val root = rootInActiveWindow ?: return ""
         val descs = mutableListOf<String>()
@@ -327,14 +341,19 @@ class ShortCutAccessibilityService : AccessibilityService() {
                         showLimitPopup(type, pendingPopupOverage)
                     }
                 } else if (nodeCount == 0 && isInShortsMode) {
-                    isInShortsMode = false
-                    lastNodeCount = 0
-                    // YT 안에서 쇼츠 탭을 벗어나도 popup 은 숨김 — pending 은 유지
-                    if (popupViews.isNotEmpty()) {
-                        Log.d(TAG, "쇼츠 이탈 → popup 숨김 (pending 유지)")
-                        dismissAllPopups()
+                    // 활성 window 에 쇼츠 노드가 없어도, 다른 window (댓글 시트, 필터 드롭다운 등)
+                    // 뒤에 쇼츠 컨테이너가 여전히 살아있으면 모드 유지. 진짜 이탈했을 때만 OFF.
+                    if (isShortsVisibleInAnyWindow()) {
+                        Log.d(TAG, "오버레이 감지 — 쇼츠모드 유지 (active=$nodeCount)")
+                    } else {
+                        isInShortsMode = false
+                        lastNodeCount = 0
+                        if (popupViews.isNotEmpty()) {
+                            Log.d(TAG, "쇼츠 이탈 → popup 숨김 (pending 유지)")
+                            dismissAllPopups()
+                        }
+                        Log.d(TAG, "쇼츠모드 OFF")
                     }
-                    Log.d(TAG, "쇼츠모드 OFF")
                 }
             }
 
@@ -507,14 +526,17 @@ class ShortCutAccessibilityService : AccessibilityService() {
     }
 
     private fun showHourlyPopupHard(overage: Int) {
-        val variant = (1..5).random()
+        // [임시] variant 6 (수학) 테스트용 — 다른 variant 주석 처리. 확인 끝나면 원복 필요.
+        // val variant = (1..6).random()
+        val variant = 6
         Log.d(TAG, "하드 모드 hourly popup variant=$variant")
         when (variant) {
-            1 -> showHardCountdown(overage)
-            2 -> showHardVerticalGrid(overage)
-            3 -> showHardSwappedLabels(overage)
-            4 -> showHardStacked(overage)
-            5 -> showHardHorizontalScroll(overage)
+            // 1 -> showHardCountdown(overage)
+            // 2 -> showHardVerticalGrid(overage)
+            // 3 -> showHardSwappedLabels(overage)
+            // 4 -> showHardStacked(overage)
+            // 5 -> showHardHorizontalScroll(overage)
+            6 -> showHardMath(overage)
         }
     }
 
@@ -763,6 +785,136 @@ class ShortCutAccessibilityService : AccessibilityService() {
 
             addPopupView(view, standardCenterParams(320))
         }
+    }
+
+    // ── Variant 6 — 수학 문제. 정답 선택 시 무시하기 활성화, 오답 선택 시 그만하기 활성화 ──
+    // 5지선다 중 1개 정답. 한 번 선택하면 다른 선택지는 잠금 — 재시도 불가.
+    private fun showHardMath(overage: Int) {
+        val type = "hourly"
+        val (title, body) = buildPopupTexts(type, overage)
+
+        val (questionText, correctAnswer) = generateMathProblem()
+        val wrongAnswers = generateWrongAnswers(correctAnswer, 4)
+        val allChoices = (wrongAnswers + correctAnswer).shuffled()
+
+        mainHandler.post {
+            dismissAllPopups()
+            val view = LayoutInflater.from(this).inflate(R.layout.overlay_popup_math, null)
+            view.findViewById<TextView>(R.id.popupTitle).text = title
+            view.findViewById<TextView>(R.id.popupMessage).text = body
+            view.findViewById<TextView>(R.id.mathQuestion).text = questionText
+            val container = view.findViewById<LinearLayout>(R.id.choicesContainer)
+
+            val btnStop = view.findViewById<Button>(R.id.btnStop)
+            val btnIgnore = view.findViewById<Button>(R.id.btnIgnore)
+
+            btnStop.text = "그만하기"
+            btnStop.isEnabled = false
+            btnStop.alpha = 0.5f
+            btnStop.setOnClickListener { executeStop(type) }
+
+            btnIgnore.text = "무시하기"
+            btnIgnore.isEnabled = false
+            btnIgnore.alpha = 0.5f
+            btnIgnore.setOnClickListener { executeIgnore(type) }
+
+            val density = resources.displayMetrics.density
+            val uniformColor = android.graphics.Color.parseColor("#555555")
+            val choiceButtons = mutableListOf<Button>()
+            var answered = false
+
+            for (choice in allChoices) {
+                val btn = Button(this).apply {
+                    text = choice.toString()
+                    setTextColor(android.graphics.Color.WHITE)
+                    setBackgroundColor(uniformColor)
+                    layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                        .apply { setMargins((4 * density).toInt(), 0, (4 * density).toInt(), 0) }
+                    setOnClickListener {
+                        if (answered) return@setOnClickListener
+                        answered = true
+                        // 다른 선택지 잠금
+                        choiceButtons.forEach { it.isEnabled = false }
+                        if (choice == correctAnswer) {
+                            btnIgnore.isEnabled = true
+                            btnIgnore.alpha = 1f
+                        } else {
+                            btnStop.isEnabled = true
+                            btnStop.alpha = 1f
+                        }
+                    }
+                }
+                choiceButtons.add(btn)
+                container.addView(btn)
+            }
+
+            addPopupView(view, standardCenterParams(360))
+        }
+    }
+
+    // 사칙연산 문제 생성 — 3개 피연산자 + 2개 연산자, 피연산자는 최대 2자리(1..99)
+    // 예: "11 + 29 × 6 = ?" (× 우선 적용해서 11 + 174 = 185)
+    // 연산자는 + - × 중 랜덤. ÷ 는 다항식에서 정수 보장이 까다로워 제외.
+    private fun generateMathProblem(): Pair<String, Long> {
+        val a = (1..99).random()
+        val b = (1..99).random()
+        val c = (1..99).random()
+        val ops = listOf("+", "-", "×")
+        val op1 = ops.random()
+        val op2 = ops.random()
+
+        fun apply(x: Long, op: String, y: Long): Long = when (op) {
+            "+" -> x + y
+            "-" -> x - y
+            "×" -> x * y
+            else -> error("unknown op: $op")
+        }
+
+        // × 우선순위 처리
+        val result: Long = when {
+            op1 == "×" && op2 != "×" -> apply(a.toLong() * b, op2, c.toLong())   // (a×b) op2 c
+            op2 == "×" && op1 != "×" -> apply(a.toLong(), op1, b.toLong() * c)   // a op1 (b×c)
+            else -> apply(apply(a.toLong(), op1, b.toLong()), op2, c.toLong())    // 좌→우
+        }
+
+        return "$a $op1 $b $op2 $c = ?" to result
+    }
+
+    // 정답의 1의 자리는 그대로 두고, 나머지 자릿수는 모두 다른 숫자로 바꾼 오답을 count 개 생성
+    // (1자리 정답이면 앞에 1~2 자리를 새로 붙여 만듦)
+    private fun generateWrongAnswers(correct: Long, count: Int): List<Long> {
+        val absValue = if (correct < 0) -correct else correct
+        val sign = if (correct < 0) -1L else 1L
+        val digits = absValue.toString().toCharArray()
+        val onesIdx = digits.size - 1
+        val candidates = linkedSetOf<Long>()
+
+        var attempt = 0
+        while (candidates.size < count && attempt < 500) {
+            attempt++
+            val candidate: Long = if (digits.size == 1) {
+                // 1자리 정답 — 앞에 자릿수 1~2개 prefix
+                val prefixLen = (1..2).random()
+                val sb = StringBuilder()
+                for (k in 0 until prefixLen) {
+                    sb.append(if (k == 0) ('1'..'9').random() else ('0'..'9').random())
+                }
+                sb.append(digits[0])
+                sb.toString().toLong() * sign
+            } else {
+                val newDigits = digits.copyOf()
+                for (i in 0 until onesIdx) {
+                    val orig = newDigits[i]
+                    var pick: Char
+                    val pool = if (i == 0) ('1'..'9') else ('0'..'9')  // 맨 앞은 0 불가
+                    do { pick = pool.random() } while (pick == orig)
+                    newDigits[i] = pick
+                }
+                String(newDigits).toLong() * sign
+            }
+            if (candidate != correct) candidates.add(candidate)
+        }
+        return candidates.toList()
     }
 
     // ── 공통 헬퍼 ─────────────────────────────────────────────

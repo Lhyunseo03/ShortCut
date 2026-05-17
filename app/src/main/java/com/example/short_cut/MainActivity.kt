@@ -19,8 +19,6 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.foundation.pager.HorizontalPager
-import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -158,6 +156,8 @@ fun LoginScreen(onLoginSuccess: () -> Unit = {}) {
     // Firebase Auth 인스턴스 — 로그인/로그아웃/토큰 관리
     val auth = FirebaseAuth.getInstance()
 
+    val scope = rememberCoroutineScope()
+
     // 구글 로그인 옵션 설정
     // requestIdToken: 서버에서 토큰 검증할 때 필요한 ID 토큰 요청
     // web client ID — google-services.json의 client_type: 3 값
@@ -192,6 +192,19 @@ fun LoginScreen(onLoginSuccess: () -> Unit = {}) {
                     // ShortCutAccessibilityService에서 이 값을 읽어 서버 요청에 사용
                     val prefs = context.getSharedPreferences("short_cut_prefs", android.content.Context.MODE_PRIVATE)
                     prefs.edit().putString("userId", userId).apply()
+
+                    // 서버에 저장된 hourly/daily limit 동기화 — 다른 기기에서 변경한 값이 있다면 가져옴
+                    scope.launch {
+                        val limits = fetchLimitsFromServer(userId)
+                        if (limits != null) {
+                            val (h, d) = limits
+                            AppDatabase.getDatabase(context).userLimitDao()
+                                .insert(UserLimit(userId = userId, hourlyLimit = h, dailyLimit = d))
+                            Log.d("Auth", "서버 limit 동기화 — hourly=$h, daily=$d")
+                        } else {
+                            Log.w("Auth", "서버 limit 동기화 실패 — 로컬/기본값 사용")
+                        }
+                    }
 
                     Log.d("Auth", "구글 로그인 성공 — userId: $userId")
                     onLoginSuccess()
@@ -596,6 +609,50 @@ private fun StatsTabContent() {
     }
 }
 
+// 월간/주간 서버 요약 카드 — 총 스크롤·일평균·피크일을 한 줄로 표시
+@Composable
+private fun StatsSummaryCard(
+    title: String,
+    totalScroll: Int?,
+    avgPerDay: Int?,
+    peakDate: String?,
+    peakCount: Int?,
+    loading: Boolean,
+    errorMsg: String?
+) {
+    Surface(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(bottom = 12.dp),
+        shape = RoundedCornerShape(10.dp),
+        color = Color(0xFFF7F7F7)
+    ) {
+        Column(modifier = Modifier.padding(12.dp)) {
+            Text(title, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = Color(0xFF555555))
+            Spacer(Modifier.height(6.dp))
+            when {
+                loading -> Text("불러오는 중...", fontSize = 12.sp, color = Color(0xFF888888))
+                errorMsg != null -> Text(errorMsg, fontSize = 12.sp, color = Color(0xFFC62828))
+                else -> {
+                    val peakStr = if (peakDate != null) "$peakDate (${peakCount ?: 0}회)" else "—"
+                    Text(
+                        "총 ${totalScroll ?: 0}회 · 일평균 ${avgPerDay ?: 0}회",
+                        fontSize = 14.sp,
+                        color = Color(0xFF1A1A1A),
+                        fontWeight = FontWeight.SemiBold
+                    )
+                    Text(
+                        "피크일 $peakStr",
+                        fontSize = 12.sp,
+                        color = Color(0xFF555555),
+                        modifier = Modifier.padding(top = 2.dp)
+                    )
+                }
+            }
+        }
+    }
+}
+
 // ── 월간: 달력 히트맵 ──────────────────────────────────────────────────
 // 한 달 캘린더 그리드. 그 날 스크롤 횟수에 비례해 빨간색 농도로 칸을 칠함.
 // 좌우 화살표로 월 이동. monthOffset 0=이번 달, -1=저번 달, ...
@@ -603,6 +660,9 @@ private fun StatsTabContent() {
 private fun StatsMonthly() {
     val context = LocalContext.current
     val db = remember { AppDatabase.getDatabase(context) }
+    val userId = remember {
+        context.getSharedPreferences("short_cut_prefs", Context.MODE_PRIVATE).getString("userId", null)
+    }
     var rows by remember { mutableStateOf<List<DailyCount>>(emptyList()) }
 
     LaunchedEffect(Unit) {
@@ -619,6 +679,19 @@ private fun StatsMonthly() {
             set(Calendar.MILLISECOND, 0)
             add(Calendar.MONTH, monthOffset)
         }
+    }
+
+    // 서버 월간 요약 — 화면 상단 카드. 달력 히트맵은 로컬 Room 데이터 유지.
+    val monthKey = remember(monthOffset) { SimpleDateFormat("yyyy-MM", Locale.US).format(cal.time) }
+    var summary by remember(monthOffset) { mutableStateOf<MonthStatsRemote?>(null) }
+    var summaryLoading by remember(monthOffset) { mutableStateOf(true) }
+    var summaryError by remember(monthOffset) { mutableStateOf<String?>(null) }
+    LaunchedEffect(monthOffset, userId) {
+        summaryLoading = true
+        summaryError = null
+        val s = userId?.let { fetchMonthlyStats(it, monthKey) }
+        if (s != null) summary = s else summaryError = "서버 요약을 불러오지 못했습니다"
+        summaryLoading = false
     }
     val year = cal.get(Calendar.YEAR)
     val month = cal.get(Calendar.MONTH) // 0~11
@@ -637,6 +710,15 @@ private fun StatsMonthly() {
     val maxCount = (countByDate.values.maxOrNull() ?: 0).coerceAtLeast(1)
 
     Column(modifier = Modifier.fillMaxSize()) {
+        StatsSummaryCard(
+            title = "이번 달 서버 요약",
+            totalScroll = summary?.totalScroll,
+            avgPerDay = summary?.avgScrollPerDay,
+            peakDate = summary?.peakDate,
+            peakCount = summary?.peakCount,
+            loading = summaryLoading,
+            errorMsg = summaryError
+        )
         // 월 네비 ← 2026.05 →
         Row(
             modifier = Modifier
@@ -761,13 +843,15 @@ private fun StatsMonthly() {
     }
 }
 
-// ── 주간: 기존 막대 그래프 (월~일) ─────────────────────────────────────
-// HorizontalPager 로 좌우 스크롤. 가운데 페이지(=initialPage)가 "이번 주",
-// 양쪽으로 +1주/-1주 이동.
+// ── 주간: 막대 그래프 (월~일) ──────────────────────────────────────────
+// ◀ ▶ 버튼으로 주 이동. 일간/월간과 같은 패턴. 다음 주(미래) 버튼은 weekOffset==0 일 때 비활성.
 @Composable
 private fun StatsWeekly() {
     val context = LocalContext.current
     val db = remember { AppDatabase.getDatabase(context) }
+    val userId = remember {
+        context.getSharedPreferences("short_cut_prefs", Context.MODE_PRIVATE).getString("userId", null)
+    }
     var rows by remember { mutableStateOf<List<DailyCount>>(emptyList()) }
 
     LaunchedEffect(Unit) {
@@ -775,34 +859,78 @@ private fun StatsWeekly() {
     }
 
     val thisWeekMonday = remember { mondayOf(System.currentTimeMillis()) }
-    val pageCount = 2000
-    val initialPage = pageCount / 2
-    val pagerState = rememberPagerState(initialPage = initialPage) { pageCount }
+    var weekOffset by remember { mutableStateOf(0) }  // 0=이번 주, -1=지난 주, ...
+    val currentWeekStart = remember(weekOffset) {
+        thisWeekMonday + weekOffset.toLong() * 7L * 24L * 60L * 60L * 1000L
+    }
+    val weekDateStr = remember(currentWeekStart) {
+        SimpleDateFormat("yyyy-MM-dd", Locale.US).format(
+            Calendar.getInstance().apply { timeInMillis = currentWeekStart }.time
+        )
+    }
+    var summary by remember { mutableStateOf<WeekStatsRemote?>(null) }
+    var summaryLoading by remember { mutableStateOf(true) }
+    var summaryError by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(currentWeekStart, userId) {
+        summaryLoading = true
+        summaryError = null
+        summary = null
+        val s = userId?.let { fetchWeeklyStats(it, weekDateStr) }
+        if (s != null) summary = s else summaryError = "서버 요약을 불러오지 못했습니다"
+        summaryLoading = false
+    }
+
+    val counts = remember(currentWeekStart, rows) { buildWeekCounts(currentWeekStart, rows) }
+
+    // 주 헤더용 날짜 라벨 (예: "2026.05.11 ~ 05.17")
+    val weekRangeLabel = remember(currentWeekStart) {
+        val rangeFmt = SimpleDateFormat("yyyy.MM.dd", Locale.US)
+        val endFmt = SimpleDateFormat("MM.dd", Locale.US)
+        val cal = Calendar.getInstance().apply { timeInMillis = currentWeekStart }
+        val startStr = rangeFmt.format(cal.time)
+        cal.add(Calendar.DAY_OF_YEAR, 6)
+        val endStr = endFmt.format(cal.time)
+        "$startStr ~ $endStr"
+    }
 
     Column(modifier = Modifier.fillMaxSize()) {
-        Text(
-            text = "주간 Daily Scroll",
-            fontSize = 20.sp,
-            fontWeight = FontWeight.ExtraBold,
-            color = Color(0xFF1A1A1A),
-            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
-        )
-        Text(
-            text = "← 좌우로 밀어 다른 주 보기 →",
-            fontSize = 12.sp,
-            color = Color(0xFF888888),
-            modifier = Modifier.padding(start = 8.dp, bottom = 12.dp)
+        StatsSummaryCard(
+            title = "이번 주 서버 요약",
+            totalScroll = summary?.totalScroll,
+            avgPerDay = summary?.avgScrollPerDay,
+            peakDate = summary?.peakDate,
+            peakCount = summary?.peakCount,
+            loading = summaryLoading,
+            errorMsg = summaryError
         )
 
-        HorizontalPager(
-            state = pagerState,
-            modifier = Modifier.fillMaxSize()
-        ) { page ->
-            val weekOffset = page - initialPage
-            val weekStart = thisWeekMonday + weekOffset.toLong() * 7L * 24L * 60L * 60L * 1000L
-            val counts = remember(weekStart, rows) { buildWeekCounts(weekStart, rows) }
-            WeekBarChart(weekStart = weekStart, counts = counts)
+        // 주 네비 ◀ 2026.05.11 ~ 05.17 ▶
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(bottom = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.Center
+        ) {
+            IconButton(onClick = { weekOffset-- }) {
+                Icon(Icons.Filled.ChevronLeft, contentDescription = "이전 주")
+            }
+            Text(
+                text = weekRangeLabel,
+                fontSize = 16.sp,
+                fontWeight = FontWeight.Bold,
+                color = Color(0xFF1A1A1A),
+                modifier = Modifier.padding(horizontal = 12.dp)
+            )
+            IconButton(
+                onClick = { if (weekOffset < 0) weekOffset++ },
+                enabled = weekOffset < 0
+            ) {
+                Icon(Icons.Filled.ChevronRight, contentDescription = "다음 주")
+            }
         }
+
+        WeekBarChart(counts = counts)
     }
 }
 
@@ -813,22 +941,35 @@ private fun StatsWeekly() {
 private fun StatsDaily() {
     val context = LocalContext.current
     val db = remember { AppDatabase.getDatabase(context) }
-
-    var dayOffset by remember { mutableStateOf(0) } // 0=오늘, -1=어제
-    var hourly by remember { mutableStateOf<List<HourlyCount>>(emptyList()) }
-
-    LaunchedEffect(dayOffset) {
-        val startOfDay = startOfDayMs(dayOffset)
-        val endOfDay = startOfDayMs(dayOffset + 1)
-        hourly = db.scrollHistoryDao().countByHourForDay(startOfDay, endOfDay)
+    val userId = remember {
+        context.getSharedPreferences("short_cut_prefs", Context.MODE_PRIVATE).getString("userId", null)
     }
 
-    // 24 길이의 시간대별 카운트 배열로 채워넣기
-    val counts = remember(hourly) {
-        IntArray(24).also { arr ->
-            hourly.forEach { hc ->
-                if (hc.hour in 0..23) arr[hc.hour] = hc.count
+    var dayOffset by remember { mutableStateOf(0) } // 0=오늘, -1=어제
+    var counts by remember { mutableStateOf(IntArray(24)) }
+    var serverStats by remember { mutableStateOf<DailyStatsRemote?>(null) }
+    var source by remember { mutableStateOf("loading") }  // "server" / "local" / "loading"
+
+    LaunchedEffect(dayOffset, userId) {
+        source = "loading"
+        // 서버 우선 — 실패 시 로컬 Room 폴백
+        val date = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(
+            Calendar.getInstance().apply { add(Calendar.DAY_OF_YEAR, dayOffset) }.time
+        )
+        val remote = userId?.let { fetchDailyStats(it, date) }
+        if (remote != null) {
+            serverStats = remote
+            counts = remote.hourlyCounts
+            source = "server"
+        } else {
+            serverStats = null
+            val startOfDay = startOfDayMs(dayOffset)
+            val endOfDay = startOfDayMs(dayOffset + 1)
+            val hourly = db.scrollHistoryDao().countByHourForDay(startOfDay, endOfDay)
+            counts = IntArray(24).also { arr ->
+                hourly.forEach { if (it.hour in 0..23) arr[it.hour] = it.count }
             }
+            source = "local"
         }
     }
     // 누적값 — cumulative[i] = counts[0..i-1] 합. 길이 25
@@ -879,11 +1020,19 @@ private fun StatsDaily() {
         }
 
         Text(
-            text = "총 ${total}회",
+            text = "총 ${total}회" + if (source == "local") " (로컬)" else "",
             fontSize = 14.sp,
             color = Color(0xFF555555),
             modifier = Modifier.padding(start = 8.dp, bottom = 4.dp)
         )
+        serverStats?.let { s ->
+            Text(
+                text = "한도 ${s.dailyLimit}회 · 정지 ${s.stopCount}회 · 무시 ${s.ignoreCount}회",
+                fontSize = 12.sp,
+                color = Color(0xFF888888),
+                modifier = Modifier.padding(start = 8.dp, bottom = 4.dp)
+            )
+        }
         if (peakCount > 0) {
             Text(
                 text = "피크 시간대: ${peakHour}시 ~ ${peakHour + 1}시 (${peakCount}회)",
@@ -1008,44 +1157,24 @@ private fun buildWeekCounts(weekStart: Long, rows: List<DailyCount>): List<Int> 
 
 // 한 주의 막대 그래프 — counts 는 [월, 화, 수, 목, 금, 토, 일] 순서
 @Composable
-private fun WeekBarChart(weekStart: Long, counts: List<Int>) {
+private fun WeekBarChart(counts: List<Int>) {
     val dayLabels = listOf("월", "화", "수", "목", "금", "토", "일")
-    val rangeFmt = SimpleDateFormat("yyyy.MM.dd", Locale.US)
-    val endFmt = SimpleDateFormat("MM.dd", Locale.US)
-
-    val cal = Calendar.getInstance().apply { timeInMillis = weekStart }
-    val startStr = rangeFmt.format(cal.time)
-    cal.add(Calendar.DAY_OF_YEAR, 6)
-    val endStr = endFmt.format(cal.time)
-
     val maxCount = counts.max().coerceAtLeast(1)
 
-    Column(modifier = Modifier.fillMaxSize()) {
-        Text(
-            text = "$startStr ~ $endStr",
-            fontSize = 14.sp,
-            fontWeight = FontWeight.SemiBold,
-            color = Color(0xFF1A1A1A),
-            modifier = Modifier
-                .align(Alignment.CenterHorizontally)
-                .padding(bottom = 16.dp)
-        )
-
-        Row(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(horizontal = 8.dp, vertical = 8.dp),
-            horizontalArrangement = Arrangement.spacedBy(4.dp),
-            verticalAlignment = Alignment.Bottom
-        ) {
-            counts.forEachIndexed { idx, count ->
-                BarColumn(
-                    count = count,
-                    maxCount = maxCount,
-                    label = dayLabels[idx],
-                    modifier = Modifier.weight(1f)
-                )
-            }
+    Row(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(horizontal = 8.dp, vertical = 8.dp),
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
+        verticalAlignment = Alignment.Bottom
+    ) {
+        counts.forEachIndexed { idx, count ->
+            BarColumn(
+                count = count,
+                maxCount = maxCount,
+                label = dayLabels[idx],
+                modifier = Modifier.weight(1f)
+            )
         }
     }
 }
@@ -1185,8 +1314,10 @@ private fun SettingsRootScreen(
         mutableStateOf(prefs.getString("appMode", "normal") ?: "normal")
     }
 
+    var showAccountMenu by remember { mutableStateOf(false) }
     var showLogoutConfirm by remember { mutableStateOf(false) }
     var showDeleteConfirm by remember { mutableStateOf(false) }
+    var isDeleting by remember { mutableStateOf(false) }
 
     Column(
         modifier = Modifier
@@ -1271,25 +1402,41 @@ private fun SettingsRootScreen(
 
         // ── 계정 ───────────────────────────────
         SectionTitle("계정")
-        OutlinedButton(
-            onClick = { showLogoutConfirm = true },
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(48.dp),
-            shape = RoundedCornerShape(10.dp)
-        ) {
-            Text("로그아웃", color = Color(0xFF1A1A1A))
-        }
-        OutlinedButton(
-            onClick = { showDeleteConfirm = true },
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(48.dp),
-            shape = RoundedCornerShape(10.dp),
-            colors = ButtonDefaults.outlinedButtonColors(contentColor = Color(0xFFC62828))
-        ) {
-            Text("탈퇴하기")
-        }
+        SettingsRow(
+            label = "계정 관리",
+            value = "열기 →",
+            onClick = { showAccountMenu = true }
+        )
+    }
+
+    // 계정 관리 — 로그아웃 / 탈퇴 / 취소 선택
+    if (showAccountMenu) {
+        AlertDialog(
+            onDismissRequest = { showAccountMenu = false },
+            title = { Text("계정 관리") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    TextButton(
+                        onClick = {
+                            showAccountMenu = false
+                            showLogoutConfirm = true
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text("로그아웃", color = Color(0xFF1A1A1A)) }
+                    TextButton(
+                        onClick = {
+                            showAccountMenu = false
+                            showDeleteConfirm = true
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text("탈퇴하기", color = Color(0xFFC62828)) }
+                }
+            },
+            confirmButton = {},
+            dismissButton = {
+                TextButton(onClick = { showAccountMenu = false }) { Text("취소") }
+            }
+        )
     }
 
     // 로그아웃 확인
@@ -1304,7 +1451,7 @@ private fun SettingsRootScreen(
                     prefs.edit().remove("userId").apply()
                     showLogoutConfirm = false
                     onAuthChanged()
-                }) { Text("응") }
+                }) { Text("예") }
             },
             dismissButton = {
                 TextButton(onClick = { showLogoutConfirm = false }) { Text("아니요") }
@@ -1313,39 +1460,47 @@ private fun SettingsRootScreen(
     }
 
     // 탈퇴 확인 + 처리
+    // 서버 DELETE /users/:userId 가 Firestore 데이터 + Firebase Auth 계정을 함께 삭제하므로
+    // 클라이언트에서 user.delete() 를 별도로 호출하지 않음. 토큰이 살아있을 때 서버를 먼저 호출.
     if (showDeleteConfirm) {
         AlertDialog(
-            onDismissRequest = { showDeleteConfirm = false },
+            onDismissRequest = { if (!isDeleting) showDeleteConfirm = false },
             title = { Text("탈퇴하기") },
-            text = { Text("탈퇴하면 계정과 로컬 데이터가 모두 삭제됩니다.\n정말 진행하시겠습니까?") },
+            text = { Text("탈퇴하면 계정과 모든 데이터(서버·로컬)가 삭제됩니다.\n정말 진행하시겠습니까?") },
             confirmButton = {
-                TextButton(onClick = {
-                    val user = auth.currentUser
-                    if (user == null) {
-                        showDeleteConfirm = false
-                        onAuthChanged()
-                        return@TextButton
-                    }
-                    scope.launch {
-                        // 로컬 데이터 정리 — Room 스크롤 기록 전부 삭제
-                        db.scrollHistoryDao().deleteAll()
-                    }
-                    user.delete().addOnCompleteListener { task ->
-                        if (task.isSuccessful) {
-                            prefs.edit().clear().apply()
-                            Toast.makeText(context, "탈퇴 완료", Toast.LENGTH_SHORT).show()
+                TextButton(
+                    enabled = !isDeleting,
+                    onClick = {
+                        val user = auth.currentUser
+                        if (user == null) {
                             showDeleteConfirm = false
                             onAuthChanged()
-                        } else {
-                            val msg = task.exception?.message ?: "알 수 없는 오류"
-                            Toast.makeText(context, "탈퇴 실패: $msg", Toast.LENGTH_LONG).show()
-                            showDeleteConfirm = false
+                            return@TextButton
+                        }
+                        isDeleting = true
+                        scope.launch {
+                            val ok = deleteAccountOnServer(user.uid)
+                            if (ok) {
+                                db.scrollHistoryDao().deleteAll()
+                                prefs.edit().clear().apply()
+                                try { auth.signOut() } catch (_: Exception) {}
+                                Toast.makeText(context, "탈퇴 완료", Toast.LENGTH_SHORT).show()
+                                showDeleteConfirm = false
+                                isDeleting = false
+                                onAuthChanged()
+                            } else {
+                                Toast.makeText(context, "탈퇴 실패 — 네트워크를 확인해 주세요", Toast.LENGTH_LONG).show()
+                                isDeleting = false
+                            }
                         }
                     }
-                }) { Text("응") }
+                ) { Text(if (isDeleting) "처리 중..." else "예") }
             },
             dismissButton = {
-                TextButton(onClick = { showDeleteConfirm = false }) { Text("아니요") }
+                TextButton(
+                    enabled = !isDeleting,
+                    onClick = { showDeleteConfirm = false }
+                ) { Text("아니요") }
             }
         )
     }
@@ -1559,7 +1714,7 @@ private fun SettingsLimitScreen(onBack: () -> Unit) {
                         showConfirm = false
                         onBack()
                     }
-                }) { Text("응") }
+                }) { Text("예") }
             },
             dismissButton = {
                 TextButton(onClick = { showConfirm = false }) { Text("아니요") }
@@ -1623,6 +1778,136 @@ private suspend fun pushLimitToServer(userId: String, hourlyLimit: Int, dailyLim
             success
         } catch (e: Exception) {
             Log.e("LimitSync", "전송 실패 — ${e.message}")
+            false
+        }
+    }
+}
+
+// ── 서버 통계/limit API 공통 ───────────────────────────────────────────
+private const val SERVER_BASE_URL = "https://short-cut-server-production.up.railway.app"
+
+// 일간 통계 — hourlyCounts 는 0..23 시간대별 카운트 배열 (서버 hourlyGraph 를 24 길이로 펴서 채움)
+private data class DailyStatsRemote(
+    val totalScroll: Int,
+    val dailyLimit: Int,
+    val stopCount: Int,
+    val ignoreCount: Int,
+    val hourlyCounts: IntArray
+)
+
+private data class WeekStatsRemote(
+    val totalScroll: Int,
+    val avgScrollPerDay: Int,
+    val peakDate: String?,
+    val peakCount: Int?,
+    val weekStart: String,
+    val weekEnd: String
+)
+
+private data class MonthStatsRemote(
+    val totalScroll: Int,
+    val avgScrollPerDay: Int,
+    val peakDate: String?,
+    val peakCount: Int?
+)
+
+// Firebase ID 토큰을 Bearer 헤더로 붙여 GET 요청 → JSON 파싱. 실패 시 null.
+private suspend fun authedGetJson(url: String): org.json.JSONObject? = withContext(Dispatchers.IO) {
+    try {
+        val token = FirebaseAuth.getInstance().currentUser?.getIdToken(false)?.await()?.token
+            ?: return@withContext null
+        val req = Request.Builder()
+            .url(url)
+            .addHeader("Authorization", "Bearer $token")
+            .get()
+            .build()
+        val resp = OkHttpClient().newCall(req).execute()
+        val body = resp.body?.string()
+        val ok = resp.isSuccessful
+        resp.close()
+        if (ok && body != null) org.json.JSONObject(body) else {
+            Log.w("StatsApi", "GET $url → ${resp.code}")
+            null
+        }
+    } catch (e: Exception) {
+        Log.e("StatsApi", "GET $url 실패 — ${e.message}")
+        null
+    }
+}
+
+// GET /limits/:userId — 다른 기기에서 설정한 한도값 동기화에 사용
+private suspend fun fetchLimitsFromServer(userId: String): Pair<Int, Int>? {
+    val json = authedGetJson("$SERVER_BASE_URL/limits/$userId") ?: return null
+    val h = json.optInt("hourlyLimit", -1)
+    val d = json.optInt("dailyLimit", -1)
+    return if (h > 0 && d > 0) h to d else null
+}
+
+private suspend fun fetchDailyStats(userId: String, date: String): DailyStatsRemote? {
+    val json = authedGetJson("$SERVER_BASE_URL/stats/$userId/daily?date=$date") ?: return null
+    val hourly = IntArray(24)
+    json.optJSONArray("hourlyGraph")?.let { arr ->
+        for (i in 0 until arr.length()) {
+            val obj = arr.optJSONObject(i) ?: continue
+            val hr = obj.optInt("hour", -1)
+            if (hr in 0..23) hourly[hr] = obj.optInt("scrollCount", 0)
+        }
+    }
+    return DailyStatsRemote(
+        totalScroll = json.optInt("totalScroll", 0),
+        dailyLimit = json.optInt("dailyLimit", 0),
+        stopCount = json.optInt("stopCount", 0),
+        ignoreCount = json.optInt("ignoreCount", 0),
+        hourlyCounts = hourly
+    )
+}
+
+private suspend fun fetchWeeklyStats(userId: String, date: String): WeekStatsRemote? {
+    val json = authedGetJson("$SERVER_BASE_URL/stats/$userId/weekly?date=$date") ?: return null
+    val peak = json.optJSONObject("peakDay")
+    return WeekStatsRemote(
+        totalScroll = json.optInt("totalScroll", 0),
+        avgScrollPerDay = json.optInt("avgScrollPerDay", 0),
+        peakDate = peak?.optString("date")?.takeIf { it.isNotEmpty() },
+        peakCount = peak?.optInt("scrollCount"),
+        weekStart = json.optString("weekStart", ""),
+        weekEnd = json.optString("weekEnd", "")
+    )
+}
+
+private suspend fun fetchMonthlyStats(userId: String, month: String): MonthStatsRemote? {
+    val json = authedGetJson("$SERVER_BASE_URL/stats/$userId/monthly?date=$month") ?: return null
+    val peak = json.optJSONObject("peakDay")
+    return MonthStatsRemote(
+        totalScroll = json.optInt("totalScroll", 0),
+        avgScrollPerDay = json.optInt("avgScrollPerDay", 0),
+        peakDate = peak?.optString("date")?.takeIf { it.isNotEmpty() },
+        peakCount = peak?.optInt("scrollCount")
+    )
+}
+
+// DELETE /users/:userId — 본인 계정 탈퇴
+// 서버가 Firestore 데이터 전체 + Firebase Auth 계정을 한 번에 삭제
+private suspend fun deleteAccountOnServer(userId: String): Boolean {
+    return withContext(Dispatchers.IO) {
+        try {
+            val token = FirebaseAuth.getInstance().currentUser?.getIdToken(false)?.await()?.token
+            if (token == null) {
+                Log.e("AccountDelete", "토큰 없음 — 전송 중단")
+                return@withContext false
+            }
+            val request = Request.Builder()
+                .url("https://short-cut-server-production.up.railway.app/users/$userId")
+                .addHeader("Authorization", "Bearer $token")
+                .delete()
+                .build()
+            val response = OkHttpClient().newCall(request).execute()
+            val success = response.isSuccessful
+            Log.d("AccountDelete", "DELETE /users 응답 — ${response.code} (success=$success)")
+            response.close()
+            success
+        } catch (e: Exception) {
+            Log.e("AccountDelete", "전송 실패 — ${e.message}")
             false
         }
     }
