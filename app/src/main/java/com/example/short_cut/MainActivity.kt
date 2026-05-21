@@ -15,6 +15,7 @@ import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
@@ -38,6 +39,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.platform.LocalContext
@@ -61,8 +63,13 @@ import com.google.android.gms.common.api.ApiException
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.auth.GoogleAuthProvider
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
@@ -555,16 +562,18 @@ private fun CountRow(label: String, value: Int, isExceeded: Boolean = false) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// 통계 탭 — 월간/주간/일간 서브탭
+// 통계 탭 — 일간(달력+선택일 상세)/주간(주 목록+상세)/월간(1년치 12달) 서브탭
 // ─────────────────────────────────────────────────────────────────────────
 
 private enum class StatsSubTab(val label: String) {
-    MONTHLY("월간"), WEEKLY("주간"), DAILY("일간")
+    DAILY("일간"), WEEKLY("주간"), MONTHLY("월간")
 }
 
 @Composable
 private fun StatsTabContent() {
-    var subTab by remember { mutableStateOf(StatsSubTab.MONTHLY) }
+    var subTab by remember { mutableStateOf(StatsSubTab.DAILY) }
+    // 월간에서 달을 누르면 일간 탭으로 드릴다운 — 보여줄 달을 공유 상태로 들고 있음
+    var dailyMonthOffset by remember { mutableStateOf(0) }
 
     Column(
         modifier = Modifier
@@ -602,9 +611,17 @@ private fun StatsTabContent() {
         }
 
         when (subTab) {
-            StatsSubTab.MONTHLY -> StatsMonthly()
+            StatsSubTab.DAILY -> StatsDaily(
+                monthOffset = dailyMonthOffset,
+                onMonthOffsetChange = { dailyMonthOffset = it }
+            )
             StatsSubTab.WEEKLY -> StatsWeekly()
-            StatsSubTab.DAILY -> StatsDaily()
+            StatsSubTab.MONTHLY -> StatsMonthly(
+                onMonthClick = { offset ->
+                    dailyMonthOffset = offset
+                    subTab = StatsSubTab.DAILY
+                }
+            )
         }
     }
 }
@@ -653,36 +670,365 @@ private fun StatsSummaryCard(
     }
 }
 
-// ── 월간: 달력 히트맵 ──────────────────────────────────────────────────
-// 한 달 캘린더 그리드. 그 날 스크롤 횟수에 비례해 빨간색 농도로 칸을 칠함.
-// 좌우 화살표로 월 이동. monthOffset 0=이번 달, -1=저번 달, ...
+// 스크롤량 비율(0~1) → 히트맵 색. 0이면 옅은 회색, 많을수록 진한 빨강.
+private fun heatColor(intensity: Float): Color =
+    if (intensity <= 0f) Color(0xFFF5F5F5)
+    else lerp(Color(0xFFFFE5E5), Color(0xFFC62828), 0.15f + 0.85f * intensity.coerceIn(0f, 1f))
+
+// ── 주간: 1년치 주(週) 그리드. ◀ 2026년 ▶ 로 연 이동, 그 해 주들을 4열 그리드로 색 농도(히트맵) 표시.
+//   한 주를 누르면 그 주 상세(요약 + 월~일 막대그래프). 셀은 "M.d~M.d"(연도는 위 헤더로 분리). ──
+// 그리드 합계와 상세 막대 모두 /daily 일별 데이터(같은 소스)에서 나와 항상 일치. 일간 탭과도 같은 값.
 @Composable
-private fun StatsMonthly() {
+private fun StatsWeekly() {
+    val context = LocalContext.current
+    val userId = remember {
+        context.getSharedPreferences("short_cut_prefs", Context.MODE_PRIVATE).getString("userId", null)
+    }
+    val nowMs = remember { System.currentTimeMillis() }
+    val curYear = remember { Calendar.getInstance().get(Calendar.YEAR) }
+    val thisWeekMonday = remember { mondayOf(nowMs) }
+    val todayStr = remember { SimpleDateFormat("yyyy-MM-dd", Locale.US).format(java.util.Date(nowMs)) }
+
+    var yearOffset by remember { mutableStateOf(0) }
+    val displayYear = curYear + yearOffset
+    val isCurrentYear = yearOffset == 0
+
+    // 그 해의 주(월요일)들 — 최근 주가 위로 오게 내림차순
+    val weeks = remember(yearOffset) { weeksOfYear(displayYear, thisWeekMonday, isCurrentYear).reversed() }
+
+    val dayFmt = remember { SimpleDateFormat("yyyy-MM-dd", Locale.US) }
+
+    // 표시 주들의 모든 날짜(오늘 이전)를 /daily 로 받아 일별 합산 — 그리드·상세 공통 소스
+    var dayTotals by remember(yearOffset) { mutableStateOf<Map<String, Int>>(emptyMap()) }
+    var loading by remember(yearOffset) { mutableStateOf(true) }
+    LaunchedEffect(yearOffset, userId) {
+        loading = true
+        if (userId != null) {
+            val cal = Calendar.getInstance()
+            val days = mutableListOf<String>()
+            for (ws in weeks) {
+                for (i in 0 until 7) {
+                    cal.timeInMillis = ws
+                    cal.add(Calendar.DAY_OF_YEAR, i)
+                    val ds = dayFmt.format(cal.time)
+                    if (ds <= todayStr) days.add(ds)  // yyyy-MM-dd 문자열 비교 = 날짜 비교
+                }
+            }
+            dayTotals = fetchDailyTotalsForDays(userId, days)
+        }
+        loading = false
+    }
+
+    fun weekDayCounts(ws: Long): List<Int> {
+        val cal = Calendar.getInstance()
+        return (0 until 7).map { i ->
+            cal.timeInMillis = ws
+            cal.add(Calendar.DAY_OF_YEAR, i)
+            dayTotals[dayFmt.format(cal.time)] ?: 0
+        }
+    }
+    fun weekTotal(ws: Long): Int = weekDayCounts(ws).sum()
+    val maxTotal = remember(dayTotals, weeks) {
+        (weeks.maxOfOrNull { weekTotal(it) } ?: 0).coerceAtLeast(1)
+    }
+
+    var selectedWeek by remember(yearOffset) { mutableStateOf(weeks.firstOrNull() ?: thisWeekMonday) }
+
+    val shortFmt = remember { SimpleDateFormat("M.d", Locale.US) }
+    val longStartFmt = remember { SimpleDateFormat("yyyy.MM.dd", Locale.US) }
+    val longEndFmt = remember { SimpleDateFormat("MM.dd", Locale.US) }
+    fun shortRange(ws: Long): String {
+        val c = Calendar.getInstance().apply { timeInMillis = ws }
+        val s = shortFmt.format(c.time)
+        c.add(Calendar.DAY_OF_YEAR, 6)
+        return "$s~${shortFmt.format(c.time)}"
+    }
+    fun longRange(ws: Long): String {
+        val c = Calendar.getInstance().apply { timeInMillis = ws }
+        val s = longStartFmt.format(c.time)
+        c.add(Calendar.DAY_OF_YEAR, 6)
+        return "$s ~ ${longEndFmt.format(c.time)}"
+    }
+
+    Column(modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
+        // 연 네비 ◀ 2026년 ▶
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.Center
+        ) {
+            IconButton(onClick = { yearOffset-- }) {
+                Icon(Icons.Filled.ChevronLeft, contentDescription = "이전 해")
+            }
+            Text(
+                "${displayYear}년", fontSize = 18.sp, fontWeight = FontWeight.Bold,
+                color = Color(0xFF1A1A1A), modifier = Modifier.padding(horizontal = 12.dp)
+            )
+            IconButton(onClick = { if (yearOffset < 0) yearOffset++ }, enabled = yearOffset < 0) {
+                Icon(Icons.Filled.ChevronRight, contentDescription = "다음 해")
+            }
+        }
+        if (loading) {
+            Text("불러오는 중...", fontSize = 12.sp, color = Color(0xFF888888),
+                modifier = Modifier.padding(4.dp))
+        }
+
+        // 주 그리드 — 4열
+        val cols = 4
+        val rowsN = (weeks.size + cols - 1) / cols
+        for (r in 0 until rowsN) {
+            Row(modifier = Modifier.fillMaxWidth()) {
+                for (c in 0 until cols) {
+                    val idx = r * cols + c
+                    if (idx < weeks.size) {
+                        val ws = weeks[idx]
+                        val total = weekTotal(ws)
+                        val intensity = total.toFloat() / maxTotal
+                        val selected = ws == selectedWeek
+                        var cellMod = Modifier
+                            .weight(1f)
+                            .aspectRatio(1f)
+                            .padding(3.dp)
+                            .background(heatColor(intensity), RoundedCornerShape(8.dp))
+                            .clickable { selectedWeek = ws }
+                        if (selected) cellMod = cellMod.border(2.dp, Color(0xFF1A1A1A), RoundedCornerShape(8.dp))
+                        Box(modifier = cellMod, contentAlignment = Alignment.Center) {
+                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                Text(
+                                    shortRange(ws), fontSize = 11.sp, fontWeight = FontWeight.SemiBold,
+                                    color = if (intensity > 0.55f) Color.White else Color(0xFF1A1A1A)
+                                )
+                                Text(
+                                    "${total}회", fontSize = 10.sp,
+                                    color = if (intensity > 0.55f) Color.White else Color(0xFF555555)
+                                )
+                            }
+                        }
+                    } else {
+                        Box(modifier = Modifier.weight(1f).aspectRatio(1f).padding(3.dp))
+                    }
+                }
+            }
+        }
+
+        Spacer(Modifier.height(16.dp))
+        Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(Color(0xFFEEEEEE)))
+        Spacer(Modifier.height(16.dp))
+
+        // 선택 주 상세 (그리드와 같은 dayTotals 에서 계산 → 항상 일치)
+        val dc = weekDayCounts(selectedWeek)
+        val total = dc.sum()
+        val peakIdx = dc.indices.maxByOrNull { dc[it] } ?: 0
+        val peakDateStr = if (dc[peakIdx] > 0) {
+            Calendar.getInstance().apply { timeInMillis = selectedWeek; add(Calendar.DAY_OF_YEAR, peakIdx) }
+                .let { dayFmt.format(it.time) }
+        } else null
+        Text(
+            longRange(selectedWeek), fontSize = 18.sp, fontWeight = FontWeight.Bold,
+            color = Color(0xFF1A1A1A), modifier = Modifier.padding(start = 4.dp, bottom = 8.dp)
+        )
+        StatsSummaryCard(
+            title = "주간 요약",
+            totalScroll = total,
+            avgPerDay = total / 7,
+            peakDate = peakDateStr,
+            peakCount = if (peakDateStr != null) dc[peakIdx] else null,
+            loading = loading,
+            errorMsg = null
+        )
+        Box(modifier = Modifier.fillMaxWidth().height(200.dp)) {
+            if (loading) {
+                Text("불러오는 중...", fontSize = 12.sp, color = Color(0xFF888888),
+                    modifier = Modifier.padding(8.dp))
+            } else {
+                WeekBarChart(counts = dc)
+            }
+        }
+        Spacer(Modifier.height(24.dp))
+    }
+}
+
+// ── 월간: 1년치 12달 그리드. 각 달 총 스크롤을 색 농도(히트맵)로 표시, 누르면 그 달 일간 상세로 드릴다운. ──
+// 각 달은 서버 /monthly 로 총 스크롤을 가져옴 (12회 병렬 호출).
+@Composable
+private fun StatsMonthly(onMonthClick: (monthOffset: Int) -> Unit) {
+    val context = LocalContext.current
+    val userId = remember {
+        context.getSharedPreferences("short_cut_prefs", Context.MODE_PRIVATE).getString("userId", null)
+    }
+    val now = remember { Calendar.getInstance() }
+    val curYear = now.get(Calendar.YEAR)
+    val curMonth = now.get(Calendar.MONTH) // 0..11
+
+    var yearOffset by remember { mutableStateOf(0) } // 0 = 올해
+    val displayYear = curYear + yearOffset
+
+    var monthTotals by remember(yearOffset) { mutableStateOf<Map<Int, Int>>(emptyMap()) }
+    var loading by remember(yearOffset) { mutableStateOf(true) }
+    LaunchedEffect(yearOffset, userId) {
+        loading = true
+        val map = mutableMapOf<Int, Int>()
+        if (userId != null) {
+            val results = coroutineScope {
+                (0 until 12).map { m ->
+                    async {
+                        val isFuture = displayYear > curYear || (displayYear == curYear && m > curMonth)
+                        if (isFuture) m to null
+                        else m to fetchMonthlyStats(userId, "%04d-%02d".format(displayYear, m + 1))
+                    }
+                }.awaitAll()
+            }
+            results.forEach { (m, s) -> if (s != null) map[m] = s.totalScroll }
+        }
+        monthTotals = map
+        loading = false
+    }
+    val maxTotal = (monthTotals.values.maxOrNull() ?: 0).coerceAtLeast(1)
+    val monthNames = listOf("1월","2월","3월","4월","5월","6월","7월","8월","9월","10월","11월","12월")
+
+    Column(modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
+        // 연 네비 ◀ 2026년 ▶
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.Center
+        ) {
+            IconButton(onClick = { yearOffset-- }) {
+                Icon(Icons.Filled.ChevronLeft, contentDescription = "이전 해")
+            }
+            Text(
+                "${displayYear}년", fontSize = 18.sp, fontWeight = FontWeight.Bold,
+                color = Color(0xFF1A1A1A), modifier = Modifier.padding(horizontal = 12.dp)
+            )
+            IconButton(onClick = { if (yearOffset < 0) yearOffset++ }, enabled = yearOffset < 0) {
+                Icon(Icons.Filled.ChevronRight, contentDescription = "다음 해")
+            }
+        }
+        if (loading) {
+            Text("불러오는 중...", fontSize = 12.sp, color = Color(0xFF888888),
+                modifier = Modifier.padding(4.dp))
+        }
+
+        // 3열 × 4행 그리드
+        for (rowIdx in 0 until 4) {
+            Row(modifier = Modifier.fillMaxWidth()) {
+                for (col in 0 until 3) {
+                    val m = rowIdx * 3 + col
+                    val isFuture = displayYear > curYear || (displayYear == curYear && m > curMonth)
+                    val total = monthTotals[m] ?: 0
+                    val intensity = total.toFloat() / maxTotal
+                    val bg = if (isFuture) Color(0xFFFAFAFA) else heatColor(intensity)
+                    var cellMod = Modifier
+                        .weight(1f)
+                        .aspectRatio(1.1f)
+                        .padding(4.dp)
+                        .background(bg, RoundedCornerShape(10.dp))
+                    if (!isFuture) {
+                        val monthOffset = (displayYear - curYear) * 12 + (m - curMonth)
+                        cellMod = cellMod.clickable { onMonthClick(monthOffset) }
+                    }
+                    Box(modifier = cellMod, contentAlignment = Alignment.Center) {
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            Text(
+                                monthNames[m], fontSize = 15.sp, fontWeight = FontWeight.SemiBold,
+                                color = when {
+                                    isFuture -> Color(0xFFCCCCCC)
+                                    intensity > 0.55f -> Color.White
+                                    else -> Color(0xFF1A1A1A)
+                                }
+                            )
+                            if (!isFuture) {
+                                Text(
+                                    "${total}회", fontSize = 12.sp,
+                                    color = if (intensity > 0.55f) Color.White else Color(0xFF555555),
+                                    modifier = Modifier.padding(top = 2.dp)
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Spacer(Modifier.height(16.dp))
+        Text(
+            "달을 누르면 그 달 일간 통계로 이동합니다.",
+            fontSize = 11.sp, color = Color(0xFF888888),
+            modifier = Modifier.padding(start = 4.dp)
+        )
+    }
+}
+
+// 특정 해 1월 1일 0시(local)의 Unix ms
+private fun startOfYearMs(year: Int): Long =
+    Calendar.getInstance().apply { clear(); set(year, Calendar.JANUARY, 1, 0, 0, 0) }.timeInMillis
+
+// 그 해에 속하는 주(월요일 0시) 목록 — 오름차순. 주는 목요일이 속한 해 기준(ISO 유사).
+// 현재 해면 이번 주까지만 포함(미래 주 제외).
+private fun weeksOfYear(year: Int, thisWeekMonday: Long, isCurrentYear: Boolean): List<Long> {
+    var ws = mondayOf(startOfYearMs(year))
+    val result = mutableListOf<Long>()
+    val cal = Calendar.getInstance()
+    while (true) {
+        cal.timeInMillis = ws
+        cal.add(Calendar.DAY_OF_YEAR, 3) // 그 주의 목요일
+        val thuYear = cal.get(Calendar.YEAR)
+        if (thuYear > year) break
+        if (thuYear == year) {
+            if (isCurrentYear && ws > thisWeekMonday) break
+            result.add(ws)
+        }
+        ws += 7L * 24L * 60L * 60L * 1000L
+    }
+    return result
+}
+
+// /logs/range 로 기간 내 모든 스크롤 로그를 받아 일별(local) 합산. 주간 통계 목록·상세 공통 소스.
+// 로그 한 건당 scrollCount(묶음 수) 를 그 로그 timestamp 가 속한 날짜에 더함.
+// 여러 날짜("yyyy-MM-dd")의 일별 총 스크롤을 /daily 로 받아 맵으로 반환. 동시 호출은 8개로 제한.
+// 주간 통계의 그리드 합계와 상세 막대가 같은 소스(일별 /daily)에서 나오게 해 항상 일치시킴.
+private suspend fun fetchDailyTotalsForDays(userId: String, days: List<String>): Map<String, Int> = coroutineScope {
+    val sem = Semaphore(8)
+    days.map { d ->
+        async { d to sem.withPermit { fetchDailyStats(userId, d)?.totalScroll ?: 0 } }
+    }.awaitAll().toMap()
+}
+
+// ── 일간: 월 달력 + 선택일 24시간 누적 그래프 ───────────────────────────
+// 상단 달력(히트맵)에서 날짜를 누르면 그 날의 시간대별 누적 스크롤 그래프를 아래에 표시.
+// 그래프엔 그 날의 daily limit 을 주황 점선으로 그려 한도 초과 여부를 한눈에 보여줌.
+// monthOffset 은 상위(StatsTabContent)에서 들고 있어 월간 탭에서 드릴다운 가능.
+@Composable
+private fun StatsDaily(monthOffset: Int, onMonthOffsetChange: (Int) -> Unit) {
     val context = LocalContext.current
     val db = remember { AppDatabase.getDatabase(context) }
     val userId = remember {
         context.getSharedPreferences("short_cut_prefs", Context.MODE_PRIVATE).getString("userId", null)
     }
-    var rows by remember { mutableStateOf<List<DailyCount>>(emptyList()) }
 
-    LaunchedEffect(Unit) {
+    // 달력 히트맵용 로컬 일자별 카운트 + 로컬 폴백용 현재 daily limit
+    var rows by remember { mutableStateOf<List<DailyCount>>(emptyList()) }
+    var currentDailyLimit by remember { mutableStateOf(0) }
+    LaunchedEffect(userId) {
         rows = db.scrollHistoryDao().countByDay()
+        currentDailyLimit = userId?.let { db.userLimitDao().getLimit(it)?.dailyLimit } ?: 0
     }
 
-    var monthOffset by remember { mutableStateOf(0) }
-    val cal = remember(monthOffset) {
+    // 달력이 보여주는 달 (0=이번 달, -1=저번 달 ...) — 상위 상태
+    val monthCal = remember(monthOffset) {
         Calendar.getInstance().apply {
             set(Calendar.DAY_OF_MONTH, 1)
-            set(Calendar.HOUR_OF_DAY, 0)
-            set(Calendar.MINUTE, 0)
-            set(Calendar.SECOND, 0)
-            set(Calendar.MILLISECOND, 0)
+            set(Calendar.HOUR_OF_DAY, 0); set(Calendar.MINUTE, 0)
+            set(Calendar.SECOND, 0); set(Calendar.MILLISECOND, 0)
             add(Calendar.MONTH, monthOffset)
         }
     }
+    val year = monthCal.get(Calendar.YEAR)
+    val month = monthCal.get(Calendar.MONTH) // 0~11
+    val daysInMonth = monthCal.getActualMaximum(Calendar.DAY_OF_MONTH)
+    val firstDayOfWeek = (monthCal.get(Calendar.DAY_OF_WEEK) + 5) % 7 // MON=0..SUN=6
 
-    // 서버 월간 요약 — 화면 상단 카드. 달력 히트맵은 로컬 Room 데이터 유지.
-    val monthKey = remember(monthOffset) { SimpleDateFormat("yyyy-MM", Locale.US).format(cal.time) }
+    // 월간 서버 요약 카드
+    val monthKey = remember(monthOffset) { SimpleDateFormat("yyyy-MM", Locale.US).format(monthCal.time) }
     var summary by remember(monthOffset) { mutableStateOf<MonthStatsRemote?>(null) }
     var summaryLoading by remember(monthOffset) { mutableStateOf(true) }
     var summaryError by remember(monthOffset) { mutableStateOf<String?>(null) }
@@ -693,14 +1039,10 @@ private fun StatsMonthly() {
         if (s != null) summary = s else summaryError = "서버 요약을 불러오지 못했습니다"
         summaryLoading = false
     }
-    val year = cal.get(Calendar.YEAR)
-    val month = cal.get(Calendar.MONTH) // 0~11
-    val daysInMonth = cal.getActualMaximum(Calendar.DAY_OF_MONTH)
-    val firstDayOfWeek = (cal.get(Calendar.DAY_OF_WEEK) + 5) % 7 // MON=0..SUN=6
 
     val countByDate = remember(monthOffset, rows) {
         val fmt = SimpleDateFormat("yyyy-MM-dd", Locale.US)
-        val tmp = Calendar.getInstance().apply { timeInMillis = cal.timeInMillis }
+        val tmp = Calendar.getInstance().apply { timeInMillis = monthCal.timeInMillis }
         (1..daysInMonth).associateWith { day ->
             tmp.set(Calendar.DAY_OF_MONTH, day)
             val key = fmt.format(tmp.time)
@@ -709,9 +1051,76 @@ private fun StatsMonthly() {
     }
     val maxCount = (countByDate.values.maxOrNull() ?: 0).coerceAtLeast(1)
 
-    Column(modifier = Modifier.fillMaxSize()) {
+    // 선택된 날짜 — 절대 자정 millis. 기본값 = 오늘.
+    val todayMidnight = remember { startOfDayMs(0) }
+    var selectedDayMs by remember { mutableStateOf(todayMidnight) }
+    val selectedDateStr = remember(selectedDayMs) {
+        SimpleDateFormat("yyyy-MM-dd", Locale.US).format(java.util.Date(selectedDayMs))
+    }
+    val selectedLabel = remember(selectedDayMs) {
+        SimpleDateFormat("yyyy.MM.dd (E)", Locale.KOREAN).format(java.util.Date(selectedDayMs))
+    }
+
+    // 표시 중인 달이 바뀌면(달력 이동/월간 드릴다운) 선택일을 그 달 안으로 맞춤
+    LaunchedEffect(monthOffset) {
+        val selCal = Calendar.getInstance().apply { timeInMillis = selectedDayMs }
+        if (selCal.get(Calendar.YEAR) != year || selCal.get(Calendar.MONTH) != month) {
+            selectedDayMs = if (monthOffset == 0) startOfDayMs(0) else monthCal.timeInMillis
+        }
+    }
+
+    // 선택일 상세 — 서버 우선, 실패 시 로컬 Room 폴백
+    var counts by remember { mutableStateOf(IntArray(24)) }
+    var serverStats by remember { mutableStateOf<DailyStatsRemote?>(null) }
+    var source by remember { mutableStateOf("loading") }  // "server" / "local" / "loading"
+    LaunchedEffect(selectedDayMs, userId) {
+        source = "loading"
+        val remote = userId?.let { fetchDailyStats(it, selectedDateStr) }
+        if (remote != null) {
+            serverStats = remote
+            counts = remote.hourlyCounts
+            source = "server"
+        } else {
+            serverStats = null
+            val endOfDay = Calendar.getInstance().apply {
+                timeInMillis = selectedDayMs
+                add(Calendar.DAY_OF_YEAR, 1)
+            }.timeInMillis
+            val hourly = db.scrollHistoryDao().countByHourForDay(selectedDayMs, endOfDay)
+            counts = IntArray(24).also { arr ->
+                hourly.forEach { if (it.hour in 0..23) arr[it.hour] = it.count }
+            }
+            source = "local"
+        }
+    }
+
+    // 누적값 — cumulative[i] = counts[0..i-1] 합. 길이 25
+    val cumulative = remember(counts) {
+        IntArray(25).also { arr ->
+            var sum = 0
+            for (i in 0 until 24) {
+                arr[i] = sum
+                sum += counts[i]
+            }
+            arr[24] = sum
+        }
+    }
+    val total = cumulative[24]
+    val peakHour = counts.indices.maxByOrNull { counts[it] } ?: 0
+    val peakCount = counts.getOrNull(peakHour) ?: 0
+
+    // 그 날의 daily limit — 서버값(그 날 기준) 우선, 없으면 현재 limit 으로 대체
+    val dailyLimit = (serverStats?.dailyLimit?.takeIf { it > 0 }) ?: currentDailyLimit
+    val exceeded = dailyLimit > 0 && total > dailyLimit
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+    ) {
+        // ── 월간 영역: 서버 요약 + 달력 히트맵 ──
         StatsSummaryCard(
-            title = "이번 달 서버 요약",
+            title = "${year}.%02d 서버 요약".format(month + 1),
             totalScroll = summary?.totalScroll,
             avgPerDay = summary?.avgScrollPerDay,
             peakDate = summary?.peakDate,
@@ -721,13 +1130,11 @@ private fun StatsMonthly() {
         )
         // 월 네비 ← 2026.05 →
         Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(bottom = 12.dp),
+            modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.Center
         ) {
-            IconButton(onClick = { monthOffset-- }) {
+            IconButton(onClick = { onMonthOffsetChange(monthOffset - 1) }) {
                 Icon(Icons.Filled.ChevronLeft, contentDescription = "이전 달")
             }
             Text(
@@ -738,7 +1145,7 @@ private fun StatsMonthly() {
                 modifier = Modifier.padding(horizontal = 12.dp)
             )
             IconButton(
-                onClick = { if (monthOffset < 0) monthOffset++ },
+                onClick = { if (monthOffset < 0) onMonthOffsetChange(monthOffset + 1) },
                 enabled = monthOffset < 0
             ) {
                 Icon(Icons.Filled.ChevronRight, contentDescription = "다음 달")
@@ -751,9 +1158,7 @@ private fun StatsMonthly() {
             dayLabels.forEach { d ->
                 Text(
                     text = d,
-                    modifier = Modifier
-                        .weight(1f)
-                        .padding(vertical = 6.dp),
+                    modifier = Modifier.weight(1f).padding(vertical = 6.dp),
                     textAlign = TextAlign.Center,
                     fontSize = 12.sp,
                     fontWeight = FontWeight.SemiBold,
@@ -762,7 +1167,7 @@ private fun StatsMonthly() {
             }
         }
 
-        // 달력 셀들 — 7개씩 끊어서 weeks 단위로 출력
+        // 달력 셀 — 누르면 선택일 변경 (미래 날짜는 비활성, 선택일은 테두리 강조)
         val totalCells = firstDayOfWeek + daysInMonth
         val totalRows = (totalCells + 6) / 7
         for (rowIdx in 0 until totalRows) {
@@ -771,28 +1176,41 @@ private fun StatsMonthly() {
                     val cellIdx = rowIdx * 7 + col
                     val dayNum = cellIdx - firstDayOfWeek + 1
                     if (dayNum in 1..daysInMonth) {
+                        val cellMs = Calendar.getInstance().apply {
+                            timeInMillis = monthCal.timeInMillis
+                            set(Calendar.DAY_OF_MONTH, dayNum)
+                        }.timeInMillis
+                        val isFuture = cellMs > todayMidnight
+                        val isSelected = cellMs == selectedDayMs
                         val count = countByDate[dayNum] ?: 0
                         val intensity = if (maxCount > 0) (count.toFloat() / maxCount).coerceIn(0f, 1f) else 0f
                         val bg = if (count == 0) {
                             Color(0xFFF5F5F5)
                         } else {
-                            // 옅은 분홍 → 진한 빨강 lerp. 최저 부터 어느정도 색이 보이도록 0.15부터 시작.
                             lerp(Color(0xFFFFE5E5), Color(0xFFC62828), 0.15f + 0.85f * intensity)
                         }
-                        Box(
-                            modifier = Modifier
-                                .weight(1f)
-                                .aspectRatio(1f)
-                                .padding(2.dp)
-                                .background(bg, RoundedCornerShape(6.dp)),
-                            contentAlignment = Alignment.Center
-                        ) {
+                        var cellMod = Modifier
+                            .weight(1f)
+                            .aspectRatio(1f)
+                            .padding(2.dp)
+                            .background(bg, RoundedCornerShape(6.dp))
+                        if (isSelected) {
+                            cellMod = cellMod.border(2.dp, Color(0xFF1A1A1A), RoundedCornerShape(6.dp))
+                        }
+                        if (!isFuture) {
+                            cellMod = cellMod.clickable { selectedDayMs = cellMs }
+                        }
+                        Box(modifier = cellMod, contentAlignment = Alignment.Center) {
                             Column(horizontalAlignment = Alignment.CenterHorizontally) {
                                 Text(
                                     text = dayNum.toString(),
                                     fontSize = 13.sp,
                                     fontWeight = FontWeight.SemiBold,
-                                    color = if (intensity > 0.55f) Color.White else Color(0xFF1A1A1A)
+                                    color = when {
+                                        isFuture -> Color(0xFFCCCCCC)
+                                        intensity > 0.55f -> Color.White
+                                        else -> Color(0xFF1A1A1A)
+                                    }
                                 )
                                 if (count > 0) {
                                     Text(
@@ -804,24 +1222,16 @@ private fun StatsMonthly() {
                             }
                         }
                     } else {
-                        // 이번 달 범위 밖 셀 — 빈 자리 차지만
-                        Box(
-                            modifier = Modifier
-                                .weight(1f)
-                                .aspectRatio(1f)
-                                .padding(2.dp)
-                        )
+                        Box(modifier = Modifier.weight(1f).aspectRatio(1f).padding(2.dp))
                     }
                 }
             }
         }
 
-        // 범례
-        Spacer(Modifier.height(16.dp))
+        // 히트맵 범례
+        Spacer(Modifier.height(12.dp))
         Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 8.dp),
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             Text("적음", fontSize = 11.sp, color = Color(0xFF888888))
@@ -840,185 +1250,19 @@ private fun StatsMonthly() {
             Spacer(Modifier.width(2.dp))
             Text("많음", fontSize = 11.sp, color = Color(0xFF888888))
         }
-    }
-}
 
-// ── 주간: 막대 그래프 (월~일) ──────────────────────────────────────────
-// ◀ ▶ 버튼으로 주 이동. 일간/월간과 같은 패턴. 다음 주(미래) 버튼은 weekOffset==0 일 때 비활성.
-@Composable
-private fun StatsWeekly() {
-    val context = LocalContext.current
-    val db = remember { AppDatabase.getDatabase(context) }
-    val userId = remember {
-        context.getSharedPreferences("short_cut_prefs", Context.MODE_PRIVATE).getString("userId", null)
-    }
-    var rows by remember { mutableStateOf<List<DailyCount>>(emptyList()) }
+        Spacer(Modifier.height(20.dp))
+        Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(Color(0xFFEEEEEE)))
+        Spacer(Modifier.height(16.dp))
 
-    LaunchedEffect(Unit) {
-        rows = db.scrollHistoryDao().countByDay()
-    }
-
-    val thisWeekMonday = remember { mondayOf(System.currentTimeMillis()) }
-    var weekOffset by remember { mutableStateOf(0) }  // 0=이번 주, -1=지난 주, ...
-    val currentWeekStart = remember(weekOffset) {
-        thisWeekMonday + weekOffset.toLong() * 7L * 24L * 60L * 60L * 1000L
-    }
-    val weekDateStr = remember(currentWeekStart) {
-        SimpleDateFormat("yyyy-MM-dd", Locale.US).format(
-            Calendar.getInstance().apply { timeInMillis = currentWeekStart }.time
+        // ── 선택일 상세 영역 ──
+        Text(
+            text = selectedLabel,
+            fontSize = 18.sp,
+            fontWeight = FontWeight.Bold,
+            color = Color(0xFF1A1A1A),
+            modifier = Modifier.padding(start = 8.dp, bottom = 8.dp)
         )
-    }
-    var summary by remember { mutableStateOf<WeekStatsRemote?>(null) }
-    var summaryLoading by remember { mutableStateOf(true) }
-    var summaryError by remember { mutableStateOf<String?>(null) }
-    LaunchedEffect(currentWeekStart, userId) {
-        summaryLoading = true
-        summaryError = null
-        summary = null
-        val s = userId?.let { fetchWeeklyStats(it, weekDateStr) }
-        if (s != null) summary = s else summaryError = "서버 요약을 불러오지 못했습니다"
-        summaryLoading = false
-    }
-
-    val counts = remember(currentWeekStart, rows) { buildWeekCounts(currentWeekStart, rows) }
-
-    // 주 헤더용 날짜 라벨 (예: "2026.05.11 ~ 05.17")
-    val weekRangeLabel = remember(currentWeekStart) {
-        val rangeFmt = SimpleDateFormat("yyyy.MM.dd", Locale.US)
-        val endFmt = SimpleDateFormat("MM.dd", Locale.US)
-        val cal = Calendar.getInstance().apply { timeInMillis = currentWeekStart }
-        val startStr = rangeFmt.format(cal.time)
-        cal.add(Calendar.DAY_OF_YEAR, 6)
-        val endStr = endFmt.format(cal.time)
-        "$startStr ~ $endStr"
-    }
-
-    Column(modifier = Modifier.fillMaxSize()) {
-        StatsSummaryCard(
-            title = "이번 주 서버 요약",
-            totalScroll = summary?.totalScroll,
-            avgPerDay = summary?.avgScrollPerDay,
-            peakDate = summary?.peakDate,
-            peakCount = summary?.peakCount,
-            loading = summaryLoading,
-            errorMsg = summaryError
-        )
-
-        // 주 네비 ◀ 2026.05.11 ~ 05.17 ▶
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(bottom = 12.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.Center
-        ) {
-            IconButton(onClick = { weekOffset-- }) {
-                Icon(Icons.Filled.ChevronLeft, contentDescription = "이전 주")
-            }
-            Text(
-                text = weekRangeLabel,
-                fontSize = 16.sp,
-                fontWeight = FontWeight.Bold,
-                color = Color(0xFF1A1A1A),
-                modifier = Modifier.padding(horizontal = 12.dp)
-            )
-            IconButton(
-                onClick = { if (weekOffset < 0) weekOffset++ },
-                enabled = weekOffset < 0
-            ) {
-                Icon(Icons.Filled.ChevronRight, contentDescription = "다음 주")
-            }
-        }
-
-        WeekBarChart(counts = counts)
-    }
-}
-
-// ── 일간: 24시간 누적 그래프 + 피크 시간대 빨강 강조 ─────────────────────
-// 시간(0~23) 별 카운트를 누적해서 단조 증가 선 그래프로 그림.
-// 그 중 시간당 증가폭이 가장 큰 한 시간 구간을 빨간 띠로 강조.
-@Composable
-private fun StatsDaily() {
-    val context = LocalContext.current
-    val db = remember { AppDatabase.getDatabase(context) }
-    val userId = remember {
-        context.getSharedPreferences("short_cut_prefs", Context.MODE_PRIVATE).getString("userId", null)
-    }
-
-    var dayOffset by remember { mutableStateOf(0) } // 0=오늘, -1=어제
-    var counts by remember { mutableStateOf(IntArray(24)) }
-    var serverStats by remember { mutableStateOf<DailyStatsRemote?>(null) }
-    var source by remember { mutableStateOf("loading") }  // "server" / "local" / "loading"
-
-    LaunchedEffect(dayOffset, userId) {
-        source = "loading"
-        // 서버 우선 — 실패 시 로컬 Room 폴백
-        val date = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(
-            Calendar.getInstance().apply { add(Calendar.DAY_OF_YEAR, dayOffset) }.time
-        )
-        val remote = userId?.let { fetchDailyStats(it, date) }
-        if (remote != null) {
-            serverStats = remote
-            counts = remote.hourlyCounts
-            source = "server"
-        } else {
-            serverStats = null
-            val startOfDay = startOfDayMs(dayOffset)
-            val endOfDay = startOfDayMs(dayOffset + 1)
-            val hourly = db.scrollHistoryDao().countByHourForDay(startOfDay, endOfDay)
-            counts = IntArray(24).also { arr ->
-                hourly.forEach { if (it.hour in 0..23) arr[it.hour] = it.count }
-            }
-            source = "local"
-        }
-    }
-    // 누적값 — cumulative[i] = counts[0..i-1] 합. 길이 25
-    val cumulative = remember(counts) {
-        IntArray(25).also { arr ->
-            var sum = 0
-            for (i in 0 until 24) {
-                arr[i] = sum
-                sum += counts[i]
-            }
-            arr[24] = sum
-        }
-    }
-    val total = cumulative[24]
-    val peakHour = counts.indices.maxByOrNull { counts[it] } ?: 0
-    val peakCount = counts.getOrNull(peakHour) ?: 0
-
-    // 날짜 헤더
-    val dateLabel = remember(dayOffset) {
-        val c = Calendar.getInstance().apply { add(Calendar.DAY_OF_YEAR, dayOffset) }
-        SimpleDateFormat("yyyy.MM.dd (E)", Locale.KOREAN).format(c.time)
-    }
-
-    Column(modifier = Modifier.fillMaxSize()) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(bottom = 12.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.Center
-        ) {
-            IconButton(onClick = { dayOffset-- }) {
-                Icon(Icons.Filled.ChevronLeft, contentDescription = "이전 날")
-            }
-            Text(
-                text = dateLabel,
-                fontSize = 16.sp,
-                fontWeight = FontWeight.Bold,
-                color = Color(0xFF1A1A1A),
-                modifier = Modifier.padding(horizontal = 12.dp)
-            )
-            IconButton(
-                onClick = { if (dayOffset < 0) dayOffset++ },
-                enabled = dayOffset < 0
-            ) {
-                Icon(Icons.Filled.ChevronRight, contentDescription = "다음 날")
-            }
-        }
-
         Text(
             text = "총 ${total}회" + if (source == "local") " (로컬)" else "",
             fontSize = 14.sp,
@@ -1027,9 +1271,18 @@ private fun StatsDaily() {
         )
         serverStats?.let { s ->
             Text(
-                text = "한도 ${s.dailyLimit}회 · 정지 ${s.stopCount}회 · 무시 ${s.ignoreCount}회",
+                text = "정지 ${s.stopCount}회 · 무시 ${s.ignoreCount}회",
                 fontSize = 12.sp,
                 color = Color(0xFF888888),
+                modifier = Modifier.padding(start = 8.dp, bottom = 4.dp)
+            )
+        }
+        if (dailyLimit > 0) {
+            Text(
+                text = if (exceeded) "daily limit ${dailyLimit}회 — 초과 ⚠️" else "daily limit ${dailyLimit}회 — 이내 ✓",
+                fontSize = 13.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = if (exceeded) Color(0xFFC62828) else Color(0xFF2E7D32),
                 modifier = Modifier.padding(start = 8.dp, bottom = 4.dp)
             )
         }
@@ -1043,7 +1296,7 @@ private fun StatsDaily() {
             )
         }
 
-        // Canvas 차트 영역
+        // Canvas 차트 영역 — 누적 라인 + 그날 한도 점선
         Box(
             modifier = Modifier
                 .fillMaxWidth()
@@ -1058,7 +1311,8 @@ private fun StatsDaily() {
                 val topPad = 8f
                 val plotW = w - leftPad - 8f
                 val plotH = h - topPad - bottomPad
-                val maxY = total.coerceAtLeast(1)
+                // 한도 점선이 항상 보이도록 총합과 한도 중 큰 값을 y축 최대치로
+                val maxY = maxOf(total, dailyLimit).coerceAtLeast(1)
 
                 // y축 가이드 라인 (4분할)
                 val gridColor = Color(0xFFEEEEEE)
@@ -1080,6 +1334,18 @@ private fun StatsDaily() {
                         color = Color(0xFFC62828).copy(alpha = 0.18f),
                         topLeft = Offset(x1, topPad),
                         size = androidx.compose.ui.geometry.Size(x2 - x1, plotH)
+                    )
+                }
+
+                // 그날 daily limit — 주황 점선 가로선
+                if (dailyLimit > 0) {
+                    val limitY = topPad + plotH * (1f - dailyLimit.toFloat() / maxY)
+                    drawLine(
+                        color = Color(0xFFFF8F00),
+                        start = Offset(leftPad, limitY),
+                        end = Offset(leftPad + plotW, limitY),
+                        strokeWidth = 3f,
+                        pathEffect = PathEffect.dashPathEffect(floatArrayOf(14f, 10f))
                     )
                 }
 
@@ -1125,6 +1391,20 @@ private fun StatsDaily() {
                 Text(text = "${h}시", fontSize = 11.sp, color = Color(0xFF888888))
             }
         }
+
+        // 한도 점선 범례
+        if (dailyLimit > 0) {
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(start = 8.dp, top = 12.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Box(modifier = Modifier.size(width = 18.dp, height = 3.dp).background(Color(0xFFFF8F00)))
+                Spacer(Modifier.width(6.dp))
+                Text("daily limit (${dailyLimit}회)", fontSize = 11.sp, color = Color(0xFF888888))
+            }
+        }
+
+        Spacer(Modifier.height(24.dp))
     }
 }
 
@@ -1141,18 +1421,6 @@ private fun mondayOf(timeMs: Long): Long {
     val daysFromMonday = (cal.get(Calendar.DAY_OF_WEEK) + 5) % 7  // MON=0 ... SUN=6
     cal.add(Calendar.DAY_OF_YEAR, -daysFromMonday)
     return cal.timeInMillis
-}
-
-// weekStart(월요일 0시) 부터 7일치 카운트 배열 반환. rows 의 day("YYYY-MM-DD") 와 매칭.
-private fun buildWeekCounts(weekStart: Long, rows: List<DailyCount>): List<Int> {
-    val fmt = SimpleDateFormat("yyyy-MM-dd", Locale.US)
-    val cal = Calendar.getInstance()
-    return (0 until 7).map { i ->
-        cal.timeInMillis = weekStart
-        cal.add(Calendar.DAY_OF_YEAR, i)
-        val key = fmt.format(cal.time)
-        rows.firstOrNull { it.day == key }?.count ?: 0
-    }
 }
 
 // 한 주의 막대 그래프 — counts 는 [월, 화, 수, 목, 금, 토, 일] 순서
@@ -1795,15 +2063,6 @@ private data class DailyStatsRemote(
     val hourlyCounts: IntArray
 )
 
-private data class WeekStatsRemote(
-    val totalScroll: Int,
-    val avgScrollPerDay: Int,
-    val peakDate: String?,
-    val peakCount: Int?,
-    val weekStart: String,
-    val weekEnd: String
-)
-
 private data class MonthStatsRemote(
     val totalScroll: Int,
     val avgScrollPerDay: Int,
@@ -1859,19 +2118,6 @@ private suspend fun fetchDailyStats(userId: String, date: String): DailyStatsRem
         stopCount = json.optInt("stopCount", 0),
         ignoreCount = json.optInt("ignoreCount", 0),
         hourlyCounts = hourly
-    )
-}
-
-private suspend fun fetchWeeklyStats(userId: String, date: String): WeekStatsRemote? {
-    val json = authedGetJson("$SERVER_BASE_URL/stats/$userId/weekly?date=$date") ?: return null
-    val peak = json.optJSONObject("peakDay")
-    return WeekStatsRemote(
-        totalScroll = json.optInt("totalScroll", 0),
-        avgScrollPerDay = json.optInt("avgScrollPerDay", 0),
-        peakDate = peak?.optString("date")?.takeIf { it.isNotEmpty() },
-        peakCount = peak?.optInt("scrollCount"),
-        weekStart = json.optString("weekStart", ""),
-        weekEnd = json.optString("weekEnd", "")
     )
 }
 

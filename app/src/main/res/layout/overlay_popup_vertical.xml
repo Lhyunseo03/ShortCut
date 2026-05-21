@@ -2,10 +2,10 @@
 <!-- 하드 모드 variant 2 — 세로 스크롤 그리드. 코드에서 rowsContainer 에 10행 × 2버튼 동적 추가 -->
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
-    android:layout_height="match_parent"
+    android:layout_height="wrap_content"
     android:orientation="vertical"
     android:background="#CC000000"
-    android:padding="20dp">
+    android:padding="24dp">
 
     <TextView
         android:id="@+id/popupTitle"
@@ -23,16 +23,16 @@
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:layout_gravity="center_horizontal"
-        android:layout_marginBottom="16dp"
+        android:layout_marginBottom="24dp"
         android:gravity="center"
         android:text=""
         android:textColor="#FFFFFF"
         android:textSize="14sp" />
 
+    <!-- 높이는 코드에서 한 줄로 고정 (showHardVerticalGrid) -->
     <ScrollView
         android:layout_width="match_parent"
-        android:layout_height="0dp"
-        android:layout_weight="1">
+        android:layout_height="wrap_content">
 
         <LinearLayout
             android:id="@+id/rowsContainer"

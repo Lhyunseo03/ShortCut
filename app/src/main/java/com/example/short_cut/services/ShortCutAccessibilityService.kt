@@ -479,7 +479,7 @@ class ShortCutAccessibilityService : AccessibilityService() {
     }
 
     // 한도 초과 popup — type 과 모드(normal/hard) 에 따라 다른 popup 으로 분기
-    // hard 모드 + hourly 만 5가지 variant 중 랜덤. daily 와 normal 모드는 표준 popup.
+    // hard 모드 + hourly 만 3단계 하드 popup. daily 와 normal 모드는 표준 popup.
     private fun showLimitPopup(type: String, overage: Int) {
         if (type == "hourly" && isHardMode()) {
             showHourlyPopupHard(overage)
@@ -518,7 +518,10 @@ class ShortCutAccessibilityService : AccessibilityService() {
         }
     }
 
-    // ── 하드 모드 — 5가지 variant 중 랜덤 (hourly 전용) ──────────
+    // ── 하드 모드 — hourly 전용, 3단계 ──────────
+    //   1단계 (처음 초과, overage == 0): 일반 팝업 (normal 모드와 동일)
+    //   2단계 (초과 ~ 2배 이하, 0 < overage <= hourlyLimit): 수학(variant 6) 제외한 variant 1~5 중 랜덤
+    //   3단계 (2배 초과, overage > hourlyLimit): 수학 문제(variant 6) 만
 
     // 사용자가 설정 탭에서 "하드 모드" 선택했는지 확인
     private fun isHardMode(): Boolean {
@@ -526,17 +529,31 @@ class ShortCutAccessibilityService : AccessibilityService() {
     }
 
     private fun showHourlyPopupHard(overage: Int) {
-        // [임시] variant 6 (수학) 테스트용 — 다른 variant 주석 처리. 확인 끝나면 원복 필요.
-        // val variant = (1..6).random()
-        val variant = 6
-        Log.d(TAG, "하드 모드 hourly popup variant=$variant")
-        when (variant) {
-            // 1 -> showHardCountdown(overage)
-            // 2 -> showHardVerticalGrid(overage)
-            // 3 -> showHardSwappedLabels(overage)
-            // 4 -> showHardStacked(overage)
-            // 5 -> showHardHorizontalScroll(overage)
-            6 -> showHardMath(overage)
+        // overage = (현재 시간당 카운트 - hourlyLimit). 첫 초과 팝업은 overage == 0.
+        // "2배 초과" = overage > hourlyLimit (카운트 > 2 × hourlyLimit ⟺ hourlyLimit + overage > 2 × hourlyLimit)
+        when {
+            overage == 0 -> {
+                // 1단계 — 처음 초과: 일반 팝업
+                Log.d(TAG, "하드 모드 hourly popup — 첫 초과 → 일반 팝업")
+                showLimitPopupNormal("hourly", overage)
+            }
+            overage > hourlyLimit -> {
+                // 3단계 — limit 2배 초과: 수학 문제만
+                Log.d(TAG, "하드 모드 hourly popup — 2배 초과 → 수학(variant 6)")
+                showHardMath(overage)
+            }
+            else -> {
+                // 2단계 — 초과 ~ 2배 이하 추가 팝업: 수학 제외 1~5 랜덤
+                val variant = (1..5).random()
+                Log.d(TAG, "하드 모드 hourly popup — 추가 팝업 → variant=$variant")
+                when (variant) {
+                    1 -> showHardCountdown(overage)
+                    2 -> showHardVerticalGrid(overage)
+                    3 -> showHardSwappedLabels(overage)
+                    4 -> showHardStacked(overage)
+                    5 -> showHardHorizontalScroll(overage)
+                }
+            }
         }
     }
 
@@ -587,7 +604,8 @@ class ShortCutAccessibilityService : AccessibilityService() {
         }
     }
 
-    // ── Variant 2 — 세로 스크롤 10행 × 2버튼, 9행은 그만하기×2, 1행만 그만/무시 쌍 ──
+    // ── Variant 2 — 세로 스크롤. 처음엔 일반 팝업과 똑같은 크기/버튼 위치로 보이되 둘 다 "그만하기"(=stop).
+    //   ScrollView 높이를 딱 한 줄로 고정해 첫 줄만 노출 → 아래로 스크롤하면 나오는 줄들 중 1곳에만 진짜 무시하기. ──
     private fun showHardVerticalGrid(overage: Int) {
         val type = "hourly"
         val (title, body) = buildPopupTexts(type, overage)
@@ -598,56 +616,55 @@ class ShortCutAccessibilityService : AccessibilityService() {
             view.findViewById<TextView>(R.id.popupMessage).text = body
             val container = view.findViewById<LinearLayout>(R.id.rowsContainer)
 
-            // 첫번째(0) 줄은 제외. 1..9 중 하나가 mixed row.
-            val mixedRowIdx = (1..9).random()
-            // mixed row 의 무시하기 위치 (왼/오 랜덤)
-            val mixedIgnoreOnRight = (0..1).random() == 1
-            val uniformColor = android.graphics.Color.parseColor("#555555")
             val density = resources.displayMetrics.density
+            val rowCount = 10
+            // 진짜 무시하기 — 첫 줄(0)은 제외, 1..9 줄 중 한 곳의 좌/우 랜덤
+            val realRow = (1 until rowCount).random()
+            val realRight = (0..1).random() == 1
 
-            for (i in 0 until 10) {
+            val red = android.graphics.Color.parseColor("#FF4444")   // 일반 팝업 그만보기 색(왼쪽)
+            val gray = android.graphics.Color.parseColor("#888888")  // 일반 팝업 무시하기 색(오른쪽)
+            val gapPx = (20 * density).toInt()                       // 일반 팝업과 동일한 버튼 간격
+            val btnHeightPx = (48 * density).toInt()
+            val rowMarginPx = (4 * density).toInt()
+
+            fun cell(label: String, bg: Int, marginEnd: Int, action: () -> Unit): Button =
+                Button(this).apply {
+                    text = label
+                    setTextColor(android.graphics.Color.WHITE)
+                    setBackgroundColor(bg)
+                    setOnClickListener { action() }
+                    layoutParams = LinearLayout.LayoutParams(0, btnHeightPx, 1f)
+                        .apply { setMargins(0, 0, marginEnd, 0) }
+                }
+
+            for (r in 0 until rowCount) {
                 val row = LinearLayout(this).apply {
                     orientation = LinearLayout.HORIZONTAL
                     layoutParams = LinearLayout.LayoutParams(
                         LinearLayout.LayoutParams.MATCH_PARENT,
                         LinearLayout.LayoutParams.WRAP_CONTENT
-                    ).apply { setMargins(0, (4 * density).toInt(), 0, (4 * density).toInt()) }
+                    ).apply { setMargins(0, rowMarginPx, 0, rowMarginPx) }
                 }
-
-                val (leftLabel, rightLabel, leftAction, rightAction) = when {
-                    i != mixedRowIdx -> {
-                        // 양쪽 모두 그만하기
-                        Quadruple("그만하기", "그만하기", { executeStop(type) }, { executeStop(type) })
-                    }
-                    mixedIgnoreOnRight -> {
-                        Quadruple("그만하기", "무시하기", { executeStop(type) }, { executeIgnore(type) })
-                    }
-                    else -> {
-                        Quadruple("무시하기", "그만하기", { executeIgnore(type) }, { executeStop(type) })
-                    }
-                }
-
-                val leftBtn = Button(this).apply {
-                    text = leftLabel
-                    setTextColor(android.graphics.Color.WHITE)
-                    setBackgroundColor(uniformColor)
-                    setOnClickListener { leftAction() }
-                    layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-                        .apply { setMargins(0, 0, (6 * density).toInt(), 0) }
-                }
-                val rightBtn = Button(this).apply {
-                    text = rightLabel
-                    setTextColor(android.graphics.Color.WHITE)
-                    setBackgroundColor(uniformColor)
-                    setOnClickListener { rightAction() }
-                    layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-                }
-                row.addView(leftBtn)
-                row.addView(rightBtn)
+                // 모든 줄을 빨강|회색 쌍으로 — 첫 줄은 일반 팝업과 동일하게 보이고, 둘 다 그만하기.
+                val leftReal = (r == realRow && !realRight)
+                val rightReal = (r == realRow && realRight)
+                row.addView(cell(if (leftReal) "무시하기" else "그만하기", red, gapPx) {
+                    if (leftReal) executeIgnore(type) else executeStop(type)
+                })
+                row.addView(cell(if (rightReal) "무시하기" else "그만하기", gray, 0) {
+                    if (rightReal) executeIgnore(type) else executeStop(type)
+                })
                 container.addView(row)
             }
 
-            addPopupView(view, fixedSizeCenterParams(320, 480))
+            // ScrollView 높이를 딱 한 줄로 고정 → 첫 줄(버튼 2개)만 보이고 나머지는 아래로 스크롤해야 노출
+            val scrollView = container.parent as android.widget.ScrollView
+            scrollView.layoutParams = scrollView.layoutParams.apply {
+                height = btnHeightPx + rowMarginPx * 2
+            }
+
+            addPopupView(view, standardCenterParams(280))
         }
     }
 
@@ -749,7 +766,8 @@ class ShortCutAccessibilityService : AccessibilityService() {
         }
     }
 
-    // ── Variant 5 — 가로 스크롤 20개 버튼. 1개(랜덤, 첫/두번째 제외) 만 무시하기 ──
+    // ── Variant 5 — 가로 스크롤. 처음엔 일반 팝업과 똑같은 크기/버튼 위치로 보이되 둘 다 "그만하기"(=stop).
+    //   버튼 폭을 딱 2개만 보이게 고정 → 오른쪽으로 스크롤하면 나오는 버튼들 중 단 1개만 진짜 무시하기. ──
     private fun showHardHorizontalScroll(overage: Int) {
         val type = "hourly"
         val (title, body) = buildPopupTexts(type, overage)
@@ -760,34 +778,39 @@ class ShortCutAccessibilityService : AccessibilityService() {
             view.findViewById<TextView>(R.id.popupMessage).text = body
             val container = view.findViewById<LinearLayout>(R.id.buttonsContainer)
 
-            val total = 20
-            val ignoreIdx = (2 until total).random()  // index 2..19 — 첫/두번째 제외
-            val uniformColor = android.graphics.Color.parseColor("#555555")
             val density = resources.displayMetrics.density
+            val total = 20
+            // 진짜 무시하기 — 처음 보이는 2칸(0,1) 밖에 한 개만 숨김
+            val ignoreIdx = (2 until total).random()
+
+            // 일반 팝업과 동일: 폭 280dp, padding 24, 버튼 간격 20dp → 버튼 폭 = (280-48-20)/2
+            val popupWidthDp = 280
+            val gapDp = 20
+            val btnWidthPx = (((popupWidthDp - 48 - gapDp) / 2) * density).toInt()
+            val gapPx = (gapDp * density).toInt()
+
+            val red = android.graphics.Color.parseColor("#FF4444")   // 일반 팝업 그만보기 색(왼쪽)
+            val gray = android.graphics.Color.parseColor("#888888")  // 일반 팝업 무시하기 색(오른쪽)
 
             for (i in 0 until total) {
-                val isIgnoreBtn = (i == ignoreIdx)
+                val isReal = (i == ignoreIdx)
                 val btn = Button(this).apply {
-                    text = if (isIgnoreBtn) "무시하기" else "그만하기"
+                    text = if (isReal) "무시하기" else "그만하기"
                     setTextColor(android.graphics.Color.WHITE)
-                    setBackgroundColor(uniformColor)
-                    setOnClickListener {
-                        if (isIgnoreBtn) executeIgnore(type) else executeStop(type)
-                    }
-                    minWidth = (96 * density).toInt()
-                    layoutParams = LinearLayout.LayoutParams(
-                        LinearLayout.LayoutParams.WRAP_CONTENT,
-                        LinearLayout.LayoutParams.WRAP_CONTENT
-                    ).apply { setMargins((4 * density).toInt(), 0, (4 * density).toInt(), 0) }
+                    // 빨강|회색 번갈아 → 첫 화면(0,1)이 빨강+회색 = 일반 팝업 모양
+                    setBackgroundColor(if (i % 2 == 0) red else gray)
+                    setOnClickListener { if (isReal) executeIgnore(type) else executeStop(type) }
+                    layoutParams = LinearLayout.LayoutParams(btnWidthPx, LinearLayout.LayoutParams.WRAP_CONTENT)
+                        .apply { setMargins(0, 0, gapPx, 0) }
                 }
                 container.addView(btn)
             }
 
-            addPopupView(view, standardCenterParams(320))
+            addPopupView(view, standardCenterParams(popupWidthDp))
         }
     }
 
-    // ── Variant 6 — 수학 문제. 정답 선택 시 무시하기 활성화, 오답 선택 시 그만하기 활성화 ──
+    // ── Variant 6 — 수학 문제. 정답이면 그만하기/무시하기 둘 다 활성화(선택권), 오답이면 그만하기만 활성화 ──
     // 5지선다 중 1개 정답. 한 번 선택하면 다른 선택지는 잠금 — 재시도 불가.
     private fun showHardMath(overage: Int) {
         val type = "hourly"
@@ -836,9 +859,13 @@ class ShortCutAccessibilityService : AccessibilityService() {
                         // 다른 선택지 잠금
                         choiceButtons.forEach { it.isEnabled = false }
                         if (choice == correctAnswer) {
+                            // 정답 — 그만하기/무시하기 둘 다 활성화해 사용자가 직접 선택
+                            btnStop.isEnabled = true
+                            btnStop.alpha = 1f
                             btnIgnore.isEnabled = true
                             btnIgnore.alpha = 1f
                         } else {
+                            // 오답 — 그만하기만 활성화
                             btnStop.isEnabled = true
                             btnStop.alpha = 1f
                         }
@@ -853,15 +880,19 @@ class ShortCutAccessibilityService : AccessibilityService() {
     }
 
     // 사칙연산 문제 생성 — 3개 피연산자 + 2개 연산자, 피연산자는 최대 2자리(1..99)
+    // 난이도 규약: 연산자 두 개 중 하나는 무조건 곱셈(×), 나머지 하나는 덧셈/뺄셈.
+    //   곱셈이 앞(op1)에 올지 뒤(op2)에 올지는 랜덤.
     // 예: "11 + 29 × 6 = ?" (× 우선 적용해서 11 + 174 = 185)
-    // 연산자는 + - × 중 랜덤. ÷ 는 다항식에서 정수 보장이 까다로워 제외.
+    // ÷ 는 다항식에서 정수 보장이 까다로워 제외.
     private fun generateMathProblem(): Pair<String, Long> {
         val a = (1..99).random()
         val b = (1..99).random()
         val c = (1..99).random()
-        val ops = listOf("+", "-", "×")
-        val op1 = ops.random()
-        val op2 = ops.random()
+
+        val addSub = listOf("+", "-").random()   // 나머지 한 자리는 덧셈/뺄셈 중 하나
+        val mulFirst = (0..1).random() == 0       // 곱셈을 앞/뒤 어디에 둘지 랜덤
+        val op1 = if (mulFirst) "×" else addSub
+        val op2 = if (mulFirst) addSub else "×"
 
         fun apply(x: Long, op: String, y: Long): Long = when (op) {
             "+" -> x + y
@@ -870,11 +901,11 @@ class ShortCutAccessibilityService : AccessibilityService() {
             else -> error("unknown op: $op")
         }
 
-        // × 우선순위 처리
-        val result: Long = when {
-            op1 == "×" && op2 != "×" -> apply(a.toLong() * b, op2, c.toLong())   // (a×b) op2 c
-            op2 == "×" && op1 != "×" -> apply(a.toLong(), op1, b.toLong() * c)   // a op1 (b×c)
-            else -> apply(apply(a.toLong(), op1, b.toLong()), op2, c.toLong())    // 좌→우
+        // 곱셈이 항상 정확히 하나이므로 × 위치를 먼저 계산해 우선순위 반영
+        val result: Long = if (mulFirst) {
+            apply(a.toLong() * b, op2, c.toLong())   // (a×b) op2 c
+        } else {
+            apply(a.toLong(), op1, b.toLong() * c)   // a op1 (b×c)
         }
 
         return "$a $op1 $b $op2 $c = ?" to result
@@ -955,19 +986,6 @@ class ShortCutAccessibilityService : AccessibilityService() {
         ).apply { gravity = Gravity.CENTER }
     }
 
-    // 화면 중앙, 너비 widthDp / 높이 heightDp 고정 popup params — variant 2 처럼 ScrollView 가 있을 때 사용
-    private fun fixedSizeCenterParams(widthDp: Int, heightDp: Int): WindowManager.LayoutParams {
-        val density = resources.displayMetrics.density
-        return WindowManager.LayoutParams(
-            (widthDp * density).toInt(),
-            (heightDp * density).toInt(),
-            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                    WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
-            PixelFormat.TRANSLUCENT
-        ).apply { gravity = Gravity.CENTER }
-    }
-
     // popup view 를 list 에 등록 + WindowManager 에 추가
     private fun addPopupView(view: View, params: WindowManager.LayoutParams) {
         try {
@@ -1001,9 +1019,6 @@ class ShortCutAccessibilityService : AccessibilityService() {
         dismissAllPopups()
         Log.d(TAG, "무시하기 선택 → 다음 milestone 까지 대기")
     }
-
-    // popupViews 의 4-튜플 비구조화 분해를 위한 헬퍼
-    private data class Quadruple<A, B, C, D>(val first: A, val second: B, val third: C, val fourth: D)
 
     // ── 상태 저장 헬퍼 ────────────────────────────────────────
 
