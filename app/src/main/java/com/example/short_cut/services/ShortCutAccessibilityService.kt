@@ -101,6 +101,10 @@ class ShortCutAccessibilityService : AccessibilityService() {
     private var windowManager: WindowManager? = null
     // popup view 들 — variant 4(stacked) 를 위해 list 로 관리. 단일 popup variant 에서도 list 에 1개로 저장.
     private val popupViews = mutableListOf<View>()
+    // 팝업 뒤 전체화면 차단막 — 카드 밖 영역 터치를 흡수해 뒤(유튜브)가 스크롤/터치되지 않게 함.
+    private var scrimView: View? = null
+    // 5분 차단 안내 popup 표시 중 여부 — 쇼츠 이탈(BACK) 로 조기 dismiss 되지 않고 6초 타이머로만 닫히게 구분
+    private var blockPopupShowing = false
     private val mainHandler = Handler(Looper.getMainLooper())
 
     // ── 배치 전송 ─────────────────────────────────────────────
@@ -291,9 +295,12 @@ class ShortCutAccessibilityService : AccessibilityService() {
         //   - 우리 앱 자신 (popup overlay 를 띄울 때 TYPE_ACCESSIBILITY_OVERLAY 가 발생시키는 이벤트)
         //   - "android" (시스템 이벤트)
         //   - null (패키지 미식별 이벤트)
+        //   - SystemUI (잠금화면/알림창) — 전원 껐다 켜서 잠금화면이 떴다가 풀려도 popup 이 그대로
+        //     남아 있게(=화면 안 바뀌게) 하려면 이 이벤트로 dismiss 하면 안 됨
         // 이걸 무시하지 않으면 popup 띄우자마자 자기 자신이 다른 앱으로 인식되어 즉시 dismiss 됨
         val ownPackage = packageName
-        val isTransientEvent = pkg == null || pkg == ownPackage || pkg == "android"
+        val isTransientEvent = pkg == null || pkg == ownPackage || pkg == "android" ||
+                pkg == "com.android.systemui"
 
         if (!isTransientEvent && pkg != TARGET_PACKAGE) {
             if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
@@ -348,7 +355,8 @@ class ShortCutAccessibilityService : AccessibilityService() {
                     } else {
                         isInShortsMode = false
                         lastNodeCount = 0
-                        if (popupViews.isNotEmpty()) {
+                        // 차단 안내 popup 은 BACK 으로 쇼츠를 막 빠져나온 직후라 여기서 닫지 않고 6초 타이머에 맡김
+                        if (popupViews.isNotEmpty() && !blockPopupShowing) {
                             Log.d(TAG, "쇼츠 이탈 → popup 숨김 (pending 유지)")
                             dismissAllPopups()
                         }
@@ -505,7 +513,7 @@ class ShortCutAccessibilityService : AccessibilityService() {
         }
     }
 
-    // 5분 차단 안내 popup — 버튼 없이 3초 후 자동 dismiss
+    // 5분 차단 안내 popup — 버튼 없이 6초 후 자동 dismiss (튕겨내기[BACK]는 호출부에서 그대로 수행)
     private fun showBlockPopup(remainingSec: Int) {
         mainHandler.post {
             dismissAllPopups()
@@ -513,8 +521,9 @@ class ShortCutAccessibilityService : AccessibilityService() {
             view.findViewById<TextView>(R.id.popupTitle).text = "그만보기를 눌렀습니다"
             view.findViewById<TextView>(R.id.popupMessage).text = "5분간 진입금지!"
             view.findViewById<LinearLayout>(R.id.popupButtonRow).visibility = View.GONE
+            blockPopupShowing = true
             addPopupView(view, standardCenterParams(280))
-            mainHandler.postDelayed({ dismissAllPopups() }, 3000L)
+            mainHandler.postDelayed({ dismissAllPopups() }, 6000L)
         }
     }
 
@@ -748,6 +757,7 @@ class ShortCutAccessibilityService : AccessibilityService() {
         if (popupViews.isEmpty()) {
             // 마지막 popup 도 사라짐 → 진짜 ignore 처리
             isPopupShowing = false
+            removeScrim()
             sendViolation(type, lastHourlyCount, "ignore")
             clearPendingPopup()
             Log.d(TAG, "스택 popup 전부 처리 → ignore 완료")
@@ -989,6 +999,8 @@ class ShortCutAccessibilityService : AccessibilityService() {
     // popup view 를 list 에 등록 + WindowManager 에 추가
     private fun addPopupView(view: View, params: WindowManager.LayoutParams) {
         try {
+            // 팝업보다 먼저 차단막을 깔아 두면(z-order 상 아래) 카드 밖 터치가 유튜브로 통과되지 않음
+            ensureScrim()
             windowManager?.addView(view, params)
             popupViews.add(view)
             isPopupShowing = true
@@ -996,6 +1008,37 @@ class ShortCutAccessibilityService : AccessibilityService() {
         } catch (e: Exception) {
             Log.e(TAG, "popup add 실패 — ${e.message}")
         }
+    }
+
+    // 전체화면 차단막을 (없으면) 추가. 모든 팝업 뒤에 깔려 카드 밖 터치를 전부 흡수 → 뒤 화면 조작 불가.
+    private fun ensureScrim() {
+        if (scrimView != null) return
+        val scrim = View(this).apply {
+            setBackgroundColor(0x40000000)  // 살짝 어둡게 — 모달(뒤 비활성) 상태 표시
+            setOnTouchListener { _, _ -> true }  // 카드 밖 모든 터치 흡수(소비)
+        }
+        val params = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            // NOT_FOCUSABLE 만 — 키(뒤로가기) 포커스는 안 가져가되 터치는 받도록(NOT_TOUCHABLE 미설정)
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+            PixelFormat.TRANSLUCENT
+        )
+        try {
+            windowManager?.addView(scrim, params)
+            scrimView = scrim
+        } catch (e: Exception) {
+            Log.e(TAG, "scrim add 실패 — ${e.message}")
+        }
+    }
+
+    // 차단막 제거
+    private fun removeScrim() {
+        scrimView?.let {
+            try { windowManager?.removeView(it) } catch (_: Exception) {}
+        }
+        scrimView = null
     }
 
     // ── 사용자 응답 처리 액션 ─────────────────────────────────
@@ -1159,9 +1202,11 @@ class ShortCutAccessibilityService : AccessibilityService() {
         val copy = popupViews.toList()
         popupViews.clear()
         isPopupShowing = false
+        blockPopupShowing = false
         copy.forEach { view ->
             try { windowManager?.removeView(view) } catch (_: Exception) {}
         }
+        removeScrim()
     }
 
     override fun onInterrupt() {

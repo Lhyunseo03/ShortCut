@@ -251,9 +251,13 @@ fun LoginScreen(onLoginSuccess: () -> Unit = {}) {
 
             // 구글 로그인 버튼
             // 클릭 시 구글 계정 선택 팝업 실행
+            // signOut 으로 이전 선택을 먼저 해제 → 매번 "계정 선택" 화면이 떠서 원하는 계정을 고를 수 있음
+            // (해제 안 하면 마지막 계정으로 자동 로그인되어 선택지가 안 보임)
             Button(
                 onClick = {
-                    launcher.launch(googleSignInClient.signInIntent)
+                    googleSignInClient.signOut().addOnCompleteListener {
+                        launcher.launch(googleSignInClient.signInIntent)
+                    }
                 },
                 modifier = Modifier
                     .fillMaxWidth()
@@ -574,12 +578,25 @@ private fun StatsTabContent() {
     var subTab by remember { mutableStateOf(StatsSubTab.DAILY) }
     // 월간에서 달을 누르면 일간 탭으로 드릴다운 — 보여줄 달을 공유 상태로 들고 있음
     var dailyMonthOffset by remember { mutableStateOf(0) }
+    // AI 분석 화면 표시 여부 — 통계 위 진입 카드를 누르면 true
+    var showAiAnalysis by remember { mutableStateOf(false) }
+
+    // AI 분석 화면에선 시스템 뒤로가기를 가로채 통계로 복귀
+    BackHandler(enabled = showAiAnalysis) { showAiAnalysis = false }
+
+    if (showAiAnalysis) {
+        AiAnalysisScreen(onBack = { showAiAnalysis = false })
+        return
+    }
 
     Column(
         modifier = Modifier
             .fillMaxSize()
             .padding(horizontal = 16.dp, vertical = 16.dp)
     ) {
+        // AI 분석 진입 카드 — 통계를 프롬프트로 만들어 AI 앱에서 분석받는 기능
+        AiAnalysisEntryCard(onClick = { showAiAnalysis = true })
+
         // 서브탭 토글 row
         Row(
             modifier = Modifier
@@ -623,6 +640,328 @@ private fun StatsTabContent() {
                 }
             )
         }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// AI 통계 분석 — 통계를 한국어 프롬프트로 만들어 ChatGPT/Gemini/Claude 앱에서 분석받기
+// ─────────────────────────────────────────────────────────────────────────
+
+// 통계 탭 상단의 진입 카드
+@Composable
+private fun AiAnalysisEntryCard(onClick: () -> Unit) {
+    Surface(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(bottom = 12.dp)
+            .clickable(onClick = onClick),
+        shape = RoundedCornerShape(12.dp),
+        color = Color(0xFF1A1A1A)
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 14.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text("🤖", fontSize = 20.sp)
+            Spacer(Modifier.width(10.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    "AI로 내 통계 분석하기",
+                    color = Color.White,
+                    fontSize = 15.sp,
+                    fontWeight = FontWeight.SemiBold
+                )
+                Text(
+                    "ChatGPT · Gemini · Claude 로 사용 패턴 분석받기",
+                    color = Color(0xFFBBBBBB),
+                    fontSize = 12.sp,
+                    modifier = Modifier.padding(top = 2.dp)
+                )
+            }
+            Icon(Icons.Filled.ChevronRight, contentDescription = null, tint = Color.White)
+        }
+    }
+}
+
+// AI 분석 화면 — 통계를 불러와 프롬프트를 만들고, 복사 + AI 앱 바로가기 버튼 제공
+@Composable
+private fun AiAnalysisScreen(onBack: () -> Unit) {
+    val context = LocalContext.current
+    val db = remember { AppDatabase.getDatabase(context) }
+    val userId = remember {
+        context.getSharedPreferences("short_cut_prefs", Context.MODE_PRIVATE).getString("userId", null)
+    }
+
+    var prompt by remember { mutableStateOf<String?>(null) }
+    var loading by remember { mutableStateOf(true) }
+    var error by remember { mutableStateOf<String?>(null) }
+
+    LaunchedEffect(userId) {
+        loading = true
+        error = null
+        if (userId == null) {
+            error = "로그인이 필요합니다. 다시 로그인 후 이용해 주세요."
+            loading = false
+            return@LaunchedEffect
+        }
+        try {
+            db.userLimitDao().promoteExpiredPending(System.currentTimeMillis())
+            val limit = db.userLimitDao().getLimit(userId)
+            val dailyLimit = limit?.dailyLimit ?: 0
+            val hourlyLimit = limit?.hourlyLimit ?: 0
+
+            // 최근 14일(오늘 포함) 날짜 — 최근→과거
+            val dayFmt = SimpleDateFormat("yyyy-MM-dd", Locale.US)
+            val cal = Calendar.getInstance()
+            val days = (0 until 14).map { i ->
+                cal.timeInMillis = System.currentTimeMillis()
+                cal.add(Calendar.DAY_OF_YEAR, -i)
+                dayFmt.format(cal.time)
+            }
+
+            val serverByDay = fetchDailyStatsForDays(userId, days)
+            // 서버가 비어도(오프라인 등) 최근 7일치 로컬 Room 으로 일별 합계 폴백
+            val localTotals = db.scrollHistoryDao().countByDay().associate { it.day to it.count }
+            val monthKey = SimpleDateFormat("yyyy-MM", Locale.US).format(java.util.Date())
+            val month = fetchMonthlyStats(userId, monthKey)
+
+            prompt = buildStatsPrompt(dailyLimit, hourlyLimit, days, serverByDay, localTotals, month)
+        } catch (e: Exception) {
+            error = "통계를 불러오지 못했습니다: ${e.message}"
+        }
+        loading = false
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 16.dp, vertical = 16.dp)
+    ) {
+        // 상단 바
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            IconButton(onClick = onBack) {
+                Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "뒤로")
+            }
+            Text("AI 통계 분석", fontSize = 20.sp, fontWeight = FontWeight.ExtraBold, color = Color(0xFF1A1A1A))
+        }
+        Spacer(Modifier.height(8.dp))
+        Text(
+            "내 사용 통계를 프롬프트로 정리했어요. 복사한 뒤 원하는 AI 앱에 붙여넣으면 사용 패턴 분석과 줄이기 조언을 받을 수 있어요.",
+            fontSize = 13.sp,
+            color = Color(0xFF666666),
+            lineHeight = 18.sp
+        )
+        Spacer(Modifier.height(16.dp))
+
+        when {
+            loading -> Row(verticalAlignment = Alignment.CenterVertically) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(18.dp),
+                    strokeWidth = 2.dp,
+                    color = Color(0xFF1A1A1A)
+                )
+                Spacer(Modifier.width(10.dp))
+                Text("통계 불러오는 중...", fontSize = 13.sp, color = Color(0xFF888888))
+            }
+            error != null -> Text(error!!, fontSize = 13.sp, color = Color(0xFFC62828))
+            prompt != null -> AiPromptBody(prompt = prompt!!)
+        }
+    }
+}
+
+// 복사/AI 앱 버튼들 — 프롬프트 원문은 사용자에게 노출하지 않고 클립보드로만 전달
+@Composable
+private fun AiPromptBody(prompt: String) {
+    val context = LocalContext.current
+
+    // 준비 완료 안내 (프롬프트 내용은 보여주지 않음)
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(10.dp),
+        color = Color(0xFFF1F8F4)
+    ) {
+        Row(
+            modifier = Modifier.padding(14.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text("✅", fontSize = 18.sp)
+            Spacer(Modifier.width(10.dp))
+            Text(
+                "통계 분석 준비가 끝났어요. 아래 버튼으로 프롬프트를 복사하거나 AI 앱에서 바로 분석받으세요.",
+                fontSize = 13.sp,
+                color = Color(0xFF2E7D52),
+                lineHeight = 18.sp
+            )
+        }
+    }
+    Spacer(Modifier.height(12.dp))
+
+    Button(
+        onClick = {
+            copyPromptToClipboard(context, prompt)
+            Toast.makeText(context, "프롬프트를 복사했어요", Toast.LENGTH_SHORT).show()
+        },
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(10.dp),
+        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1A1A1A))
+    ) {
+        Text("📋 프롬프트 복사", color = Color.White, fontWeight = FontWeight.SemiBold)
+    }
+
+    Spacer(Modifier.height(20.dp))
+    HorizontalDivider(color = Color(0xFFEEEEEE))
+    Spacer(Modifier.height(16.dp))
+
+    Text("AI 앱에서 분석받기", fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = Color(0xFF1A1A1A))
+    Text(
+        "버튼을 누르면 프롬프트가 자동 복사되고 앱이 열려요. 입력창을 길게 눌러 붙여넣기 하세요. (앱이 없으면 웹으로 열립니다)",
+        fontSize = 12.sp,
+        color = Color(0xFF888888),
+        modifier = Modifier.padding(top = 4.dp, bottom = 12.dp),
+        lineHeight = 16.sp
+    )
+
+    AiAppButton(
+        label = "ChatGPT 열기",
+        bgColor = Color(0xFF10A37F),
+        onClick = {
+            copyPromptToClipboard(context, prompt)
+            openAiApp(context, "com.openai.chatgpt", "https://chatgpt.com")
+        }
+    )
+    Spacer(Modifier.height(10.dp))
+    AiAppButton(
+        label = "Gemini 열기",
+        bgColor = Color(0xFF4285F4),
+        onClick = {
+            copyPromptToClipboard(context, prompt)
+            openAiApp(context, "com.google.android.apps.bard", "https://gemini.google.com/app")
+        }
+    )
+    Spacer(Modifier.height(10.dp))
+    AiAppButton(
+        label = "Claude 열기",
+        bgColor = Color(0xFFD97757),
+        onClick = {
+            copyPromptToClipboard(context, prompt)
+            openAiApp(context, "com.anthropic.claude", "https://claude.ai/new")
+        }
+    )
+    Spacer(Modifier.height(24.dp))
+}
+
+@Composable
+private fun AiAppButton(label: String, bgColor: Color, onClick: () -> Unit) {
+    Button(
+        onClick = onClick,
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(10.dp),
+        colors = ButtonDefaults.buttonColors(containerColor = bgColor)
+    ) {
+        Text(label, color = Color.White, fontWeight = FontWeight.SemiBold, fontSize = 15.sp)
+    }
+}
+
+// 여러 날짜의 일간 통계를 동시에(최대 8개) 가져옴 — AI 프롬프트용. 실패한 날짜는 결과에서 빠짐.
+private suspend fun fetchDailyStatsForDays(
+    userId: String,
+    days: List<String>
+): Map<String, DailyStatsRemote> = coroutineScope {
+    val sem = Semaphore(8)
+    days.map { d -> async { d to sem.withPermit { fetchDailyStats(userId, d) } } }
+        .awaitAll()
+        .mapNotNull { (d, s) -> s?.let { d to it } }
+        .toMap()
+}
+
+// 통계를 사람이 읽기 쉬운 한국어 프롬프트로 변환. 패턴 분석 + 줄이기 조언을 함께 요청.
+private fun buildStatsPrompt(
+    dailyLimit: Int,
+    hourlyLimit: Int,
+    days: List<String>,                         // yyyy-MM-dd, 최근→과거 14일
+    serverByDay: Map<String, DailyStatsRemote>, // 서버 일간 통계 (있으면 우선)
+    localTotals: Map<String, Int>,              // 로컬 Room 일별 합계 (서버 없을 때 폴백)
+    month: MonthStatsRemote?
+): String {
+    val parse = SimpleDateFormat("yyyy-MM-dd", Locale.US)
+    val label = SimpleDateFormat("M.d(E)", Locale.KOREAN)
+    fun lbl(d: String): String = try { label.format(parse.parse(d)!!) } catch (e: Exception) { d }
+    fun totalOf(d: String): Int = serverByDay[d]?.totalScroll ?: localTotals[d] ?: 0
+
+    val recent7 = days.take(7)
+    val sum7 = recent7.sumOf { totalOf(it) }
+    val sum14 = days.sumOf { totalOf(it) }
+    val avg7 = sum7 / 7
+    val avg14 = sum14 / 14
+    val stopSum = days.sumOf { serverByDay[it]?.stopCount ?: 0 }
+    val ignoreSum = days.sumOf { serverByDay[it]?.ignoreCount ?: 0 }
+    val exceedDays = days.count { dailyLimit > 0 && totalOf(it) > dailyLimit }
+
+    val peakDay = days.maxByOrNull { totalOf(it) }
+    val peakCount = peakDay?.let { totalOf(it) } ?: 0
+    val hasPeak = peakDay != null && peakCount > 0
+    val hourlyLine = peakDay?.let { serverByDay[it]?.hourlyCounts }
+        ?.withIndex()
+        ?.filter { it.value > 0 }
+        ?.joinToString(", ") { "${it.index}시 ${it.value}회" }
+        ?.takeIf { it.isNotEmpty() }
+        ?: "기록 없음"
+
+    return buildString {
+        appendLine("당신은 디지털 웰빙 코치입니다. 아래는 'ShortCut' 앱이 기록한 제 YouTube Shorts 사용 통계입니다. 이 데이터를 바탕으로 분석해 주세요.")
+        appendLine()
+        appendLine("[제 목표 한도]")
+        appendLine("- 하루 목표: ${dailyLimit}회")
+        appendLine("- 1시간 목표: ${hourlyLimit}회")
+        appendLine()
+        appendLine("[최근 14일 일별 스크롤 수] (목표 초과한 날은 ⚠️)")
+        for (d in days) {
+            val t = totalOf(d)
+            val warn = if (dailyLimit > 0 && t > dailyLimit) " ⚠️" else ""
+            appendLine("- ${lbl(d)}: ${t}회$warn")
+        }
+        appendLine()
+        appendLine("[기간 요약]")
+        appendLine("- 최근 7일 총 ${sum7}회 (일평균 ${avg7}회)")
+        appendLine("- 최근 14일 총 ${sum14}회 (일평균 ${avg14}회)")
+        appendLine("- 14일 중 목표 초과한 날: ${exceedDays}일")
+        if (hasPeak) appendLine("- 가장 많이 본 날: ${lbl(peakDay!!)} (${peakCount}회)")
+        appendLine("- 한도 초과 시 '그만보기' 선택 ${stopSum}회 / 무시하고 계속 ${ignoreSum}회")
+        if (month != null) appendLine("- 이번 달 총 ${month.totalScroll}회 (일평균 ${month.avgScrollPerDay}회)")
+        appendLine()
+        if (hasPeak) {
+            appendLine("[가장 많이 본 날(${lbl(peakDay!!)})의 시간대별 분포]")
+            appendLine(hourlyLine)
+            appendLine()
+        }
+        appendLine("[분석 요청]")
+        appendLine("1. 제 사용 패턴을 분석해 주세요 — 주로 어느 시간대/요일에 많이 보는지, 한도를 얼마나 자주 넘는지, 최근 추세(늘었는지 줄었는지).")
+        appendLine("2. 쇼츠 사용을 줄이기 위한 구체적이고 실천 가능한 팁 3~5가지와, 다음 주에 도전할 만한 현실적인 목표 한도를 제안해 주세요.")
+        append("친근하고 격려하는 말투로, 한국어로 답해 주세요.")
+    }
+}
+
+// 프롬프트를 시스템 클립보드에 복사
+private fun copyPromptToClipboard(context: Context, text: String) {
+    val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+    cm.setPrimaryClip(android.content.ClipData.newPlainText("ShortCut 통계 프롬프트", text))
+}
+
+// 설치돼 있으면 해당 AI 앱을, 없으면 웹(브라우저)으로 폴백해서 연다.
+private fun openAiApp(context: Context, packageName: String, webUrl: String) {
+    val launch = context.packageManager.getLaunchIntentForPackage(packageName)
+    if (launch != null) {
+        launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        context.startActivity(launch)
+        return
+    }
+    try {
+        val web = Intent(Intent.ACTION_VIEW, android.net.Uri.parse(webUrl))
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        context.startActivity(web)
+    } catch (e: Exception) {
+        Toast.makeText(context, "앱이나 브라우저를 열 수 없습니다", Toast.LENGTH_SHORT).show()
     }
 }
 
@@ -675,9 +1014,10 @@ private fun heatColor(intensity: Float): Color =
     if (intensity <= 0f) Color(0xFFF5F5F5)
     else lerp(Color(0xFFFFE5E5), Color(0xFFC62828), 0.15f + 0.85f * intensity.coerceIn(0f, 1f))
 
-// ── 주간: 1년치 주(週) 그리드. ◀ 2026년 ▶ 로 연 이동, 그 해 주들을 4열 그리드로 색 농도(히트맵) 표시.
-//   한 주를 누르면 그 주 상세(요약 + 월~일 막대그래프). 셀은 "M.d~M.d"(연도는 위 헤더로 분리). ──
-// 그리드 합계와 상세 막대 모두 /daily 일별 데이터(같은 소스)에서 나와 항상 일치. 일간 탭과도 같은 값.
+// ── 주간: 연도 선택 + 1~4분기 탭. 선택한 분기의 주(週)만 4열 그리드로 색 농도(히트맵) 표시.
+//   배치는 좌상단=과거 → 우하단=최신(오름차순). 한 주를 누르면 그 주 상세(요약 + 월~일 막대그래프). ──
+// 데이터는 그 해 전체를 한 번 받아(yearOffset 키) 분기 전환은 즉시. 그리드 합계·상세 막대 모두 같은
+// /daily 일별 데이터에서 나와 항상 일치. 주가 속한 분기 = 그 주 목요일의 월/3 (연도 판정과 동일 기준).
 @Composable
 private fun StatsWeekly() {
     val context = LocalContext.current
@@ -686,6 +1026,7 @@ private fun StatsWeekly() {
     }
     val nowMs = remember { System.currentTimeMillis() }
     val curYear = remember { Calendar.getInstance().get(Calendar.YEAR) }
+    val curQuarter = remember { Calendar.getInstance().get(Calendar.MONTH) / 3 } // 0=1분기 .. 3=4분기
     val thisWeekMonday = remember { mondayOf(nowMs) }
     val todayStr = remember { SimpleDateFormat("yyyy-MM-dd", Locale.US).format(java.util.Date(nowMs)) }
 
@@ -693,12 +1034,23 @@ private fun StatsWeekly() {
     val displayYear = curYear + yearOffset
     val isCurrentYear = yearOffset == 0
 
-    // 그 해의 주(월요일)들 — 최근 주가 위로 오게 내림차순
-    val weeks = remember(yearOffset) { weeksOfYear(displayYear, thisWeekMonday, isCurrentYear).reversed() }
+    // 선택 분기 — 올해는 현재 분기로 시작
+    var quarter by remember { mutableStateOf(curQuarter) }
 
     val dayFmt = remember { SimpleDateFormat("yyyy-MM-dd", Locale.US) }
 
-    // 표시 주들의 모든 날짜(오늘 이전)를 /daily 로 받아 일별 합산 — 그리드·상세 공통 소스
+    // 그 해 전체 주(월요일) — 오름차순(과거가 앞)
+    val allWeeks = remember(yearOffset) { weeksOfYear(displayYear, thisWeekMonday, isCurrentYear) }
+
+    // 주가 속한 분기 = 그 주 목요일의 월 / 3
+    fun weekQuarter(ws: Long): Int {
+        val c = Calendar.getInstance().apply { timeInMillis = ws; add(Calendar.DAY_OF_YEAR, 3) }
+        return c.get(Calendar.MONTH) / 3
+    }
+    // 선택 분기의 주들 — 오름차순이라 좌상단=과거, 우하단=최신
+    val weeks = remember(allWeeks, quarter) { allWeeks.filter { weekQuarter(it) == quarter } }
+
+    // 표시 주들의 모든 날짜(오늘 이전)를 /daily 로 받아 일별 합산 — 그 해 전체를 한 번에(분기 전환은 즉시)
     var dayTotals by remember(yearOffset) { mutableStateOf<Map<String, Int>>(emptyMap()) }
     var loading by remember(yearOffset) { mutableStateOf(true) }
     LaunchedEffect(yearOffset, userId) {
@@ -706,7 +1058,7 @@ private fun StatsWeekly() {
         if (userId != null) {
             val cal = Calendar.getInstance()
             val days = mutableListOf<String>()
-            for (ws in weeks) {
+            for (ws in allWeeks) {
                 for (i in 0 until 7) {
                     cal.timeInMillis = ws
                     cal.add(Calendar.DAY_OF_YEAR, i)
@@ -728,11 +1080,15 @@ private fun StatsWeekly() {
         }
     }
     fun weekTotal(ws: Long): Int = weekDayCounts(ws).sum()
-    val maxTotal = remember(dayTotals, weeks) {
-        (weeks.maxOfOrNull { weekTotal(it) } ?: 0).coerceAtLeast(1)
+    // 히트맵 농도는 그 해 전체 최대값 기준 — 분기끼리 색을 비교할 수 있게
+    val maxTotal = remember(dayTotals, allWeeks) {
+        (allWeeks.maxOfOrNull { weekTotal(it) } ?: 0).coerceAtLeast(1)
     }
 
-    var selectedWeek by remember(yearOffset) { mutableStateOf(weeks.firstOrNull() ?: thisWeekMonday) }
+    // 선택 주 — 분기 안의 최신 주를 기본 선택. 분기/연도 바뀌면 재설정.
+    var selectedWeek by remember(yearOffset, quarter) {
+        mutableStateOf(weeks.lastOrNull() ?: thisWeekMonday)
+    }
 
     val shortFmt = remember { SimpleDateFormat("M.d", Locale.US) }
     val longStartFmt = remember { SimpleDateFormat("yyyy.MM.dd", Locale.US) }
@@ -768,83 +1124,116 @@ private fun StatsWeekly() {
                 Icon(Icons.Filled.ChevronRight, contentDescription = "다음 해")
             }
         }
+
+        // 분기 선택 탭 (1~4분기) — 한 번에 한 분기만 표시
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp),
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            listOf("1분기", "2분기", "3분기", "4분기").forEachIndexed { i, label ->
+                val selected = quarter == i
+                Surface(
+                    modifier = Modifier.weight(1f).clickable { quarter = i },
+                    shape = RoundedCornerShape(8.dp),
+                    color = if (selected) Color(0xFF1A1A1A) else Color(0xFFF1F1F1)
+                ) {
+                    Text(
+                        label,
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
+                        textAlign = TextAlign.Center,
+                        color = if (selected) Color.White else Color(0xFF1A1A1A),
+                        fontWeight = FontWeight.SemiBold,
+                        fontSize = 13.sp
+                    )
+                }
+            }
+        }
+
         if (loading) {
             Text("불러오는 중...", fontSize = 12.sp, color = Color(0xFF888888),
                 modifier = Modifier.padding(4.dp))
         }
 
-        // 주 그리드 — 4열
-        val cols = 4
-        val rowsN = (weeks.size + cols - 1) / cols
-        for (r in 0 until rowsN) {
-            Row(modifier = Modifier.fillMaxWidth()) {
-                for (c in 0 until cols) {
-                    val idx = r * cols + c
-                    if (idx < weeks.size) {
-                        val ws = weeks[idx]
-                        val total = weekTotal(ws)
-                        val intensity = total.toFloat() / maxTotal
-                        val selected = ws == selectedWeek
-                        var cellMod = Modifier
-                            .weight(1f)
-                            .aspectRatio(1f)
-                            .padding(3.dp)
-                            .background(heatColor(intensity), RoundedCornerShape(8.dp))
-                            .clickable { selectedWeek = ws }
-                        if (selected) cellMod = cellMod.border(2.dp, Color(0xFF1A1A1A), RoundedCornerShape(8.dp))
-                        Box(modifier = cellMod, contentAlignment = Alignment.Center) {
-                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                Text(
-                                    shortRange(ws), fontSize = 11.sp, fontWeight = FontWeight.SemiBold,
-                                    color = if (intensity > 0.55f) Color.White else Color(0xFF1A1A1A)
-                                )
-                                Text(
-                                    "${total}회", fontSize = 10.sp,
-                                    color = if (intensity > 0.55f) Color.White else Color(0xFF555555)
-                                )
+        if (weeks.isEmpty()) {
+            Text(
+                "이 분기에는 아직 기록이 없습니다.",
+                fontSize = 13.sp, color = Color(0xFF888888),
+                modifier = Modifier.padding(vertical = 24.dp)
+            )
+        } else {
+            // 주 그리드 — 4열, 좌상단(과거) → 우하단(최신)
+            val cols = 4
+            val rowsN = (weeks.size + cols - 1) / cols
+            for (r in 0 until rowsN) {
+                Row(modifier = Modifier.fillMaxWidth()) {
+                    for (c in 0 until cols) {
+                        val idx = r * cols + c
+                        if (idx < weeks.size) {
+                            val ws = weeks[idx]
+                            val total = weekTotal(ws)
+                            val intensity = total.toFloat() / maxTotal
+                            val selected = ws == selectedWeek
+                            var cellMod = Modifier
+                                .weight(1f)
+                                .aspectRatio(1f)
+                                .padding(3.dp)
+                                .background(heatColor(intensity), RoundedCornerShape(8.dp))
+                                .clickable { selectedWeek = ws }
+                            if (selected) cellMod = cellMod.border(2.dp, Color(0xFF1A1A1A), RoundedCornerShape(8.dp))
+                            Box(modifier = cellMod, contentAlignment = Alignment.Center) {
+                                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                    Text(
+                                        shortRange(ws), fontSize = 11.sp, fontWeight = FontWeight.SemiBold,
+                                        color = if (intensity > 0.55f) Color.White else Color(0xFF1A1A1A)
+                                    )
+                                    Text(
+                                        "${total}회", fontSize = 10.sp,
+                                        color = if (intensity > 0.55f) Color.White else Color(0xFF555555)
+                                    )
+                                }
                             }
+                        } else {
+                            Box(modifier = Modifier.weight(1f).aspectRatio(1f).padding(3.dp))
                         }
-                    } else {
-                        Box(modifier = Modifier.weight(1f).aspectRatio(1f).padding(3.dp))
                     }
                 }
             }
-        }
 
-        Spacer(Modifier.height(16.dp))
-        Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(Color(0xFFEEEEEE)))
-        Spacer(Modifier.height(16.dp))
+            Spacer(Modifier.height(16.dp))
+            Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(Color(0xFFEEEEEE)))
+            Spacer(Modifier.height(16.dp))
 
-        // 선택 주 상세 (그리드와 같은 dayTotals 에서 계산 → 항상 일치)
-        val dc = weekDayCounts(selectedWeek)
-        val total = dc.sum()
-        val peakIdx = dc.indices.maxByOrNull { dc[it] } ?: 0
-        val peakDateStr = if (dc[peakIdx] > 0) {
-            Calendar.getInstance().apply { timeInMillis = selectedWeek; add(Calendar.DAY_OF_YEAR, peakIdx) }
-                .let { dayFmt.format(it.time) }
-        } else null
-        Text(
-            longRange(selectedWeek), fontSize = 18.sp, fontWeight = FontWeight.Bold,
-            color = Color(0xFF1A1A1A), modifier = Modifier.padding(start = 4.dp, bottom = 8.dp)
-        )
-        StatsSummaryCard(
-            title = "주간 요약",
-            totalScroll = total,
-            avgPerDay = total / 7,
-            peakDate = peakDateStr,
-            peakCount = if (peakDateStr != null) dc[peakIdx] else null,
-            loading = loading,
-            errorMsg = null
-        )
-        Box(modifier = Modifier.fillMaxWidth().height(200.dp)) {
-            if (loading) {
-                Text("불러오는 중...", fontSize = 12.sp, color = Color(0xFF888888),
-                    modifier = Modifier.padding(8.dp))
-            } else {
-                WeekBarChart(counts = dc)
+            // 선택 주 상세 (그리드와 같은 dayTotals 에서 계산 → 항상 일치)
+            val dc = weekDayCounts(selectedWeek)
+            val total = dc.sum()
+            val peakIdx = dc.indices.maxByOrNull { dc[it] } ?: 0
+            val peakDateStr = if (dc[peakIdx] > 0) {
+                Calendar.getInstance().apply { timeInMillis = selectedWeek; add(Calendar.DAY_OF_YEAR, peakIdx) }
+                    .let { dayFmt.format(it.time) }
+            } else null
+            Text(
+                longRange(selectedWeek), fontSize = 18.sp, fontWeight = FontWeight.Bold,
+                color = Color(0xFF1A1A1A), modifier = Modifier.padding(start = 4.dp, bottom = 8.dp)
+            )
+            StatsSummaryCard(
+                title = "주간 요약",
+                totalScroll = total,
+                avgPerDay = total / 7,
+                peakDate = peakDateStr,
+                peakCount = if (peakDateStr != null) dc[peakIdx] else null,
+                loading = loading,
+                errorMsg = null
+            )
+            Box(modifier = Modifier.fillMaxWidth().height(200.dp)) {
+                if (loading) {
+                    Text("불러오는 중...", fontSize = 12.sp, color = Color(0xFF888888),
+                        modifier = Modifier.padding(8.dp))
+                } else {
+                    WeekBarChart(counts = dc)
+                }
             }
+            Spacer(Modifier.height(24.dp))
         }
-        Spacer(Modifier.height(24.dp))
     }
 }
 
@@ -1531,7 +1920,7 @@ private fun GroupTabContent() {
 // 설정 탭
 // ─────────────────────────────────────────────────────────────────────────
 
-private enum class SettingsSubScreen { ROOT, LIMIT }
+private enum class SettingsSubScreen { ROOT, LIMIT, ACCOUNT }
 
 @Composable
 private fun SettingsTabContent(onAuthChanged: () -> Unit) {
@@ -1545,10 +1934,14 @@ private fun SettingsTabContent(onAuthChanged: () -> Unit) {
     when (subScreen) {
         SettingsSubScreen.ROOT -> SettingsRootScreen(
             onOpenLimit = { subScreen = SettingsSubScreen.LIMIT },
-            onAuthChanged = onAuthChanged
+            onOpenAccount = { subScreen = SettingsSubScreen.ACCOUNT }
         )
         SettingsSubScreen.LIMIT -> SettingsLimitScreen(
             onBack = { subScreen = SettingsSubScreen.ROOT }
+        )
+        SettingsSubScreen.ACCOUNT -> SettingsAccountScreen(
+            onBack = { subScreen = SettingsSubScreen.ROOT },
+            onAuthChanged = onAuthChanged
         )
     }
 }
@@ -1556,11 +1949,9 @@ private fun SettingsTabContent(onAuthChanged: () -> Unit) {
 @Composable
 private fun SettingsRootScreen(
     onOpenLimit: () -> Unit,
-    onAuthChanged: () -> Unit
+    onOpenAccount: () -> Unit
 ) {
     val context = LocalContext.current
-    val scope = rememberCoroutineScope()
-    val db = remember { AppDatabase.getDatabase(context) }
     val auth = remember { FirebaseAuth.getInstance() }
 
     val prefs = remember {
@@ -1581,11 +1972,6 @@ private fun SettingsRootScreen(
     var appMode by remember {
         mutableStateOf(prefs.getString("appMode", "normal") ?: "normal")
     }
-
-    var showAccountMenu by remember { mutableStateOf(false) }
-    var showLogoutConfirm by remember { mutableStateOf(false) }
-    var showDeleteConfirm by remember { mutableStateOf(false) }
-    var isDeleting by remember { mutableStateOf(false) }
 
     Column(
         modifier = Modifier
@@ -1673,38 +2059,88 @@ private fun SettingsRootScreen(
         SettingsRow(
             label = "계정 관리",
             value = "열기 →",
-            onClick = { showAccountMenu = true }
+            onClick = onOpenAccount
         )
     }
+}
 
-    // 계정 관리 — 로그아웃 / 탈퇴 / 취소 선택
-    if (showAccountMenu) {
-        AlertDialog(
-            onDismissRequest = { showAccountMenu = false },
-            title = { Text("계정 관리") },
-            text = {
-                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    TextButton(
-                        onClick = {
-                            showAccountMenu = false
-                            showLogoutConfirm = true
-                        },
-                        modifier = Modifier.fillMaxWidth()
-                    ) { Text("로그아웃", color = Color(0xFF1A1A1A)) }
-                    TextButton(
-                        onClick = {
-                            showAccountMenu = false
-                            showDeleteConfirm = true
-                        },
-                        modifier = Modifier.fillMaxWidth()
-                    ) { Text("탈퇴하기", color = Color(0xFFC62828)) }
-                }
-            },
-            confirmButton = {},
-            dismissButton = {
-                TextButton(onClick = { showAccountMenu = false }) { Text("취소") }
+// ── 계정 하위 화면 (전체화면) ──────────────────────────────────────────
+// 로그인된 Google 계정 정보 표시 + 로그아웃 / 탈퇴. 작은 다이얼로그가 아닌 별도 페이지로 띄움.
+@Composable
+private fun SettingsAccountScreen(onBack: () -> Unit, onAuthChanged: () -> Unit) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val db = remember { AppDatabase.getDatabase(context) }
+    val auth = remember { FirebaseAuth.getInstance() }
+    val prefs = remember {
+        context.getSharedPreferences("short_cut_prefs", Context.MODE_PRIVATE)
+    }
+
+    var showLogoutConfirm by remember { mutableStateOf(false) }
+    var showDeleteConfirm by remember { mutableStateOf(false) }
+    var isDeleting by remember { mutableStateOf(false) }
+
+    val accountEmail = auth.currentUser?.email ?: "이메일 정보 없음"
+    val accountName = auth.currentUser?.displayName
+
+    Column(modifier = Modifier.fillMaxSize()) {
+        // 상단 뒤로가기 + 타이틀
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.padding(horizontal = 8.dp, vertical = 16.dp)
+        ) {
+            IconButton(onClick = onBack) {
+                Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "뒤로")
             }
-        )
+            Text(
+                text = "내 계정",
+                fontSize = 22.sp,
+                fontWeight = FontWeight.ExtraBold,
+                color = Color(0xFF1A1A1A)
+            )
+        }
+
+        Column(modifier = Modifier.padding(horizontal = 24.dp)) {
+            Spacer(Modifier.height(8.dp))
+
+            // 로그인 계정 정보 카드
+            Surface(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(12.dp),
+                color = Color(0xFFF7F7F7)
+            ) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Text("로그인된 Google 계정", fontSize = 13.sp, color = Color(0xFF888888))
+                    Spacer(Modifier.height(6.dp))
+                    if (!accountName.isNullOrBlank()) {
+                        Text(
+                            accountName,
+                            fontSize = 18.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = Color(0xFF1A1A1A)
+                        )
+                        Spacer(Modifier.height(2.dp))
+                    }
+                    Text(accountEmail, fontSize = 15.sp, color = Color(0xFF1A1A1A))
+                }
+            }
+
+            Spacer(Modifier.height(24.dp))
+            HorizontalDivider(color = Color(0xFFEEEEEE))
+
+            // 로그아웃 / 탈퇴 행
+            SettingsRow(label = "로그아웃", value = "", onClick = { showLogoutConfirm = true })
+            HorizontalDivider(color = Color(0xFFEEEEEE))
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable { showDeleteConfirm = true }
+                    .padding(vertical = 12.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(text = "탈퇴하기", fontSize = 16.sp, color = Color(0xFFC62828))
+            }
+        }
     }
 
     // 로그아웃 확인
