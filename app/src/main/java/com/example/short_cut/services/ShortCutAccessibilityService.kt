@@ -220,6 +220,15 @@ class ShortCutAccessibilityService : AccessibilityService() {
         sendPendingUserLogs()
     }
 
+    // 두 시각이 같은 '시(hour)'(로컬 타임존, 같은 날 같은 시)인지 — 배치가 시 경계를 넘는지 판단용
+    private fun sameHour(a: Long, b: Long): Boolean {
+        val ca = java.util.Calendar.getInstance().apply { timeInMillis = a }
+        val cb = java.util.Calendar.getInstance().apply { timeInMillis = b }
+        return ca.get(java.util.Calendar.YEAR) == cb.get(java.util.Calendar.YEAR) &&
+                ca.get(java.util.Calendar.DAY_OF_YEAR) == cb.get(java.util.Calendar.DAY_OF_YEAR) &&
+                ca.get(java.util.Calendar.HOUR_OF_DAY) == cb.get(java.util.Calendar.HOUR_OF_DAY)
+    }
+
     // 오늘 자정(00:00:00) 타임스탬프 계산
     private fun getStartOfDayTimestamp(): Long {
         val cal = java.util.Calendar.getInstance()
@@ -427,9 +436,15 @@ class ShortCutAccessibilityService : AccessibilityService() {
 
             dailyCount++
 
-            // 배치 카운터 증가 — BATCH_SIZE(10개) 쌓이면 즉시 서버 전송
-            // 배치의 첫 스크롤 시각(now)을 기록 → 전송 시 "보낸 시각"이 아니라 "실제 스크롤 시각"을
-            // timestamp 로 보냄. 서버가 그 시각 기준 날짜로 집계하므로 자정 넘김 오분류를 막음.
+            // 배치 카운터 증가 — BATCH_SIZE(10개) 쌓이면 즉시 서버 전송.
+            // 배치의 첫 스크롤 시각(now)을 timestamp 로 보냄 → 서버가 실제 스크롤 시각 기준으로 집계.
+            // 이번 스크롤이 배치 첫 스크롤과 다른 시(hour)면 먼저 flush → 한 배치가 두 시간대에 안 걸치게
+            // 함(시간대별 그래프 정확도용). 자정 경계는 handleDayRolloverIfNeeded 가 이미 flush.
+            val crossesHour = synchronized(pendingLock) {
+                batchScrollCount > 0 && !sameHour(batchFirstScrollMs, now)
+            }
+            if (crossesHour) flushBatch()
+
             val reachedBatch: Boolean
             synchronized(pendingLock) {
                 if (batchScrollCount == 0) batchFirstScrollMs = now
