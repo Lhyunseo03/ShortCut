@@ -2524,7 +2524,13 @@ private suspend fun fetchAiAnalysis(userId: String, prompt: String): String? = w
             .addHeader("Authorization", "Bearer $token")
             .post(payload.toRequestBody("application/json".toMediaType()))
             .build()
-        val resp = OkHttpClient().newCall(req).execute()
+        // Gemini 응답이 기본 10초를 넘길 수 있어 타임아웃을 넉넉히 — 기본값이면 앱이 먼저 끊어 "다시 시도" 에러
+        val client = OkHttpClient.Builder()
+            .connectTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+            .readTimeout(90, java.util.concurrent.TimeUnit.SECONDS)
+            .writeTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+            .build()
+        val resp = client.newCall(req).execute()
         val body = resp.body?.string()
         val ok = resp.isSuccessful
         val code = resp.code
