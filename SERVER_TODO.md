@@ -29,9 +29,21 @@ Content-Type: application/json
 { "analysis": "<AI가 생성한 분석 텍스트>" }
 ```
 
+**사용할 AI: Google Gemini (확정)**
+- API 키: Google AI Studio(https://aistudio.google.com/apikey)에서 발급. 무료 티어 충분.
+- **키는 서버 환경변수(예: `GEMINI_API_KEY`)에만 보관** — 앱엔 절대 안 넣음.
+- 모델: `gemini-2.5-flash`(또는 `gemini-2.0-flash`) 같은 flash 계열이면 충분 (싸고 빠름). 현재 사용 가능한 모델명은 AI Studio에서 확인.
+- 호출 예 (REST):
+  ```
+  POST https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=$GEMINI_API_KEY
+  Content-Type: application/json
+
+  { "contents": [ { "parts": [ { "text": "<앱이 보낸 prompt>" } ] } ] }
+  ```
+  응답에서 `candidates[0].content.parts[0].text` 를 꺼내 우리 응답의 `analysis` 로 반환.
+
 **요청사항**
-- AI는 자유 선택 (Gemini / Claude / GPT). **API 키는 반드시 서버 환경변수로만** 보관 — 앱엔 절대 안 넣음.
-- 받은 `prompt`를 그대로 AI에 전달하고, 답변 텍스트를 `analysis`에 담아 반환.
+- 받은 `prompt`를 그대로 Gemini에 전달하고, 답변 텍스트를 `analysis`에 담아 반환.
 - 실패 시 4xx/5xx면 됨 (앱이 "다시 시도" 버튼 표시). 응답 본문 형식은 신경 안 써도 됨.
 - 프롬프트가 김(최근 14일 통계) → 타임아웃 넉넉히.
 - ⚠️ `/analyze` 배포 전까지는 앱에서 AI 분석 버튼 누르면 "다시 시도" 에러만 뜸 (정상).
