@@ -56,6 +56,7 @@ class ShortCutAccessibilityService : AccessibilityService() {
         const val PK_PENDING_TYPE = "pendingPopupType"         // "daily"/"hourly"/null — 현재 미응답 popup 종류
         const val PK_PENDING_OVERAGE = "pendingPopupOverage"   // 현재 미응답 popup 의 overage (0,10,20.../0,100,200...)
         const val PK_TODAY_START = "todayStartMs"              // 마지막으로 처리한 "오늘 0시" — 날짜 롤오버 감지용
+        const val PK_PENDING_USERLOGS = "pendingUserLogs"      // 서버 전송 대기/실패한 userlog 큐 (JSON 배열 [{ts,count}])
     }
 
     // ── Room DB ───────────────────────────────────────────────
@@ -108,13 +109,19 @@ class ShortCutAccessibilityService : AccessibilityService() {
     private val mainHandler = Handler(Looper.getMainLooper())
 
     // ── 배치 전송 ─────────────────────────────────────────────
+    // 현재 쌓이는 중인 배치. batchFirstScrollMs = 이 배치의 첫 스크롤 시각(전송 timestamp 로 사용).
     private var batchScrollCount = 0
+    private var batchFirstScrollMs = 0L
     private val BATCH_SIZE = 10
     private val batchHandler = Handler(Looper.getMainLooper())
     private val batchTimerRunnable = Runnable {
         flushBatch()
         scheduleBatchTimer()
     }
+    // batchScrollCount/batchFirstScrollMs 와 pending 큐(prefs) 접근을 보호하는 락 (네트워크 I/O 는 락 밖에서 수행)
+    private val pendingLock = Any()
+    // 동시에 두 전송이 큐 앞쪽을 중복 제거하지 않도록 — 전송은 한 번에 하나만
+    private val isSending = java.util.concurrent.atomic.AtomicBoolean(false)
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -208,6 +215,9 @@ class ShortCutAccessibilityService : AccessibilityService() {
 
         savePersistedState()
         Log.d(TAG, "상태 복원 — dailyMilestone=$dailyMilestone, hourlyMilestone=$hourlyMilestone, stopUntilMs=$stopUntilMs, pending=$pendingPopupType($pendingPopupOverage)")
+
+        // 지난 실행에서 전송 못 하고 남은 userlog 가 있으면 재시도 (앱 강제종료 등으로 유실 방지)
+        sendPendingUserLogs()
     }
 
     // 오늘 자정(00:00:00) 타임스탬프 계산
@@ -227,6 +237,9 @@ class ShortCutAccessibilityService : AccessibilityService() {
         if (startToday == todayStartMs) return
 
         Log.d(TAG, "자정 롤오버 감지 → 상태 재설정")
+        // 날짜가 바뀌기 전에 이전 날 배치를 먼저 flush — batchFirstScrollMs(이전 날 시각)로 전송돼
+        // 어제 스크롤이 어제 날짜로 집계됨
+        flushBatch()
         todayStartMs = startToday
         dailyCount = scrollHistoryDao.countToday(startToday)
         dailyMilestone = -1
@@ -415,10 +428,15 @@ class ShortCutAccessibilityService : AccessibilityService() {
             dailyCount++
 
             // 배치 카운터 증가 — BATCH_SIZE(10개) 쌓이면 즉시 서버 전송
-            batchScrollCount++
-            if (batchScrollCount >= BATCH_SIZE) {
-                flushBatch()
+            // 배치의 첫 스크롤 시각(now)을 기록 → 전송 시 "보낸 시각"이 아니라 "실제 스크롤 시각"을
+            // timestamp 로 보냄. 서버가 그 시각 기준 날짜로 집계하므로 자정 넘김 오분류를 막음.
+            val reachedBatch: Boolean
+            synchronized(pendingLock) {
+                if (batchScrollCount == 0) batchFirstScrollMs = now
+                batchScrollCount++
+                reachedBatch = batchScrollCount >= BATCH_SIZE
             }
+            if (reachedBatch) flushBatch()
 
             // 최근 1시간 스크롤 횟수 조회 (슬라이딩 윈도우)
             val oneHourAgo = now - (60 * 60 * 1000L)
@@ -1148,41 +1166,114 @@ class ShortCutAccessibilityService : AccessibilityService() {
         }
     }
 
-    // 서버로 POST /userlogs 전송 — 배치 기간 동안 누적된 스크롤 횟수 저장
-    private fun sendUserLog(scrollCount: Int) {
-        val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
-        val userId = prefs.getString("userId", "unknown") ?: "unknown"
+    // ── userlog pending 큐 (prefs 영속) ───────────────────────
+    // 큐는 JSON 배열 [{"id":String,"ts":Long,"count":Int}, ...] 로 prefs 에 저장 — 앱이 강제종료돼도 살아남음.
+    // 전송 성공이 확인된 항목만 큐에서 빠지므로, 네트워크/토큰 실패 시 스크롤이 유실되지 않음.
+    // id 는 중복 방지(idempotency)용 고유 키 — 재전송돼도 서버가 같은 id 를 dedup 하면 중복 집계 안 됨.
+    // 아래 read/write/append 헬퍼는 모두 synchronized(pendingLock) 안에서만 호출해야 함.
 
-        val json = """
-        {
-            "userId": "$userId",
-            "timestamp": ${System.currentTimeMillis()},
-            "scrollCount": $scrollCount
+    private data class PendingLog(val id: String, val ts: Long, val count: Int)
+
+    private fun readPendingLocked(): List<PendingLog> {
+        val raw = getSharedPreferences(PREFS, MODE_PRIVATE).getString(PK_PENDING_USERLOGS, "[]") ?: "[]"
+        return try {
+            val arr = org.json.JSONArray(raw)
+            (0 until arr.length()).mapNotNull { i ->
+                arr.optJSONObject(i)?.let { o ->
+                    // 구버전 큐(id 없음) 호환 — 없으면 새 id 부여
+                    val id = o.optString("id").takeIf { it.isNotEmpty() }
+                        ?: java.util.UUID.randomUUID().toString()
+                    PendingLog(id, o.optLong("ts"), o.optInt("count"))
+                }
+            }
+        } catch (_: Exception) {
+            emptyList()
         }
-    """.trimIndent()
+    }
 
-        serviceScope.launch {
-            try {
+    private fun writePendingLocked(list: List<PendingLog>) {
+        val arr = org.json.JSONArray()
+        list.forEach { p ->
+            arr.put(org.json.JSONObject().put("id", p.id).put("ts", p.ts).put("count", p.count))
+        }
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+            .putString(PK_PENDING_USERLOGS, arr.toString()).apply()
+    }
+
+    private fun appendPendingLocked(ts: Long, count: Int) {
+        val entry = PendingLog(java.util.UUID.randomUUID().toString(), ts, count)
+        writePendingLocked(readPendingLocked() + entry)
+    }
+
+    // /userlogs 1건 전송(블로킹). 성공하면 true. ts = 배치 첫 스크롤 시각(실제 발생 시각).
+    // logId 를 함께 보내 서버가 재전송 중복을 dedup 하도록 함.
+    private fun postUserLogBlocking(token: String, userId: String, log: PendingLog): Boolean {
+        return try {
+            val json = """
+            {
+                "userId": "$userId",
+                "logId": "${log.id}",
+                "timestamp": ${log.ts},
+                "scrollCount": ${log.count}
+            }
+        """.trimIndent()
+            val client = okhttp3.OkHttpClient()
+            val body = json.toRequestBody("application/json".toMediaType())
+            val request = okhttp3.Request.Builder()
+                .url("https://short-cut-server-production.up.railway.app/userlogs")
+                .addHeader("Authorization", "Bearer $token")
+                .post(body)
+                .build()
+            val response = client.newCall(request).execute()
+            val ok = response.isSuccessful
+            val code = response.code
+            response.close()
+            Log.d(TAG, "userLog 전송 — id=${log.id}, count=${log.count}, ts=${log.ts}, success=$ok ($code)")
+            ok
+        } catch (e: Exception) {
+            Log.e(TAG, "userLog 전송 실패 — ${e.message}")
+            false
+        }
+    }
+
+    // pending 큐를 서버로 전송. 성공분만 큐에서 제거, 실패분은 남겨 다음 기회에 재시도.
+    // isSending 가드로 한 번에 하나만 실행 — 큐 앞쪽 항목을 중복 전송/중복 제거하지 않게 함.
+    private suspend fun sendPendingUserLogs() {
+        if (!isSending.compareAndSet(false, true)) return  // 이미 전송 중
+        try {
+            val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
+            val userId = prefs.getString("userId", "unknown") ?: "unknown"
+            while (true) {
+                val queue = synchronized(pendingLock) { readPendingLocked() }
+                if (queue.isEmpty()) return
+
                 val token = getFirebaseToken()
                 if (token == null) {
-                    Log.e(TAG, "userLog 전송 실패 — 토큰 없음")
-                    return@launch
+                    Log.e(TAG, "userLog 전송 보류 — 토큰 없음 (다음 기회 재시도)")
+                    return
                 }
 
-                val client = okhttp3.OkHttpClient()
-                val mediaType = "application/json".toMediaType()
-                val body = json.toRequestBody(mediaType)
-                val request = okhttp3.Request.Builder()
-                    .url("https://short-cut-server-production.up.railway.app/userlogs")
-                    .addHeader("Authorization", "Bearer $token")
-                    .post(body)
-                    .build()
+                // 네트워크 I/O 는 락 밖에서 — 전송 중에도 스크롤 카운팅이 막히지 않게
+                val failed = ArrayList<PendingLog>()
+                for (log in queue) {
+                    if (log.count <= 0) continue
+                    if (!postUserLogBlocking(token, userId, log)) failed.add(log)
+                }
 
-                val response = client.newCall(request).execute()
-                Log.d(TAG, "userLog 배치 전송 완료 — scrollCount: $scrollCount, ${response.code}")
-            } catch (e: Exception) {
-                Log.e(TAG, "userLog 배치 전송 실패 — ${e.message}")
+                // 처리한 앞쪽 queue.size 개를 제거하고, 그 사이 새로 들어온 항목(newer)과 실패분을 다시 씀.
+                // 앞쪽에서 제거하는 건 이 전송(isSending 가드로 단일)뿐이고 enqueue 는 뒤에만 붙으므로 안전.
+                val keepLooping = synchronized(pendingLock) {
+                    val current = readPendingLocked()
+                    val newer = if (current.size > queue.size) current.subList(queue.size, current.size).toList()
+                                else emptyList()
+                    writePendingLocked(failed + newer)
+                    // 실패가 있으면 네트워크 불안정으로 보고 중단(다음 flush/시작 시 재시도). 없으면 newer 만큼 더 처리.
+                    failed.isEmpty() && newer.isNotEmpty()
+                }
+                if (!keepLooping) return
             }
+        } finally {
+            isSending.set(false)
         }
     }
 
@@ -1190,11 +1281,17 @@ class ShortCutAccessibilityService : AccessibilityService() {
         batchHandler.postDelayed(batchTimerRunnable, 5 * 60 * 1000L)
     }
 
+    // 현재 배치를 pending 큐에 영속화(즉시, 동기)하고 전송을 트리거.
+    // 큐에 넣은 뒤에만 카운터를 비우므로, 전송 코루틴이 끝나기 전에 프로세스가 죽어도 유실되지 않음.
     private fun flushBatch() {
-        val count = batchScrollCount
-        if (count <= 0) return
-        batchScrollCount = 0
-        sendUserLog(count)
+        synchronized(pendingLock) {
+            if (batchScrollCount > 0) {
+                appendPendingLocked(batchFirstScrollMs, batchScrollCount)
+                batchScrollCount = 0
+                batchFirstScrollMs = 0L
+            }
+        }
+        serviceScope.launch { sendPendingUserLogs() }
     }
 
     // 모든 popup view 제거 — variant 4 stacked 포함 전체 dismiss

@@ -22,6 +22,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Add
@@ -52,7 +53,6 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import com.example.short_cut.db.AppDatabase
-import com.example.short_cut.db.DailyCount
 import com.example.short_cut.db.HourlyCount
 import com.example.short_cut.db.UserLimit
 import com.example.short_cut.services.ShortCutAccessibilityService
@@ -644,7 +644,8 @@ private fun StatsTabContent() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// AI 통계 분석 — 통계를 한국어 프롬프트로 만들어 ChatGPT/Gemini/Claude 앱에서 분석받기
+// AI 통계 분석 — 통계로 프롬프트를 만들어 서버(/analyze)로 보내고, AI 분석 결과만 인앱에 표시.
+// 프롬프트 원문은 서버→AI 로만 전달되어 사용자에게 노출되지 않음(API 키는 서버 보관).
 // ─────────────────────────────────────────────────────────────────────────
 
 // 통계 탭 상단의 진입 카드
@@ -672,7 +673,7 @@ private fun AiAnalysisEntryCard(onClick: () -> Unit) {
                     fontWeight = FontWeight.SemiBold
                 )
                 Text(
-                    "ChatGPT · Gemini · Claude 로 사용 패턴 분석받기",
+                    "사용 패턴 분석과 줄이기 조언을 앱에서 바로 받기",
                     color = Color(0xFFBBBBBB),
                     fontSize = 12.sp,
                     modifier = Modifier.padding(top = 2.dp)
@@ -683,7 +684,8 @@ private fun AiAnalysisEntryCard(onClick: () -> Unit) {
     }
 }
 
-// AI 분석 화면 — 통계를 불러와 프롬프트를 만들고, 복사 + AI 앱 바로가기 버튼 제공
+// AI 분석 화면 — 통계로 프롬프트를 만들어 서버(/analyze)로 보내고, 돌아온 분석 결과만 표시.
+// 프롬프트 원문은 화면에 띄우지도 클립보드에 복사하지도 않음 → 사용자에게 노출되지 않음.
 @Composable
 private fun AiAnalysisScreen(onBack: () -> Unit) {
     val context = LocalContext.current
@@ -692,13 +694,15 @@ private fun AiAnalysisScreen(onBack: () -> Unit) {
         context.getSharedPreferences("short_cut_prefs", Context.MODE_PRIVATE).getString("userId", null)
     }
 
-    var prompt by remember { mutableStateOf<String?>(null) }
+    var analysis by remember { mutableStateOf<String?>(null) }
     var loading by remember { mutableStateOf(true) }
     var error by remember { mutableStateOf<String?>(null) }
+    var reloadKey by remember { mutableStateOf(0) }  // "다시 시도" 트리거
 
-    LaunchedEffect(userId) {
+    LaunchedEffect(userId, reloadKey) {
         loading = true
         error = null
+        analysis = null
         if (userId == null) {
             error = "로그인이 필요합니다. 다시 로그인 후 이용해 주세요."
             loading = false
@@ -725,7 +729,14 @@ private fun AiAnalysisScreen(onBack: () -> Unit) {
             val monthKey = SimpleDateFormat("yyyy-MM", Locale.US).format(java.util.Date())
             val month = fetchMonthlyStats(userId, monthKey)
 
-            prompt = buildStatsPrompt(dailyLimit, hourlyLimit, days, serverByDay, localTotals, month)
+            // 프롬프트는 만들어 서버로만 전송 — 사용자에겐 결과만 노출
+            val prompt = buildStatsPrompt(dailyLimit, hourlyLimit, days, serverByDay, localTotals, month)
+            val result = fetchAiAnalysis(userId, prompt)
+            if (result != null) {
+                analysis = result
+            } else {
+                error = "AI 분석을 불러오지 못했어요. 잠시 후 다시 시도해 주세요."
+            }
         } catch (e: Exception) {
             error = "통계를 불러오지 못했습니다: ${e.message}"
         }
@@ -747,7 +758,7 @@ private fun AiAnalysisScreen(onBack: () -> Unit) {
         }
         Spacer(Modifier.height(8.dp))
         Text(
-            "내 사용 통계를 프롬프트로 정리했어요. 복사한 뒤 원하는 AI 앱에 붙여넣으면 사용 패턴 분석과 줄이기 조언을 받을 수 있어요.",
+            "내 사용 통계를 AI가 분석했어요. 아래에서 사용 패턴과 줄이기 조언을 확인하세요.",
             fontSize = 13.sp,
             color = Color(0xFF666666),
             lineHeight = 18.sp
@@ -762,105 +773,43 @@ private fun AiAnalysisScreen(onBack: () -> Unit) {
                     color = Color(0xFF1A1A1A)
                 )
                 Spacer(Modifier.width(10.dp))
-                Text("통계 불러오는 중...", fontSize = 13.sp, color = Color(0xFF888888))
+                Text("AI가 분석 중이에요...", fontSize = 13.sp, color = Color(0xFF888888))
             }
-            error != null -> Text(error!!, fontSize = 13.sp, color = Color(0xFFC62828))
-            prompt != null -> AiPromptBody(prompt = prompt!!)
+            error != null -> Column {
+                Text(error!!, fontSize = 13.sp, color = Color(0xFFC62828), lineHeight = 18.sp)
+                Spacer(Modifier.height(12.dp))
+                Button(
+                    onClick = { reloadKey++ },
+                    shape = RoundedCornerShape(10.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1A1A1A))
+                ) {
+                    Text("다시 시도", color = Color.White, fontWeight = FontWeight.SemiBold)
+                }
+            }
+            analysis != null -> AiAnalysisBody(analysis = analysis!!)
         }
     }
 }
 
-// 복사/AI 앱 버튼들 — 프롬프트 원문은 사용자에게 노출하지 않고 클립보드로만 전달
+// AI 분석 결과 본문 — 서버에서 받은 분석 텍스트만 표시(프롬프트 원문은 노출하지 않음).
 @Composable
-private fun AiPromptBody(prompt: String) {
-    val context = LocalContext.current
-
-    // 준비 완료 안내 (프롬프트 내용은 보여주지 않음)
+private fun AiAnalysisBody(analysis: String) {
     Surface(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(10.dp),
-        color = Color(0xFFF1F8F4)
+        color = Color(0xFFF7F7F7)
     ) {
-        Row(
-            modifier = Modifier.padding(14.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Text("✅", fontSize = 18.sp)
-            Spacer(Modifier.width(10.dp))
+        SelectionContainer {
             Text(
-                "통계 분석 준비가 끝났어요. 아래 버튼으로 프롬프트를 복사하거나 AI 앱에서 바로 분석받으세요.",
-                fontSize = 13.sp,
-                color = Color(0xFF2E7D52),
-                lineHeight = 18.sp
+                analysis,
+                modifier = Modifier.padding(16.dp),
+                fontSize = 14.sp,
+                color = Color(0xFF1A1A1A),
+                lineHeight = 21.sp
             )
         }
     }
-    Spacer(Modifier.height(12.dp))
-
-    Button(
-        onClick = {
-            copyPromptToClipboard(context, prompt)
-            Toast.makeText(context, "프롬프트를 복사했어요", Toast.LENGTH_SHORT).show()
-        },
-        modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(10.dp),
-        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1A1A1A))
-    ) {
-        Text("📋 프롬프트 복사", color = Color.White, fontWeight = FontWeight.SemiBold)
-    }
-
-    Spacer(Modifier.height(20.dp))
-    HorizontalDivider(color = Color(0xFFEEEEEE))
-    Spacer(Modifier.height(16.dp))
-
-    Text("AI 앱에서 분석받기", fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = Color(0xFF1A1A1A))
-    Text(
-        "버튼을 누르면 프롬프트가 자동 복사되고 앱이 열려요. 입력창을 길게 눌러 붙여넣기 하세요. (앱이 없으면 웹으로 열립니다)",
-        fontSize = 12.sp,
-        color = Color(0xFF888888),
-        modifier = Modifier.padding(top = 4.dp, bottom = 12.dp),
-        lineHeight = 16.sp
-    )
-
-    AiAppButton(
-        label = "ChatGPT 열기",
-        bgColor = Color(0xFF10A37F),
-        onClick = {
-            copyPromptToClipboard(context, prompt)
-            openAiApp(context, "com.openai.chatgpt", "https://chatgpt.com")
-        }
-    )
-    Spacer(Modifier.height(10.dp))
-    AiAppButton(
-        label = "Gemini 열기",
-        bgColor = Color(0xFF4285F4),
-        onClick = {
-            copyPromptToClipboard(context, prompt)
-            openAiApp(context, "com.google.android.apps.bard", "https://gemini.google.com/app")
-        }
-    )
-    Spacer(Modifier.height(10.dp))
-    AiAppButton(
-        label = "Claude 열기",
-        bgColor = Color(0xFFD97757),
-        onClick = {
-            copyPromptToClipboard(context, prompt)
-            openAiApp(context, "com.anthropic.claude", "https://claude.ai/new")
-        }
-    )
     Spacer(Modifier.height(24.dp))
-}
-
-@Composable
-private fun AiAppButton(label: String, bgColor: Color, onClick: () -> Unit) {
-    Button(
-        onClick = onClick,
-        modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(10.dp),
-        colors = ButtonDefaults.buttonColors(containerColor = bgColor)
-    ) {
-        Text(label, color = Color.White, fontWeight = FontWeight.SemiBold, fontSize = 15.sp)
-    }
 }
 
 // 여러 날짜의 일간 통계를 동시에(최대 8개) 가져옴 — AI 프롬프트용. 실패한 날짜는 결과에서 빠짐.
@@ -939,29 +888,6 @@ private fun buildStatsPrompt(
         appendLine("1. 제 사용 패턴을 분석해 주세요 — 주로 어느 시간대/요일에 많이 보는지, 한도를 얼마나 자주 넘는지, 최근 추세(늘었는지 줄었는지).")
         appendLine("2. 쇼츠 사용을 줄이기 위한 구체적이고 실천 가능한 팁 3~5가지와, 다음 주에 도전할 만한 현실적인 목표 한도를 제안해 주세요.")
         append("친근하고 격려하는 말투로, 한국어로 답해 주세요.")
-    }
-}
-
-// 프롬프트를 시스템 클립보드에 복사
-private fun copyPromptToClipboard(context: Context, text: String) {
-    val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
-    cm.setPrimaryClip(android.content.ClipData.newPlainText("ShortCut 통계 프롬프트", text))
-}
-
-// 설치돼 있으면 해당 AI 앱을, 없으면 웹(브라우저)으로 폴백해서 연다.
-private fun openAiApp(context: Context, packageName: String, webUrl: String) {
-    val launch = context.packageManager.getLaunchIntentForPackage(packageName)
-    if (launch != null) {
-        launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        context.startActivity(launch)
-        return
-    }
-    try {
-        val web = Intent(Intent.ACTION_VIEW, android.net.Uri.parse(webUrl))
-            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        context.startActivity(web)
-    } catch (e: Exception) {
-        Toast.makeText(context, "앱이나 브라우저를 열 수 없습니다", Toast.LENGTH_SHORT).show()
     }
 }
 
@@ -1394,11 +1320,11 @@ private fun StatsDaily(monthOffset: Int, onMonthOffsetChange: (Int) -> Unit) {
         context.getSharedPreferences("short_cut_prefs", Context.MODE_PRIVATE).getString("userId", null)
     }
 
-    // 달력 히트맵용 로컬 일자별 카운트 + 로컬 폴백용 현재 daily limit
-    var rows by remember { mutableStateOf<List<DailyCount>>(emptyList()) }
+    // 달력 히트맵 일자별 카운트(yyyy-MM-dd → 스크롤 수) + 로컬 폴백용 현재 daily limit.
+    // 상세 그래프와 같은 서버 /daily 를 소스로 써서 같은 날 숫자가 어긋나지 않게 함(서버에 없는 날만 로컬 Room 폴백).
+    var dayCounts by remember { mutableStateOf<Map<String, Int>>(emptyMap()) }
     var currentDailyLimit by remember { mutableStateOf(0) }
     LaunchedEffect(userId) {
-        rows = db.scrollHistoryDao().countByDay()
         currentDailyLimit = userId?.let { db.userLimitDao().getLimit(it)?.dailyLimit } ?: 0
     }
 
@@ -1429,13 +1355,26 @@ private fun StatsDaily(monthOffset: Int, onMonthOffsetChange: (Int) -> Unit) {
         summaryLoading = false
     }
 
-    val countByDate = remember(monthOffset, rows) {
+    // 표시 중인 달의 일자별 스크롤 수를 서버 /daily 로 가져옴(상세 그래프와 동일 소스).
+    // 서버 응답이 있는 날은 서버값, 없는 날(오프라인 등)만 로컬 Room countByDay 로 폴백.
+    LaunchedEffect(monthOffset, userId) {
+        val fmt = SimpleDateFormat("yyyy-MM-dd", Locale.US)
+        val tmp = Calendar.getInstance().apply { timeInMillis = monthCal.timeInMillis }
+        val monthDays = (1..daysInMonth).map { day ->
+            tmp.set(Calendar.DAY_OF_MONTH, day); fmt.format(tmp.time)
+        }
+        val server = userId?.let { fetchDailyStatsForDays(it, monthDays) } ?: emptyMap()
+        val local = db.scrollHistoryDao().countByDay().associate { it.day to it.count }
+        dayCounts = monthDays.associateWith { d -> server[d]?.totalScroll ?: local[d] ?: 0 }
+    }
+
+    val countByDate = remember(monthOffset, dayCounts) {
         val fmt = SimpleDateFormat("yyyy-MM-dd", Locale.US)
         val tmp = Calendar.getInstance().apply { timeInMillis = monthCal.timeInMillis }
         (1..daysInMonth).associateWith { day ->
             tmp.set(Calendar.DAY_OF_MONTH, day)
             val key = fmt.format(tmp.time)
-            rows.firstOrNull { it.day == key }?.count ?: 0
+            dayCounts[key] ?: 0
         }
     }
     val maxCount = (countByDate.values.maxOrNull() ?: 0).coerceAtLeast(1)
@@ -2566,6 +2505,40 @@ private suspend fun fetchMonthlyStats(userId: String, month: String): MonthStats
         peakDate = peak?.optString("date")?.takeIf { it.isNotEmpty() },
         peakCount = peak?.optInt("scrollCount")
     )
+}
+
+// POST /analyze — 통계 프롬프트를 서버로 보내 AI 분석 결과(텍스트)만 돌려받음.
+// 프롬프트는 서버→AI 로만 전달되고 사용자에겐 결과만 노출됨. AI API 키는 서버가 보관.
+// 서버 응답 형식: { "analysis": "..." }
+private suspend fun fetchAiAnalysis(userId: String, prompt: String): String? = withContext(Dispatchers.IO) {
+    try {
+        val token = FirebaseAuth.getInstance().currentUser?.getIdToken(false)?.await()?.token
+            ?: return@withContext null
+        // JSONObject 로 직렬화해 프롬프트의 줄바꿈/따옴표가 안전하게 이스케이프되도록 함
+        val payload = org.json.JSONObject()
+            .put("userId", userId)
+            .put("prompt", prompt)
+            .toString()
+        val req = Request.Builder()
+            .url("$SERVER_BASE_URL/analyze")
+            .addHeader("Authorization", "Bearer $token")
+            .post(payload.toRequestBody("application/json".toMediaType()))
+            .build()
+        val resp = OkHttpClient().newCall(req).execute()
+        val body = resp.body?.string()
+        val ok = resp.isSuccessful
+        val code = resp.code
+        resp.close()
+        if (ok && body != null) {
+            org.json.JSONObject(body).optString("analysis").takeIf { it.isNotBlank() }
+        } else {
+            Log.w("StatsApi", "POST /analyze → $code")
+            null
+        }
+    } catch (e: Exception) {
+        Log.e("StatsApi", "POST /analyze 실패 — ${e.message}")
+        null
+    }
 }
 
 // DELETE /users/:userId — 본인 계정 탈퇴
