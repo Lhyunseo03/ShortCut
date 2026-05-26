@@ -10,7 +10,6 @@ import android.view.LayoutInflater
 import android.view.View
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
-import android.view.accessibility.AccessibilityNodeInfo
 import android.util.Log
 import android.widget.Button
 import android.widget.LinearLayout
@@ -34,10 +33,6 @@ class ShortCutAccessibilityService : AccessibilityService() {
 
     companion object {
         const val TAG = "ShortCut"
-        const val TARGET_PACKAGE = "com.google.android.youtube"
-        const val SHORTS_NODE_ID = "com.google.android.youtube:id/reel_player_page_container"
-        const val DEBOUNCE_MS = 500L
-        const val NOISE_MS = 1500L
 
         // 그만보기(Stop) 선택 후 쇼츠 진입 차단 시간 — 5분
         const val STOP_BLOCK_MS = 5 * 60 * 1000L
@@ -92,12 +87,20 @@ class ShortCutAccessibilityService : AccessibilityService() {
     // 마지막으로 처리한 "오늘 0시" — 자정 롤오버 감지에 사용
     private var todayStartMs = 0L
 
-    // ── 스크롤 감지 상태 ──────────────────────────────────────
-    private var isInShortsMode = false
-    private var lastCountTime = 0L
-    private var shortsEnteredTime = 0L
-    private var lastNodeCount = 0
-    private var lastContentDesc = ""
+    // ── 앱별 쇼츠 검출기 ──────────────────────────────────────
+    // 각 detector 가 자기 앱의 진입/이탈/스크롤 상태를 따로 관리. 메인 서비스는 outcome 만 받아 처리.
+    private val detectors = listOf(
+        com.example.short_cut.services.detectors.YoutubeDetector(),
+        com.example.short_cut.services.detectors.InstagramDetector(),
+        com.example.short_cut.services.detectors.TiktokDetector(
+            com.example.short_cut.services.detectors.TiktokDetector.PACKAGE_GLOBAL
+        ),
+        com.example.short_cut.services.detectors.TiktokDetector(
+            com.example.short_cut.services.detectors.TiktokDetector.PACKAGE_TRILL
+        )
+    )
+
+    // ── popup 상태 ────────────────────────────────────────────
     private var isPopupShowing = false
     private var windowManager: WindowManager? = null
     // popup view 들 — variant 4(stacked) 를 위해 list 로 관리. 단일 popup variant 에서도 list 에 1개로 저장.
@@ -262,168 +265,79 @@ class ShortCutAccessibilityService : AccessibilityService() {
         savePersistedState()
     }
 
-    private fun getShortsNodeCount(): Int {
-        val root = rootInActiveWindow ?: return 0
-        val nodes = root.findAccessibilityNodeInfosByViewId(SHORTS_NODE_ID)
-        val count = nodes?.size ?: 0
-        root.recycle()
-        return count
-    }
-
-    // 활성 window 가 아니어도 (댓글 시트, 필터 드롭다운 등 오버레이 뒤에) 쇼츠 컨테이너가 어떤 window 에든
-    // 살아있는지 확인. 쇼츠 모드 이탈 판정에 사용 — 오버레이 뜨자마자 모드 OFF 되는 것 방지.
-    private fun isShortsVisibleInAnyWindow(): Boolean {
-        val ws = try { windows } catch (_: Exception) { null }
-        if (ws.isNullOrEmpty()) return getShortsNodeCount() > 0  // API 폴백
-        for (w in ws) {
-            val root = w.root ?: continue
-            try {
-                val nodes = root.findAccessibilityNodeInfosByViewId(SHORTS_NODE_ID)
-                if ((nodes?.size ?: 0) > 0) return true
-            } finally {
-                root.recycle()
-            }
-        }
-        return false
-    }
-
-    private fun getShortsFingerprint(): String {
-        val root = rootInActiveWindow ?: return ""
-        val descs = mutableListOf<String>()
-        collectContentDescs(root, descs)
-        root.recycle()
-        return descs.take(5).joinToString("|")
-    }
-
-    private fun collectContentDescs(node: AccessibilityNodeInfo, descs: MutableList<String>) {
-        val desc = node.contentDescription?.toString()
-        if (!desc.isNullOrEmpty() && desc.length > 5) {
-            descs.add(desc)
-        }
-        for (i in 0 until node.childCount) {
-            val child = node.getChild(i) ?: continue
-            collectContentDescs(child, descs)
-            if (descs.size >= 5) return
-        }
-    }
-
     override fun onAccessibilityEvent(event: AccessibilityEvent) {
         val now = System.currentTimeMillis()
         val pkg = event.packageName?.toString()
 
-        // YT 외 다른 앱으로 전환되면 popup 만 숨김 — pending 은 유지
-        //
-        // 단, 다음 패키지의 이벤트는 무시해야 함:
-        //   - 우리 앱 자신 (popup overlay 를 띄울 때 TYPE_ACCESSIBILITY_OVERLAY 가 발생시키는 이벤트)
-        //   - "android" (시스템 이벤트)
-        //   - null (패키지 미식별 이벤트)
-        //   - SystemUI (잠금화면/알림창) — 전원 껐다 켜서 잠금화면이 떴다가 풀려도 popup 이 그대로
-        //     남아 있게(=화면 안 바뀌게) 하려면 이 이벤트로 dismiss 하면 안 됨
-        // 이걸 무시하지 않으면 popup 띄우자마자 자기 자신이 다른 앱으로 인식되어 즉시 dismiss 됨
+        // 자기 자신/시스템 이벤트는 무시 — popup 이 띄워지면서 발생하는 이벤트(TYPE_ACCESSIBILITY_OVERLAY 등),
+        // "android" 시스템 이벤트, SystemUI (잠금화면/알림창) 는 우리 상태 변화로 잘못 해석하지 않기 위해 제외.
         val ownPackage = packageName
         val isTransientEvent = pkg == null || pkg == ownPackage || pkg == "android" ||
                 pkg == "com.android.systemui"
 
-        if (!isTransientEvent && pkg != TARGET_PACKAGE) {
+        // 매칭되는 detector 찾기
+        val detector = if (pkg != null) detectors.firstOrNull { it.packageName == pkg } else null
+
+        if (detector == null) {
+            // self/system 이벤트는 조용히 무시
+            if (isTransientEvent) return
+            // 지원 안 하는 다른 앱으로 전환된 경우 — popup 만 숨기고 모든 detector 의 모드 리셋
             if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
                 if (popupViews.isNotEmpty()) {
                     Log.d(TAG, "다른 앱($pkg) 전환 → popup 숨김 (pending 유지)")
                     dismissAllPopups()
                 }
-                if (isInShortsMode) {
-                    isInShortsMode = false
-                    lastNodeCount = 0
+                detectors.forEach { if (it.inShortsMode) it.onPackageLeft() }
+            }
+            return
+        }
+
+        // detector 에 위임
+        val outcome = detector.onEvent(this, event)
+
+        // 5분 차단 기간 중 — 쇼츠 모드라면 계속 BACK 으로 밀어냄.
+        // (HOME 보내면 앱 강종 후 쇼츠로 재진입할 때마다 폰 홈으로 튕겨서 앱 자체를 못 쓰게 됨 → BACK 으로 앱 안 다른 화면으로 보냄)
+        if (detector.inShortsMode && now < stopUntilMs) {
+            if (outcome.entered) {
+                val remaining = ((stopUntilMs - now) / 1000).toInt() + 1
+                Log.d(TAG, "차단 기간 중 쇼츠 진입 시도 (${detector.packageName}) — 남은 ${remaining}초")
+                showBlockPopup(remaining)
+            }
+            // WINDOW_STATE/CONTENT/SCROLLED 변화 때만 BACK — 다른 작은 이벤트로 매번 호출되는 것 방지
+            when (event.eventType) {
+                AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED,
+                AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED,
+                AccessibilityEvent.TYPE_VIEW_SCROLLED -> {
+                    performGlobalAction(GLOBAL_ACTION_BACK)
                 }
             }
             return
         }
 
-        // 자기 자신/시스템 이벤트는 무시 — popup 이 띄워지면서 발생하는 이벤트를 우리 자신의 상태 변화로 잘못 해석하지 않기 위함
-        if (pkg != TARGET_PACKAGE) return
-
-        when (event.eventType) {
-
-            AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED -> {
-                val nodeCount = getShortsNodeCount()
-                if (nodeCount >= 1 && !isInShortsMode) {
-                    isInShortsMode = true
-                    shortsEnteredTime = now
-                    lastCountTime = now
-                    lastNodeCount = nodeCount
-                    lastContentDesc = getShortsFingerprint()
-                    Log.d(TAG, "쇼츠 진입 노드=$nodeCount")
-
-                    // 1) 5분 차단 중이면 차단 popup + BACK 으로 쇼츠만 빠져나가게 함
-                    // (HOME 으로 보내면 YT 가 강종 후 쇼츠로 바로 재진입할 때마다 폰 홈으로 튕겨서
-                    //  YT 자체를 못 쓰게 됨 → BACK 으로 YT 안에서 다른 탭으로만 보냄)
-                    if (now < stopUntilMs) {
-                        val remaining = ((stopUntilMs - now) / 1000).toInt() + 1
-                        Log.d(TAG, "차단 기간 중 쇼츠 진입 시도 — 남은 ${remaining}초")
-                        showBlockPopup(remaining)
-                        performGlobalAction(GLOBAL_ACTION_BACK)
-                        return
-                    }
-
-                    // 2) 미응답 popup 이 있으면 재표시 (YT 강제종료 후 재진입 시나리오)
-                    pendingPopupType?.let { type ->
-                        Log.d(TAG, "미응답 popup 재표시 — type=$type, overage=$pendingPopupOverage")
-                        showLimitPopup(type, pendingPopupOverage)
-                    }
-                } else if (nodeCount == 0 && isInShortsMode) {
-                    // 활성 window 에 쇼츠 노드가 없어도, 다른 window (댓글 시트, 필터 드롭다운 등)
-                    // 뒤에 쇼츠 컨테이너가 여전히 살아있으면 모드 유지. 진짜 이탈했을 때만 OFF.
-                    if (isShortsVisibleInAnyWindow()) {
-                        Log.d(TAG, "오버레이 감지 — 쇼츠모드 유지 (active=$nodeCount)")
-                    } else {
-                        isInShortsMode = false
-                        lastNodeCount = 0
-                        // 차단 안내 popup 은 BACK 으로 쇼츠를 막 빠져나온 직후라 여기서 닫지 않고 6초 타이머에 맡김
-                        if (popupViews.isNotEmpty() && !blockPopupShowing) {
-                            Log.d(TAG, "쇼츠 이탈 → popup 숨김 (pending 유지)")
-                            dismissAllPopups()
-                        }
-                        Log.d(TAG, "쇼츠모드 OFF")
-                    }
-                }
+        if (outcome.entered) {
+            // 미응답 popup 이 있으면 재표시 (앱 강제종료 후 재진입 시나리오)
+            pendingPopupType?.let { type ->
+                Log.d(TAG, "미응답 popup 재표시 — type=$type, overage=$pendingPopupOverage")
+                showLimitPopup(type, pendingPopupOverage)
             }
+        }
 
-            AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED -> {
-                if (!isInShortsMode) return
-
-                // 차단 기간 중이면 어떤 스크롤도 무시 + 쇼츠에서 BACK 으로 빠져나감
-                if (now < stopUntilMs) {
-                    performGlobalAction(GLOBAL_ACTION_BACK)
-                    return
-                }
-
-                val nodeCount = getShortsNodeCount()
-
-                if (lastNodeCount == 2 && nodeCount == 1) {
-                    val currentDesc = getShortsFingerprint()
-
-                    if (currentDesc != lastContentDesc && currentDesc.isNotEmpty()) {
-                        lastContentDesc = currentDesc
-                        Log.d(TAG, "영상 변경 확인")
-                        countShorts(now)
-                    } else {
-                        Log.d(TAG, "스크롤 취소 (같은 영상)")
-                    }
-                }
-
-                lastNodeCount = nodeCount
+        if (outcome.exited) {
+            // 쇼츠 이탈 — popup 숨김 (pending 유지). 차단 안내 popup 은 자체 6초 타이머에 맡김.
+            if (popupViews.isNotEmpty() && !blockPopupShowing) {
+                Log.d(TAG, "쇼츠 이탈 → popup 숨김 (pending 유지)")
+                dismissAllPopups()
             }
+        }
+
+        if (outcome.scrolled) {
+            countShorts(now, detector.packageName)
         }
     }
 
-    private fun countShorts(now: Long) {
-        if (now - shortsEnteredTime < NOISE_MS) {
-            Log.d(TAG, "진입 노이즈 무시")
-            return
-        }
-        if (now - lastCountTime < DEBOUNCE_MS) return
-
-        lastCountTime = now
-
+    // 스크롤 한 건 처리 — debounce/noise 검사는 각 detector 가 이미 수행함.
+    // appPkg: 어느 앱(YT/IG/TT)에서 발생한 스크롤인지 — DB 저장용.
+    private fun countShorts(now: Long, appPkg: String) {
         serviceScope.launch {
             val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
             val userId = prefs.getString("userId", "unknown") ?: "unknown"
@@ -432,7 +346,7 @@ class ShortCutAccessibilityService : AccessibilityService() {
             handleDayRolloverIfNeeded(now, userId)
 
             // 스크롤 이벤트를 Room DB 에 저장
-            scrollHistoryDao.insert(ScrollHistory(appPkg = TARGET_PACKAGE, timestamp = now))
+            scrollHistoryDao.insert(ScrollHistory(appPkg = appPkg, timestamp = now))
 
             dailyCount++
 
@@ -467,9 +381,15 @@ class ShortCutAccessibilityService : AccessibilityService() {
                 savePersistedState()
             }
 
-            // hourly 체크 — milestone 단위로 트리거
+            // hourly 체크 — milestone 단위로 트리거.
+            // milestone=-1 (서비스 재시작/슬라이딩 윈도우로 reset 직후) 인데 카운트가 이미 limit+N*STEP 이상이면,
+            // 가장 가까운 STEP 배수로 첫 트리거를 맞춤. (아니면 limit→limit+STEP→... 까지 매 스크롤마다 popup 폭주)
             if (hourlyCount >= hourlyLimit) {
-                val nextTrigger = if (hourlyMilestone < 0) hourlyLimit else hourlyMilestone + HOURLY_STEP
+                val nextTrigger = if (hourlyMilestone < 0) {
+                    hourlyLimit + ((hourlyCount - hourlyLimit) / HOURLY_STEP) * HOURLY_STEP
+                } else {
+                    hourlyMilestone + HOURLY_STEP
+                }
                 if (hourlyCount >= nextTrigger) {
                     hourlyMilestone = nextTrigger
                     val overage = nextTrigger - hourlyLimit
@@ -479,9 +399,13 @@ class ShortCutAccessibilityService : AccessibilityService() {
                 }
             }
 
-            // daily 체크 — milestone 단위로 트리거
+            // daily 체크 — milestone 단위로 트리거. (hourly 와 동일한 따라잡기 처리)
             if (dailyCount >= dailyLimit) {
-                val nextTrigger = if (dailyMilestone < 0) dailyLimit else dailyMilestone + DAILY_STEP
+                val nextTrigger = if (dailyMilestone < 0) {
+                    dailyLimit + ((dailyCount - dailyLimit) / DAILY_STEP) * DAILY_STEP
+                } else {
+                    dailyMilestone + DAILY_STEP
+                }
                 if (dailyCount >= nextTrigger) {
                     dailyMilestone = nextTrigger
                     val overage = nextTrigger - dailyLimit
