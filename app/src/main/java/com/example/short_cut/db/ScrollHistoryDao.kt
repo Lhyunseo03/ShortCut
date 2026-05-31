@@ -72,6 +72,24 @@ interface ScrollHistoryDao {
         ORDER BY day ASC
     """)
     suspend fun countByDayForRange(startMs: Long, endMs: Long): List<DailyCount>
+
+    // 특정 기간 내 N번째 스크롤의 timestamp(ms). offset=N-1 이 N번째.
+    // 한도 초과 시각 추적용 — 예: dailyLimit=100 이면 offset=100 으로 호출 → 101번째 스크롤 시각 = 한도 처음 넘긴 순간.
+    @Query("""
+        SELECT timestamp FROM scroll_history
+        WHERE timestamp >= :startMs AND timestamp < :endMs
+        ORDER BY timestamp ASC
+        LIMIT 1 OFFSET :offset
+    """)
+    suspend fun nthScrollTimestamp(startMs: Long, endMs: Long, offset: Int): Long?
+
+    // 특정 기간 안의 모든 스크롤 timestamp 시간순 — hourly 슬라이딩 윈도우 위반 시각 계산용.
+    @Query("""
+        SELECT timestamp FROM scroll_history
+        WHERE timestamp >= :startMs AND timestamp < :endMs
+        ORDER BY timestamp ASC
+    """)
+    suspend fun timestampsInRange(startMs: Long, endMs: Long): List<Long>
 }
 
 // 일자별 스크롤 횟수 — countByDay() 반환 타입

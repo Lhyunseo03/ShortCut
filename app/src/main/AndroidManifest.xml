@@ -6,6 +6,12 @@
     SYSTEM_ALERT_WINDOW 바로 아래에 한 줄 추가하면 돼요.-->
     <uses-permission android:name="android.permission.INTERNET" />
 
+    <!-- 접근성 권한 OFF 우회 차단용 GuardForegroundService — UsageStatsManager 로 포그라운드 앱 폴링 -->
+    <uses-permission android:name="android.permission.PACKAGE_USAGE_STATS" tools:ignore="ProtectedPermissions" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
     <!-- AI 앱 바로 연결 기능 — Android 11+(targetSdk 30↑) 패키지 가시성 제한 때문에
          실행/설치여부를 확인할 AI 앱들을 명시해야 getLaunchIntentForPackage 가 동작함.
          마지막 VIEW intent 는 앱 미설치 시 웹(브라우저)으로 폴백하기 위한 가시성. -->
@@ -51,6 +57,16 @@
             <meta-data
                 android:name="android.accessibilityservice"
                 android:resource="@xml/accessibility_service_config" />
+        </service>
+
+        <!-- 접근성 OFF 시 타겟앱 진입을 막는 보조 가드 — UsageStatsManager 폴링 -->
+        <service
+            android:name=".services.GuardForegroundService"
+            android:foregroundServiceType="specialUse"
+            android:exported="false">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Block shorts/reels apps when accessibility permission is disabled" />
         </service>
 
     </application>
