@@ -51,6 +51,27 @@ interface ScrollHistoryDao {
         ORDER BY hour ASC
     """)
     suspend fun countByHourForDay(startOfDay: Long, endOfDay: Long): List<HourlyCount>
+
+    // 도넛 그래프용 — 특정 기간의 앱(패키지)별 스크롤 횟수.
+    // 일간이면 그 날, 월간이면 그 달을 [startMs, endMs) 로 넘김.
+    @Query("""
+        SELECT appPkg, COUNT(*) AS count
+        FROM scroll_history
+        WHERE timestamp >= :startMs AND timestamp < :endMs
+        GROUP BY appPkg
+    """)
+    suspend fun countByAppForRange(startMs: Long, endMs: Long): List<AppCount>
+
+    // 월간 분석 화면용 — 특정 기간의 일별 스크롤 횟수.
+    // countByDay() 는 전체를 반환하지만 이건 범위로 제한
+    @Query("""
+        SELECT date(timestamp / 1000, 'unixepoch', 'localtime') AS day, COUNT(*) AS count
+        FROM scroll_history
+        WHERE timestamp >= :startMs AND timestamp < :endMs
+        GROUP BY day
+        ORDER BY day ASC
+    """)
+    suspend fun countByDayForRange(startMs: Long, endMs: Long): List<DailyCount>
 }
 
 // 일자별 스크롤 횟수 — countByDay() 반환 타입
@@ -64,5 +85,11 @@ data class DailyCount(
 // hour: 0~23 (로컬 타임존 기준)
 data class HourlyCount(
     val hour: Int,
+    val count: Int
+)
+
+// 앱(패키지)별 스크롤 횟수 — countByAppForRange() 반환 타입. 도넛 그래프용.
+data class AppCount(
+    val appPkg: String,
     val count: Int
 )

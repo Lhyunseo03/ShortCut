@@ -113,8 +113,13 @@ class ShortCutAccessibilityService : AccessibilityService() {
 
     // ── 배치 전송 ─────────────────────────────────────────────
     // 현재 쌓이는 중인 배치. batchFirstScrollMs = 이 배치의 첫 스크롤 시각(전송 timestamp 로 사용).
+    // batchAppPkg = 이 배치가 어느 앱에서 발생한 스크롤인지 — 다른 앱 스크롤이 끼면 먼저 flush 후 새 배치 시작
+    // (서버에 플랫폼별로 분리 집계되도록).
     private var batchScrollCount = 0
     private var batchFirstScrollMs = 0L
+    private var batchAppPkg: String = ""
+    // 마지막으로 감지된 스크롤의 앱 패키지 — violation 전송 시 어느 플랫폼에서 발생했는지 식별용
+    @Volatile private var lastScrollPkg: String = ""
     private val BATCH_SIZE = 10
     private val batchHandler = Handler(Looper.getMainLooper())
     private val batchTimerRunnable = Runnable {
@@ -338,6 +343,7 @@ class ShortCutAccessibilityService : AccessibilityService() {
     // 스크롤 한 건 처리 — debounce/noise 검사는 각 detector 가 이미 수행함.
     // appPkg: 어느 앱(YT/IG/TT)에서 발생한 스크롤인지 — DB 저장용.
     private fun countShorts(now: Long, appPkg: String) {
+        lastScrollPkg = appPkg
         serviceScope.launch {
             val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
             val userId = prefs.getString("userId", "unknown") ?: "unknown"
@@ -352,16 +358,18 @@ class ShortCutAccessibilityService : AccessibilityService() {
 
             // 배치 카운터 증가 — BATCH_SIZE(10개) 쌓이면 즉시 서버 전송.
             // 배치의 첫 스크롤 시각(now)을 timestamp 로 보냄 → 서버가 실제 스크롤 시각 기준으로 집계.
-            // 이번 스크롤이 배치 첫 스크롤과 다른 시(hour)면 먼저 flush → 한 배치가 두 시간대에 안 걸치게
-            // 함(시간대별 그래프 정확도용). 자정 경계는 handleDayRolloverIfNeeded 가 이미 flush.
-            val crossesHour = synchronized(pendingLock) {
-                batchScrollCount > 0 && !sameHour(batchFirstScrollMs, now)
+            // 이번 스크롤이 배치 첫 스크롤과 다른 시(hour)/다른 앱이면 먼저 flush → 한 배치가 두 시간대/두 플랫폼에 안 걸치게.
+            val needFlush = synchronized(pendingLock) {
+                batchScrollCount > 0 && (!sameHour(batchFirstScrollMs, now) || batchAppPkg != appPkg)
             }
-            if (crossesHour) flushBatch()
+            if (needFlush) flushBatch()
 
             val reachedBatch: Boolean
             synchronized(pendingLock) {
-                if (batchScrollCount == 0) batchFirstScrollMs = now
+                if (batchScrollCount == 0) {
+                    batchFirstScrollMs = now
+                    batchAppPkg = appPkg
+                }
                 batchScrollCount++
                 reachedBatch = batchScrollCount >= BATCH_SIZE
             }
@@ -1076,7 +1084,8 @@ class ShortCutAccessibilityService : AccessibilityService() {
             "timestamp": ${System.currentTimeMillis()},
             "limitType": "$limitType",
             "scrollCount": $scrollCount,
-            "action": "$action"
+            "action": "$action",
+            "platform": "${platformOf(lastScrollPkg)}"
         }
     """.trimIndent()
 
@@ -1111,7 +1120,15 @@ class ShortCutAccessibilityService : AccessibilityService() {
     // id 는 중복 방지(idempotency)용 고유 키 — 재전송돼도 서버가 같은 id 를 dedup 하면 중복 집계 안 됨.
     // 아래 read/write/append 헬퍼는 모두 synchronized(pendingLock) 안에서만 호출해야 함.
 
-    private data class PendingLog(val id: String, val ts: Long, val count: Int)
+    private data class PendingLog(val id: String, val ts: Long, val count: Int, val appPkg: String)
+
+    // 패키지명 → 서버 전송용 정규화된 플랫폼 이름. 구버전 큐에는 appPkg 가 비어있을 수 있음("unknown").
+    private fun platformOf(pkg: String): String = when (pkg) {
+        "com.google.android.youtube" -> "youtube"
+        "com.instagram.android" -> "instagram"
+        "com.zhiliaoapp.musically", "com.ss.android.ugc.trill" -> "tiktok"
+        else -> "unknown"
+    }
 
     private fun readPendingLocked(): List<PendingLog> {
         val raw = getSharedPreferences(PREFS, MODE_PRIVATE).getString(PK_PENDING_USERLOGS, "[]") ?: "[]"
@@ -1119,10 +1136,11 @@ class ShortCutAccessibilityService : AccessibilityService() {
             val arr = org.json.JSONArray(raw)
             (0 until arr.length()).mapNotNull { i ->
                 arr.optJSONObject(i)?.let { o ->
-                    // 구버전 큐(id 없음) 호환 — 없으면 새 id 부여
+                    // 구버전 큐(id/appPkg 없음) 호환 — 없으면 새 id 부여, appPkg 는 빈 문자열로
                     val id = o.optString("id").takeIf { it.isNotEmpty() }
                         ?: java.util.UUID.randomUUID().toString()
-                    PendingLog(id, o.optLong("ts"), o.optInt("count"))
+                    val appPkg = o.optString("appPkg", "")
+                    PendingLog(id, o.optLong("ts"), o.optInt("count"), appPkg)
                 }
             }
         } catch (_: Exception) {
@@ -1133,14 +1151,15 @@ class ShortCutAccessibilityService : AccessibilityService() {
     private fun writePendingLocked(list: List<PendingLog>) {
         val arr = org.json.JSONArray()
         list.forEach { p ->
-            arr.put(org.json.JSONObject().put("id", p.id).put("ts", p.ts).put("count", p.count))
+            arr.put(org.json.JSONObject()
+                .put("id", p.id).put("ts", p.ts).put("count", p.count).put("appPkg", p.appPkg))
         }
         getSharedPreferences(PREFS, MODE_PRIVATE).edit()
             .putString(PK_PENDING_USERLOGS, arr.toString()).apply()
     }
 
-    private fun appendPendingLocked(ts: Long, count: Int) {
-        val entry = PendingLog(java.util.UUID.randomUUID().toString(), ts, count)
+    private fun appendPendingLocked(ts: Long, count: Int, appPkg: String) {
+        val entry = PendingLog(java.util.UUID.randomUUID().toString(), ts, count, appPkg)
         writePendingLocked(readPendingLocked() + entry)
     }
 
@@ -1153,7 +1172,8 @@ class ShortCutAccessibilityService : AccessibilityService() {
                 "userId": "$userId",
                 "logId": "${log.id}",
                 "timestamp": ${log.ts},
-                "scrollCount": ${log.count}
+                "scrollCount": ${log.count},
+                "platform": "${platformOf(log.appPkg)}"
             }
         """.trimIndent()
             val client = okhttp3.OkHttpClient()
@@ -1225,9 +1245,10 @@ class ShortCutAccessibilityService : AccessibilityService() {
     private fun flushBatch() {
         synchronized(pendingLock) {
             if (batchScrollCount > 0) {
-                appendPendingLocked(batchFirstScrollMs, batchScrollCount)
+                appendPendingLocked(batchFirstScrollMs, batchScrollCount, batchAppPkg)
                 batchScrollCount = 0
                 batchFirstScrollMs = 0L
+                batchAppPkg = ""
             }
         }
         serviceScope.launch { sendPendingUserLogs() }

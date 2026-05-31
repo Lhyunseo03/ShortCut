@@ -85,4 +85,81 @@ POST /userlogs
 
 ---
 
-작성: 박정은 (앱) · 날짜: 2026-05-24
+## 4. `/userlogs`, `/violations` 에 `platform` 필드 추가 — **저장 부탁**
+
+앱이 어느 쇼츠 플랫폼(YouTube/Instagram/TikTok)에서 발생한 스크롤인지 같이 보냅니다.
+기존 필드는 그대로, **`platform` 한 줄만 추가**되었습니다.
+
+```
+POST /userlogs
+{
+  "userId": "...",
+  "logId": "...",
+  "timestamp": <ms>,
+  "scrollCount": <int>,
+  "platform": "youtube" | "instagram" | "tiktok" | "unknown"   // ← 추가
+}
+
+POST /violations
+{
+  "userId": "...",
+  "timestamp": <ms>,
+  "limitType": "...",
+  "scrollCount": <int>,
+  "action": "stop" | "ignore",
+  "platform": "youtube" | "instagram" | "tiktok" | "unknown"   // ← 추가
+}
+```
+
+- 같은 배치(=같은 `logId`)는 한 가지 platform만 들어옵니다. 앱이 다른 플랫폼 스크롤이 들어오면 먼저 flush 한 뒤 새 배치를 시작합니다.
+- 구버전 큐가 남아있어 잠시 `"unknown"` 이 섞일 수 있습니다(허용).
+- 부탁: 로그 문서에 `platform` 컬럼 추가 + 향후 통계 응답에 플랫폼별 합계 노출(예: `/stats/.../daily` 응답에 `byPlatform: {youtube, instagram, tiktok}` 포함). 도넛 그래프용입니다.
+
+---
+
+## 5. `/stats/.../daily`·`/monthly` 응답 필드 확장 — **추가 필드 부탁**
+
+새 통계 UI(일간 진행률/시간별 달성/도넛/월간 인라인 펼침)를 위해 응답에 필드를 더 얹어 주세요.
+**기존 필드는 그대로 두고 새 필드만 추가** — 앱은 누락된 필드는 nullable로 처리합니다.
+
+### `/stats/:userId/daily?date=YYYY-MM-DD`
+```json
+{
+  "totalScroll": 248,
+  "dailyLimit": 300,
+  "hourlyLimit": 50,                  // ← 추가: 그 날의 시간별 한도
+  "stopCount": 5,
+  "ignoreCount": 12,
+  "hourlyGraph": [ { "hour": 0, "scrollCount": 0 }, ... ],
+  "byPlatform": {                     // ← 추가: 도넛 그래프용
+    "youtube": 180,
+    "instagram": 50,
+    "tiktok": 18
+  },
+  "violations": [                     // ← 추가: 위반 기록(시간 포함). 비어도 됨
+    { "timestamp": 1716985200000, "limitType": "hourly", "action": "stop", "hour": 21 }
+  ]
+}
+```
+
+### `/stats/:userId/monthly?date=YYYY-MM`
+```json
+{
+  "totalScroll": 5200,
+  "avgScrollPerDay": 173,
+  "peakDay": { "date": "2026-05-12", "scrollCount": 412 },
+  "stopCount": 38,                    // ← 추가: 그 달 누적 '그만보기' 횟수
+  "ignoreCount": 91,                  // ← 추가: 그 달 누적 '무시' 횟수
+  "byPlatform": {                     // ← 추가
+    "youtube": 3200, "instagram": 1500, "tiktok": 500
+  }
+}
+```
+
+- `byPlatform` 키는 `"youtube" | "instagram" | "tiktok"` (소문자 고정, #4의 platform 값과 동일).
+- 필드 없으면 앱이 로컬 DB로 폴백/0 처리. 도넛은 byPlatform이 있으면 우선 사용.
+- `violations` 가 없어도 앱은 `hourlyGraph` + `hourlyLimit` 로 초과 시간을 자체 계산.
+
+---
+
+작성: 박정은 (앱) · 날짜: 2026-05-24 (platform/응답 확장: 2026-05-31)

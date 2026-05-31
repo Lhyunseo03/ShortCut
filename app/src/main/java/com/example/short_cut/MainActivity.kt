@@ -22,7 +22,9 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Add
@@ -41,6 +43,7 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.PathEffect
+import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.platform.LocalContext
@@ -52,6 +55,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
+import com.example.short_cut.db.AppCount
 import com.example.short_cut.db.AppDatabase
 import com.example.short_cut.db.HourlyCount
 import com.example.short_cut.db.UserLimit
@@ -502,6 +506,8 @@ private fun SectionTitle(text: String) {
     )
 }
 
+// 한도값 입력 — +/− 버튼 대신 숫자 키보드로 직접 입력. minValue 미만이면 minValue 로 보정.
+// step 은 placeholder 힌트로만 쓰임 (자유 입력이라 강제 안 함).
 @Composable
 private fun LimitRow(
     label: String,
@@ -510,8 +516,10 @@ private fun LimitRow(
     minValue: Int,
     onChange: (Int) -> Unit
 ) {
+    // 입력 도중 비어있는 상태("")를 허용해야 사용자가 전체 지우고 다시 칠 수 있음
+    var text by remember(value) { mutableStateOf(value.toString()) }
     Row(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.SpaceBetween
     ) {
@@ -521,27 +529,27 @@ private fun LimitRow(
             fontWeight = FontWeight.SemiBold,
             color = Color(0xFF1A1A1A)
         )
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(4.dp)
-        ) {
-            IconButton(onClick = {
-                val newVal = (value - step).coerceAtLeast(minValue)
-                if (newVal != value) onChange(newVal)
-            }) {
-                Icon(Icons.Filled.Remove, contentDescription = "감소")
-            }
-            Text(
-                text = value.toString(),
-                fontSize = 18.sp,
-                fontWeight = FontWeight.Bold,
-                color = Color(0xFF1A1A1A),
-                textAlign = TextAlign.Center,
-                modifier = Modifier.widthIn(min = 56.dp)
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            OutlinedTextField(
+                value = text,
+                onValueChange = { input ->
+                    val filtered = input.filter { it.isDigit() }.take(6)
+                    text = filtered
+                    val parsed = filtered.toIntOrNull()
+                    if (parsed != null) onChange(parsed.coerceAtLeast(minValue))
+                },
+                modifier = Modifier.widthIn(min = 110.dp, max = 150.dp),
+                singleLine = true,
+                placeholder = { Text("${step} 단위", fontSize = 12.sp, color = Color(0xFFAAAAAA)) },
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                shape = RoundedCornerShape(8.dp)
             )
-            IconButton(onClick = { onChange(value + step) }) {
-                Icon(Icons.Filled.Add, contentDescription = "증가")
-            }
+            Text(
+                "회",
+                fontSize = 14.sp,
+                color = Color(0xFF555555),
+                modifier = Modifier.padding(start = 6.dp)
+            )
         }
     }
 }
@@ -573,19 +581,48 @@ private enum class StatsSubTab(val label: String) {
     DAILY("일간"), WEEKLY("주간"), MONTHLY("월간")
 }
 
+// 통계 화면 인메모리 캐시 — 탭 전환 시 stale 즉시 표시용. 앱 인스턴스 수명 동안만 유지.
+// 일반 통계는 60초 TTL(짧게 둬서 최신성 확보), AI 분석 결과는 비싸므로 영구 보관(사용자가 "다시 시도"로만 갱신).
+private object StatsCache {
+    private const val TTL_MS = 60_000L
+
+    // userId 별 AI 분석 — 다른 사용자로 바꾸면 무효
+    var aiAnalysis: Pair<String, String>? = null
+
+    private data class Entry(val value: Any?, val at: Long)
+    private val map = mutableMapOf<String, Entry>()
+
+    @Suppress("UNCHECKED_CAST")
+    fun <T> get(key: String): T? {
+        val e = map[key] ?: return null
+        if (System.currentTimeMillis() - e.at > TTL_MS) {
+            map.remove(key); return null
+        }
+        return e.value as T?
+    }
+
+    fun put(key: String, value: Any?) {
+        map[key] = Entry(value, System.currentTimeMillis())
+    }
+}
+
 @Composable
 private fun StatsTabContent() {
     var subTab by remember { mutableStateOf(StatsSubTab.DAILY) }
-    // 월간에서 달을 누르면 일간 탭으로 드릴다운 — 보여줄 달을 공유 상태로 들고 있음
+    // 일간 탭의 월 오프셋 (0=이번 달, -1=저번 달 ...). 달력 좌우 화살표로 조정.
     var dailyMonthOffset by remember { mutableStateOf(0) }
-    // AI 분석 화면 표시 여부 — 통계 위 진입 카드를 누르면 true
+    // AI 분석 화면 진입 여부 — 서브탭 옆 작은 "AI분석 →" 버튼으로 토글
     var showAiAnalysis by remember { mutableStateOf(false) }
 
-    // AI 분석 화면에선 시스템 뒤로가기를 가로채 통계로 복귀
     BackHandler(enabled = showAiAnalysis) { showAiAnalysis = false }
-
     if (showAiAnalysis) {
-        AiAnalysisScreen(onBack = { showAiAnalysis = false })
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(horizontal = 16.dp, vertical = 16.dp)
+        ) {
+            AiAnalysisContent(onBack = { showAiAnalysis = false })
+        }
         return
     }
 
@@ -594,15 +631,13 @@ private fun StatsTabContent() {
             .fillMaxSize()
             .padding(horizontal = 16.dp, vertical = 16.dp)
     ) {
-        // AI 분석 진입 카드 — 통계를 프롬프트로 만들어 AI 앱에서 분석받는 기능
-        AiAnalysisEntryCard(onClick = { showAiAnalysis = true })
-
-        // 서브탭 토글 row
+        // 서브탭 토글 row — 일간/주간/월간 + 오른쪽 끝에 작은 "AI분석 →" 텍스트 버튼
         Row(
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(bottom = 12.dp),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
         ) {
             StatsSubTab.values().forEach { tab ->
                 val selected = subTab == tab
@@ -625,6 +660,16 @@ private fun StatsTabContent() {
                     )
                 }
             }
+            // 작은 텍스트 버튼 — AI 분석 화면 진입
+            Text(
+                text = "AI분석 →",
+                modifier = Modifier
+                    .clickable { showAiAnalysis = true }
+                    .padding(horizontal = 8.dp, vertical = 10.dp),
+                fontSize = 13.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = Color(0xFF1A1A1A)
+            )
         }
 
         when (subTab) {
@@ -633,12 +678,7 @@ private fun StatsTabContent() {
                 onMonthOffsetChange = { dailyMonthOffset = it }
             )
             StatsSubTab.WEEKLY -> StatsWeekly()
-            StatsSubTab.MONTHLY -> StatsMonthly(
-                onMonthClick = { offset ->
-                    dailyMonthOffset = offset
-                    subTab = StatsSubTab.DAILY
-                }
-            )
+            StatsSubTab.MONTHLY -> StatsMonthly()
         }
     }
 }
@@ -648,58 +688,35 @@ private fun StatsTabContent() {
 // 프롬프트 원문은 서버→AI 로만 전달되어 사용자에게 노출되지 않음(API 키는 서버 보관).
 // ─────────────────────────────────────────────────────────────────────────
 
-// 통계 탭 상단의 진입 카드
-@Composable
-private fun AiAnalysisEntryCard(onClick: () -> Unit) {
-    Surface(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(bottom = 12.dp)
-            .clickable(onClick = onClick),
-        shape = RoundedCornerShape(12.dp),
-        color = Color(0xFF1A1A1A)
-    ) {
-        Row(
-            modifier = Modifier.padding(horizontal = 16.dp, vertical = 14.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Text("🤖", fontSize = 20.sp)
-            Spacer(Modifier.width(10.dp))
-            Column(modifier = Modifier.weight(1f)) {
-                Text(
-                    "AI로 내 통계 분석하기",
-                    color = Color.White,
-                    fontSize = 15.sp,
-                    fontWeight = FontWeight.SemiBold
-                )
-                Text(
-                    "사용 패턴 분석과 줄이기 조언을 앱에서 바로 받기",
-                    color = Color(0xFFBBBBBB),
-                    fontSize = 12.sp,
-                    modifier = Modifier.padding(top = 2.dp)
-                )
-            }
-            Icon(Icons.Filled.ChevronRight, contentDescription = null, tint = Color.White)
-        }
-    }
-}
-
-// AI 분석 화면 — 통계로 프롬프트를 만들어 서버(/analyze)로 보내고, 돌아온 분석 결과만 표시.
+// AI 분석 탭 본문 — 통계로 프롬프트를 만들어 서버(/analyze)로 보내고, 돌아온 분석 결과만 표시.
 // 프롬프트 원문은 화면에 띄우지도 클립보드에 복사하지도 않음 → 사용자에게 노출되지 않음.
 @Composable
-private fun AiAnalysisScreen(onBack: () -> Unit) {
+private fun AiAnalysisContent(onBack: () -> Unit) {
     val context = LocalContext.current
     val db = remember { AppDatabase.getDatabase(context) }
-    val userId = remember {
-        context.getSharedPreferences("short_cut_prefs", Context.MODE_PRIVATE).getString("userId", null)
+    val prefs = remember { context.getSharedPreferences("short_cut_prefs", Context.MODE_PRIVATE) }
+    val userId = remember { prefs.getString("userId", null) }
+    // 닉네임 — 저장된 값 우선, 없으면 Firebase displayName/이메일 prefix 폴백
+    val nickname = remember {
+        prefs.getString("nickname", null)?.takeIf { it.isNotBlank() }
+            ?: FirebaseAuth.getInstance().currentUser?.displayName?.takeIf { it.isNotBlank() }
+            ?: FirebaseAuth.getInstance().currentUser?.email?.substringBefore("@")?.takeIf { it.isNotBlank() }
+            ?: "회원"
     }
 
-    var analysis by remember { mutableStateOf<String?>(null) }
-    var loading by remember { mutableStateOf(true) }
+    // 같은 사용자의 캐시가 있으면 즉시 표시 — 두 번째 진입부터는 LLM 재호출 없음
+    val cached = StatsCache.aiAnalysis?.takeIf { it.first == userId }?.second
+    var analysis by remember { mutableStateOf<String?>(cached) }
+    var loading by remember { mutableStateOf(cached == null) }
     var error by remember { mutableStateOf<String?>(null) }
     var reloadKey by remember { mutableStateOf(0) }  // "다시 시도" 트리거
 
     LaunchedEffect(userId, reloadKey) {
+        // 캐시가 있고 강제 새로고침(reloadKey>0)이 아니면 네트워크 호출 생략
+        if (reloadKey == 0 && analysis != null) {
+            loading = false
+            return@LaunchedEffect
+        }
         loading = true
         error = null
         analysis = null
@@ -730,10 +747,11 @@ private fun AiAnalysisScreen(onBack: () -> Unit) {
             val month = fetchMonthlyStats(userId, monthKey)
 
             // 프롬프트는 만들어 서버로만 전송 — 사용자에겐 결과만 노출
-            val prompt = buildStatsPrompt(dailyLimit, hourlyLimit, days, serverByDay, localTotals, month)
+            val prompt = buildStatsPrompt(nickname, dailyLimit, hourlyLimit, days, serverByDay, localTotals, month)
             val result = fetchAiAnalysis(userId, prompt)
             if (result != null) {
                 analysis = result
+                StatsCache.aiAnalysis = userId to result
             } else {
                 error = "AI 분석을 불러오지 못했어요. 잠시 후 다시 시도해 주세요."
             }
@@ -747,23 +765,19 @@ private fun AiAnalysisScreen(onBack: () -> Unit) {
         modifier = Modifier
             .fillMaxSize()
             .verticalScroll(rememberScrollState())
-            .padding(horizontal = 16.dp, vertical = 16.dp)
     ) {
-        // 상단 바
-        Row(verticalAlignment = Alignment.CenterVertically) {
+        // 상단 바 — 뒤로가기 + 헤더
+        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(bottom = 12.dp)) {
             IconButton(onClick = onBack) {
                 Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "뒤로")
             }
-            Text("AI 통계 분석", fontSize = 20.sp, fontWeight = FontWeight.ExtraBold, color = Color(0xFF1A1A1A))
+            Text(
+                "${nickname}(님)의 통계분석",
+                fontSize = 18.sp,
+                fontWeight = FontWeight.ExtraBold,
+                color = Color(0xFF1A1A1A)
+            )
         }
-        Spacer(Modifier.height(8.dp))
-        Text(
-            "내 사용 통계를 AI가 분석했어요. 아래에서 사용 패턴과 줄이기 조언을 확인하세요.",
-            fontSize = 13.sp,
-            color = Color(0xFF666666),
-            lineHeight = 18.sp
-        )
-        Spacer(Modifier.height(16.dp))
 
         when {
             loading -> Row(verticalAlignment = Alignment.CenterVertically) {
@@ -825,7 +839,9 @@ private suspend fun fetchDailyStatsForDays(
 }
 
 // 통계를 사람이 읽기 쉬운 한국어 프롬프트로 변환. 패턴 분석 + 줄이기 조언을 함께 요청.
+// 응답 분량은 의도적으로 짧게 — 사용자 피드백: "분석 너무 한바가지". 200~300자 이내 요약.
 private fun buildStatsPrompt(
+    nickname: String,
     dailyLimit: Int,
     hourlyLimit: Int,
     days: List<String>,                         // yyyy-MM-dd, 최근→과거 14일
@@ -857,37 +873,27 @@ private fun buildStatsPrompt(
         ?.takeIf { it.isNotEmpty() }
         ?: "기록 없음"
 
+    // 일별 카운트를 한 줄에 콤마로 — 14줄을 1줄로 압축
+    val dailyLine = days.joinToString(", ") {
+        val warn = if (dailyLimit > 0 && totalOf(it) > dailyLimit) "⚠" else ""
+        "${lbl(it)}:${totalOf(it)}$warn"
+    }
+
     return buildString {
-        appendLine("당신은 디지털 웰빙 코치입니다. 아래는 'ShortCut' 앱이 기록한 제 YouTube Shorts 사용 통계입니다. 이 데이터를 바탕으로 분석해 주세요.")
+        appendLine("당신은 디지털 웰빙 코치입니다. 아래는 '${nickname}'님의 최근 14일 쇼츠(YouTube/Instagram/TikTok) 사용 통계입니다.")
         appendLine()
-        appendLine("[제 목표 한도]")
-        appendLine("- 하루 목표: ${dailyLimit}회")
-        appendLine("- 1시간 목표: ${hourlyLimit}회")
-        appendLine()
-        appendLine("[최근 14일 일별 스크롤 수] (목표 초과한 날은 ⚠️)")
-        for (d in days) {
-            val t = totalOf(d)
-            val warn = if (dailyLimit > 0 && t > dailyLimit) " ⚠️" else ""
-            appendLine("- ${lbl(d)}: ${t}회$warn")
-        }
-        appendLine()
-        appendLine("[기간 요약]")
-        appendLine("- 최근 7일 총 ${sum7}회 (일평균 ${avg7}회)")
-        appendLine("- 최근 14일 총 ${sum14}회 (일평균 ${avg14}회)")
-        appendLine("- 14일 중 목표 초과한 날: ${exceedDays}일")
+        appendLine("- 목표 한도: 하루 ${dailyLimit}회 / 1시간 ${hourlyLimit}회")
+        appendLine("- 최근 7일 ${sum7}회(일평균 ${avg7}), 14일 ${sum14}회(일평균 ${avg14}), 한도 초과 ${exceedDays}일")
         if (hasPeak) appendLine("- 가장 많이 본 날: ${lbl(peakDay!!)} (${peakCount}회)")
-        appendLine("- 한도 초과 시 '그만보기' 선택 ${stopSum}회 / 무시하고 계속 ${ignoreSum}회")
-        if (month != null) appendLine("- 이번 달 총 ${month.totalScroll}회 (일평균 ${month.avgScrollPerDay}회)")
+        appendLine("- '그만보기' ${stopSum}회 / '무시하고 계속' ${ignoreSum}회")
+        if (month != null) appendLine("- 이번 달 누적 ${month.totalScroll}회(일평균 ${month.avgScrollPerDay})")
+        appendLine("- 일별: $dailyLine")
+        if (hasPeak) appendLine("- 피크일 시간대: $hourlyLine")
         appendLine()
-        if (hasPeak) {
-            appendLine("[가장 많이 본 날(${lbl(peakDay!!)})의 시간대별 분포]")
-            appendLine(hourlyLine)
-            appendLine()
-        }
-        appendLine("[분석 요청]")
-        appendLine("1. 제 사용 패턴을 분석해 주세요 — 주로 어느 시간대/요일에 많이 보는지, 한도를 얼마나 자주 넘는지, 최근 추세(늘었는지 줄었는지).")
-        appendLine("2. 쇼츠 사용을 줄이기 위한 구체적이고 실천 가능한 팁 3~5가지와, 다음 주에 도전할 만한 현실적인 목표 한도를 제안해 주세요.")
-        append("친근하고 격려하는 말투로, 한국어로 답해 주세요.")
+        appendLine("[요청] ${nickname}님께 친근한 말투로 한국어로 답해 주세요. 전체 250자 내외로 짧게 요약:")
+        appendLine("1) 핵심 패턴 1~2문장")
+        appendLine("2) 줄이기 팁 2가지(불릿)")
+        append("3) 다음 주 추천 한도 한 줄")
     }
 }
 
@@ -940,6 +946,472 @@ private fun heatColor(intensity: Float): Color =
     if (intensity <= 0f) Color(0xFFF5F5F5)
     else lerp(Color(0xFFFFE5E5), Color(0xFFC62828), 0.15f + 0.85f * intensity.coerceIn(0f, 1f))
 
+// ── 일일 목표 진행률 박스 — 진행률 바 + 정지/무시/피크 시간대 ──
+@Composable
+private fun DailyGoalProgressBox(
+    total: Int,
+    dailyLimit: Int,
+    exceeded: Boolean,
+    stopCount: Int?,
+    ignoreCount: Int?,
+    peakHour: Int,
+    peakCount: Int,
+    source: String
+) {
+    val frac = if (dailyLimit > 0) (total.toFloat() / dailyLimit).coerceIn(0f, 1.5f) else 0f
+    val barColor = if (exceeded) Color(0xFFC62828) else Color(0xFF2E7D32)
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(12.dp),
+        color = Color(0xFFF7F7F7)
+    ) {
+        Column(modifier = Modifier.padding(14.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    "일일 목표 진행률" + if (source == "local") " (로컬)" else "",
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = Color(0xFF1A1A1A)
+                )
+                if (dailyLimit > 0) {
+                    Text(
+                        "${total} / ${dailyLimit}회",
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = barColor
+                    )
+                } else {
+                    Text("${total}회 / 한도 미설정", fontSize = 13.sp, color = Color(0xFF888888))
+                }
+            }
+            Spacer(Modifier.height(8.dp))
+            // 진행률 바 — limit 초과 시 100% 위로 넘는 부분은 같은 빨강으로 더 채움
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(10.dp)
+                    .background(Color(0xFFE8E8E8), RoundedCornerShape(5.dp))
+            ) {
+                if (dailyLimit > 0) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth(frac.coerceAtMost(1f))
+                            .fillMaxHeight()
+                            .background(barColor, RoundedCornerShape(5.dp))
+                    )
+                }
+            }
+            if (dailyLimit > 0) {
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    if (exceeded) "목표 ${dailyLimit}회 초과 ⚠️" else "목표 ${dailyLimit}회 이내 ✓",
+                    fontSize = 12.sp,
+                    color = barColor,
+                    fontWeight = FontWeight.SemiBold
+                )
+            }
+            Spacer(Modifier.height(8.dp))
+            // 정지/무시/피크 — 한 줄 요약
+            val parts = buildList {
+                if (stopCount != null) add("정지 ${stopCount}회")
+                if (ignoreCount != null) add("무시 ${ignoreCount}회")
+                if (peakCount > 0) add("피크 ${peakHour}시 (${peakCount}회)")
+            }
+            if (parts.isNotEmpty()) {
+                Text(
+                    parts.joinToString(" · "),
+                    fontSize = 12.sp,
+                    color = Color(0xFF666666)
+                )
+            }
+        }
+    }
+}
+
+// ── 시간별 목표 달성 현황 박스 ──
+// 시간별 limit 이 0 이면 안내 메시지만. 그 외엔 ✅/⚠️ 카운트 + 초과 시간 목록 표시.
+@Composable
+private fun HourlyGoalBox(hourlyCounts: IntArray, hourlyLimit: Int) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(12.dp),
+        color = Color(0xFFF7F7F7)
+    ) {
+        Column(modifier = Modifier.padding(14.dp)) {
+            Text(
+                "시간별 목표 달성 " + if (hourlyLimit > 0) "(한도 ${hourlyLimit}회)" else "",
+                fontSize = 13.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = Color(0xFF1A1A1A)
+            )
+            Spacer(Modifier.height(6.dp))
+            if (hourlyLimit <= 0) {
+                Text("시간별 한도가 설정되지 않았어요", fontSize = 12.sp, color = Color(0xFF888888))
+                return@Column
+            }
+            // 활동이 있었던(>0) 시간만 집계 대상
+            val activeHours = hourlyCounts.withIndex().filter { it.value > 0 }
+            val exceedHours = activeHours.filter { it.value > hourlyLimit }
+            val achievedHours = activeHours.size - exceedHours.size
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("✅ 달성 ${achievedHours}시간", fontSize = 12.sp, color = Color(0xFF2E7D32), fontWeight = FontWeight.SemiBold)
+                Spacer(Modifier.width(12.dp))
+                Text("⚠️ 초과 ${exceedHours.size}시간", fontSize = 12.sp, color = Color(0xFFC62828), fontWeight = FontWeight.SemiBold)
+            }
+            if (exceedHours.isNotEmpty()) {
+                Spacer(Modifier.height(6.dp))
+                val label = exceedHours.joinToString(", ") { "${it.index}시 (${it.value}회)" }
+                Text("초과 시간: $label", fontSize = 12.sp, color = Color(0xFF555555), lineHeight = 17.sp)
+            }
+        }
+    }
+}
+
+// ── 앱별 스크롤 비율 도넛 그래프 ─────────────────────────────
+// counts: Map<key, count> — key 는 패키지명 또는 플랫폼 키("youtube"/"instagram"/"tiktok").
+// 데이터 없으면 안내문만 표시. 색: 유튜브=빨강, 인스타=파랑, 틱톡=초록, 기타=회색.
+@Composable
+private fun AppShareDonut(counts: Map<String, Int>) {
+    // 플랫폼 키(서버 byPlatform) 와 로컬 패키지명 둘 다 받을 수 있게 매핑
+    val ytKeys = setOf("youtube", "com.google.android.youtube")
+    val igKeys = setOf("instagram", "com.instagram.android")
+    val ttKeys = setOf("tiktok", "com.zhiliaoapp.musically", "com.ss.android.ugc.trill")
+
+    val yt = counts.entries.filter { it.key in ytKeys }.sumOf { it.value }
+    val ig = counts.entries.filter { it.key in igKeys }.sumOf { it.value }
+    val tt = counts.entries.filter { it.key in ttKeys }.sumOf { it.value }
+    val other = counts.entries
+        .filter { it.key !in ytKeys && it.key !in igKeys && it.key !in ttKeys }
+        .sumOf { it.value }
+    val total = yt + ig + tt + other
+
+    if (total == 0) {
+        Surface(
+            modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp),
+            shape = RoundedCornerShape(10.dp),
+            color = Color(0xFFF7F7F7)
+        ) {
+            Text(
+                "앱별 데이터가 아직 없어요",
+                modifier = Modifier.padding(16.dp),
+                fontSize = 12.sp, color = Color(0xFF888888)
+            )
+        }
+        return
+    }
+
+    // 표시 순서: 유튜브 → 인스타 → 틱톡 → 기타. 0인 항목은 건너뜀.
+    // 색: YT=빨강 / IG=파랑 / TT=초록 (사용자 지정)
+    data class Slice(val label: String, val count: Int, val color: Color)
+    val slices = listOfNotNull(
+        Slice("유튜브", yt, Color(0xFFE53935)).takeIf { yt > 0 },
+        Slice("인스타", ig, Color(0xFF1E88E5)).takeIf { ig > 0 },
+        Slice("틱톡", tt, Color(0xFF43A047)).takeIf { tt > 0 },
+        Slice("기타", other, Color(0xFF9E9E9E)).takeIf { other > 0 }
+    )
+
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Canvas(modifier = Modifier.size(120.dp)) {
+            val stroke = 28.dp.toPx()
+            val pad = stroke / 2f
+            val rect = androidx.compose.ui.geometry.Rect(pad, pad, size.width - pad, size.height - pad)
+            var startAngle = -90f
+            slices.forEach { s ->
+                val sweep = 360f * s.count / total
+                drawArc(
+                    color = s.color,
+                    startAngle = startAngle,
+                    sweepAngle = sweep,
+                    useCenter = false,
+                    topLeft = rect.topLeft,
+                    size = rect.size,
+                    style = Stroke(width = stroke, cap = StrokeCap.Butt)
+                )
+                startAngle += sweep
+            }
+        }
+        Spacer(Modifier.width(16.dp))
+        Column(modifier = Modifier.weight(1f)) {
+            slices.forEach { s ->
+                val pct = s.count * 100 / total
+                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(vertical = 3.dp)) {
+                    Box(modifier = Modifier.size(10.dp).background(s.color, RoundedCornerShape(2.dp)))
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        "${s.label}  ${s.count}회 (${pct}%)",
+                        fontSize = 13.sp, color = Color(0xFF1A1A1A)
+                    )
+                }
+            }
+        }
+    }
+}
+
+// ── 월간 인라인 펼침 영역 — 그리드 셀 클릭 시 그 자리 아래에 펼쳐짐 ──
+// 기간 / 총 스크롤 / 일평균 / 피크일 / 목표 달성 일수 / 중단·무시 횟수 / 앱별 도넛 / 일별 막대.
+// 서버 /monthly + 일별 /daily(서버 우선, 로컬 폴백). 도넛은 서버 byPlatform 우선, 없으면 로컬 Room.
+@Composable
+private fun MonthInlineDetail(monthOffset: Int) {
+    val context = LocalContext.current
+    val db = remember { AppDatabase.getDatabase(context) }
+    val userId = remember {
+        context.getSharedPreferences("short_cut_prefs", Context.MODE_PRIVATE).getString("userId", null)
+    }
+
+    // 표시 중인 달의 첫 자정 / 다음 달 첫 자정
+    val monthCal = remember(monthOffset) {
+        Calendar.getInstance().apply {
+            set(Calendar.DAY_OF_MONTH, 1)
+            set(Calendar.HOUR_OF_DAY, 0); set(Calendar.MINUTE, 0)
+            set(Calendar.SECOND, 0); set(Calendar.MILLISECOND, 0)
+            add(Calendar.MONTH, monthOffset)
+        }
+    }
+    val monthStartMs = monthCal.timeInMillis
+    val nextMonthStartMs = remember(monthOffset) {
+        Calendar.getInstance().apply {
+            timeInMillis = monthStartMs
+            add(Calendar.MONTH, 1)
+        }.timeInMillis
+    }
+    val year = monthCal.get(Calendar.YEAR)
+    val month = monthCal.get(Calendar.MONTH) // 0..11
+    val daysInMonth = monthCal.getActualMaximum(Calendar.DAY_OF_MONTH)
+    val monthKey = remember(monthOffset) { SimpleDateFormat("yyyy-MM", Locale.US).format(monthCal.time) }
+
+    var summary by remember(monthOffset) {
+        mutableStateOf<MonthStatsRemote?>(
+            userId?.let { StatsCache.get<MonthStatsRemote>("monthSummary:$it:$monthKey") }
+        )
+    }
+    var dayCounts by remember(monthOffset) {
+        mutableStateOf<Map<String, Int>>(
+            userId?.let { StatsCache.get<Map<String, Int>>("monthDays:$it:$monthKey") } ?: emptyMap()
+        )
+    }
+    var appCounts by remember(monthOffset) { mutableStateOf<Map<String, Int>>(emptyMap()) }
+    // 목표 달성 일수 계산용 — 사용자 daily limit
+    var dailyLimit by remember { mutableStateOf(0) }
+    var loading by remember(monthOffset) { mutableStateOf(summary == null || dayCounts.isEmpty()) }
+
+    LaunchedEffect(monthOffset, userId) {
+        loading = true
+        if (userId != null) {
+            dailyLimit = db.userLimitDao().getLimit(userId)?.dailyLimit ?: 0
+        }
+        if (summary == null && userId != null) {
+            val s = fetchMonthlyStats(userId, monthKey)
+            if (s != null) {
+                summary = s
+                StatsCache.put("monthSummary:$userId:$monthKey", s)
+            }
+        }
+        if (dayCounts.isEmpty() && userId != null) {
+            val fmt = SimpleDateFormat("yyyy-MM-dd", Locale.US)
+            val tmp = Calendar.getInstance().apply { timeInMillis = monthStartMs }
+            val monthDays = (1..daysInMonth).map { day ->
+                tmp.set(Calendar.DAY_OF_MONTH, day); fmt.format(tmp.time)
+            }
+            val server = fetchDailyStatsForDays(userId, monthDays)
+            val local = db.scrollHistoryDao().countByDay().associate { it.day to it.count }
+            val merged = monthDays.associateWith { d -> server[d]?.totalScroll ?: local[d] ?: 0 }
+            dayCounts = merged
+            StatsCache.put("monthDays:$userId:$monthKey", merged)
+        }
+        appCounts = db.scrollHistoryDao()
+            .countByAppForRange(monthStartMs, nextMonthStartMs)
+            .associate { it.appPkg to it.count }
+        loading = false
+    }
+
+    val totalScroll = summary?.totalScroll ?: dayCounts.values.sum()
+    val avgPerDay = summary?.avgScrollPerDay ?: (if (dayCounts.isNotEmpty()) totalScroll / daysInMonth else 0)
+    val peakDay = dayCounts.maxByOrNull { it.value }
+    val peakDate = peakDay?.key ?: summary?.peakDate
+    val peakCount = peakDay?.value ?: summary?.peakCount ?: 0
+    // 목표 달성 일수 = limit > 0 이고 그 날 totalScroll ≤ limit 이면서 활동이 있었던(>0) 날
+    val goalAchievedDays = if (dailyLimit > 0) {
+        dayCounts.values.count { it in 1..dailyLimit }
+    } else 0
+    val activeDays = dayCounts.values.count { it > 0 }
+
+    val parse = remember { SimpleDateFormat("yyyy-MM-dd", Locale.US) }
+    val peakLabel = remember(peakDate) {
+        peakDate?.let {
+            try { SimpleDateFormat("M월 d일(E)", Locale.KOREAN).format(parse.parse(it)!!) } catch (_: Exception) { it }
+        }
+    }
+    // 도넛 데이터 — 서버 byPlatform 있으면 우선, 없으면 로컬 Room
+    val donutCounts = summary?.byPlatform ?: appCounts
+
+    Surface(
+        modifier = Modifier.fillMaxWidth().padding(top = 4.dp, bottom = 16.dp),
+        shape = RoundedCornerShape(12.dp),
+        color = Color(0xFFF7F7F7)
+    ) {
+        Column(modifier = Modifier.padding(14.dp)) {
+            // 기간 표시
+            Text(
+                "${year}.%02d.01 ~ ${year}.%02d.%02d".format(month + 1, month + 1, daysInMonth),
+                fontSize = 13.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = Color(0xFF555555)
+            )
+            Spacer(Modifier.height(10.dp))
+
+            // 핵심 수치 3개 — 총합 / 일평균 / 피크일
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                MonthMetricCard("총 스크롤", "${totalScroll}회", modifier = Modifier.weight(1f))
+                MonthMetricCard("일평균", "${avgPerDay}회", modifier = Modifier.weight(1f))
+                MonthMetricCard(
+                    "가장 많이 본 날",
+                    peakLabel ?: "-",
+                    subValue = if (peakCount > 0) "${peakCount}회" else null,
+                    modifier = Modifier.weight(1f)
+                )
+            }
+
+            // 목표 달성 일수 + 중단/무시 — 한 줄로
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                MonthMetricCard(
+                    "목표 달성",
+                    if (dailyLimit > 0) "${goalAchievedDays}일" else "-",
+                    subValue = if (dailyLimit > 0) "활동 ${activeDays}일 중" else "한도 미설정",
+                    modifier = Modifier.weight(1f)
+                )
+                MonthMetricCard(
+                    "그만보기",
+                    summary?.stopCount?.let { "${it}회" } ?: "-",
+                    modifier = Modifier.weight(1f)
+                )
+                MonthMetricCard(
+                    "무시",
+                    summary?.ignoreCount?.let { "${it}회" } ?: "-",
+                    modifier = Modifier.weight(1f)
+                )
+            }
+
+            Text("앱별 스크롤 비율", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = Color(0xFF1A1A1A))
+            Spacer(Modifier.height(6.dp))
+            AppShareDonut(donutCounts)
+
+            Text("일별 스크롤", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = Color(0xFF1A1A1A))
+            Spacer(Modifier.height(6.dp))
+            MonthDailyBarChart(
+                year = year,
+                month = month,
+                daysInMonth = daysInMonth,
+                dayCounts = dayCounts,
+                peakDate = peakDate
+            )
+
+            if (loading) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    CircularProgressIndicator(modifier = Modifier.size(14.dp), strokeWidth = 2.dp, color = Color(0xFF888888))
+                    Spacer(Modifier.width(8.dp))
+                    Text("불러오는 중...", fontSize = 12.sp, color = Color(0xFF888888))
+                }
+            }
+        }
+    }
+}
+
+// 월별 분석 화면의 작은 지표 카드
+@Composable
+private fun MonthMetricCard(label: String, value: String, subValue: String? = null, modifier: Modifier = Modifier) {
+    Surface(
+        modifier = modifier,
+        shape = RoundedCornerShape(10.dp),
+        color = Color(0xFFF7F7F7)
+    ) {
+        Column(modifier = Modifier.padding(12.dp)) {
+            Text(label, fontSize = 11.sp, color = Color(0xFF888888))
+            Spacer(Modifier.height(4.dp))
+            Text(value, fontSize = 14.sp, fontWeight = FontWeight.Bold, color = Color(0xFF1A1A1A))
+            if (subValue != null) {
+                Text(subValue, fontSize = 11.sp, color = Color(0xFF555555), modifier = Modifier.padding(top = 2.dp))
+            }
+        }
+    }
+}
+
+// 월별 일별 막대 그래프 — 1~말일을 가로로 균등 분할. 피크일은 색을 진하게 표시.
+@Composable
+private fun MonthDailyBarChart(
+    year: Int,
+    month: Int,
+    daysInMonth: Int,
+    dayCounts: Map<String, Int>,
+    peakDate: String?
+) {
+    val fmt = remember(year, month) { SimpleDateFormat("yyyy-MM-dd", Locale.US) }
+    val tmp = remember(year, month) {
+        Calendar.getInstance().apply {
+            clear(); set(year, month, 1, 0, 0, 0)
+        }
+    }
+    val counts = remember(year, month, daysInMonth, dayCounts) {
+        (1..daysInMonth).map { day ->
+            tmp.set(Calendar.DAY_OF_MONTH, day)
+            val key = fmt.format(tmp.time)
+            key to (dayCounts[key] ?: 0)
+        }
+    }
+    val maxCount = (counts.maxOfOrNull { it.second } ?: 0).coerceAtLeast(1)
+    val chartHeight = 140.dp
+
+    Surface(
+        modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp),
+        shape = RoundedCornerShape(10.dp),
+        color = Color(0xFFFAFAFA)
+    ) {
+        Column(modifier = Modifier.padding(12.dp)) {
+            // 막대 영역
+            Row(
+                modifier = Modifier.fillMaxWidth().height(chartHeight),
+                verticalAlignment = Alignment.Bottom,
+                horizontalArrangement = Arrangement.spacedBy(2.dp)
+            ) {
+                counts.forEach { (date, c) ->
+                    val frac = c.toFloat() / maxCount
+                    val isPeak = peakDate != null && date == peakDate && c > 0
+                    val color = when {
+                        c == 0 -> Color(0xFFE0E0E0)
+                        isPeak -> Color(0xFFC62828)
+                        else -> Color(0xFF8AB4F8)
+                    }
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .fillMaxHeight(frac.coerceAtLeast(0.02f))
+                            .background(color, RoundedCornerShape(topStart = 3.dp, topEnd = 3.dp))
+                    )
+                }
+            }
+            Spacer(Modifier.height(6.dp))
+            // x 축 라벨: 1, 10, 20, 말일
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                listOf(1, 10, 20, daysInMonth).distinct().forEach { d ->
+                    Text("${d}일", fontSize = 10.sp, color = Color(0xFF888888))
+                }
+            }
+        }
+    }
+}
+
 // ── 주간: 연도 선택 + 1~4분기 탭. 선택한 분기의 주(週)만 4열 그리드로 색 농도(히트맵) 표시.
 //   배치는 좌상단=과거 → 우하단=최신(오름차순). 한 주를 누르면 그 주 상세(요약 + 월~일 막대그래프). ──
 // 데이터는 그 해 전체를 한 번 받아(yearOffset 키) 분기 전환은 즉시. 그리드 합계·상세 막대 모두 같은
@@ -947,6 +1419,7 @@ private fun heatColor(intensity: Float): Color =
 @Composable
 private fun StatsWeekly() {
     val context = LocalContext.current
+    val db = remember { AppDatabase.getDatabase(context) }
     val userId = remember {
         context.getSharedPreferences("short_cut_prefs", Context.MODE_PRIVATE).getString("userId", null)
     }
@@ -977,9 +1450,21 @@ private fun StatsWeekly() {
     val weeks = remember(allWeeks, quarter) { allWeeks.filter { weekQuarter(it) == quarter } }
 
     // 표시 주들의 모든 날짜(오늘 이전)를 /daily 로 받아 일별 합산 — 그 해 전체를 한 번에(분기 전환은 즉시)
-    var dayTotals by remember(yearOffset) { mutableStateOf<Map<String, Int>>(emptyMap()) }
-    var loading by remember(yearOffset) { mutableStateOf(true) }
+    var dayTotals by remember(yearOffset) {
+        mutableStateOf<Map<String, Int>>(
+            userId?.let { StatsCache.get<Map<String, Int>>("weekly:$it:$displayYear") } ?: emptyMap()
+        )
+    }
+    var loading by remember(yearOffset) { mutableStateOf(dayTotals.isEmpty()) }
     LaunchedEffect(yearOffset, userId) {
+        if (userId != null) {
+            val cached = StatsCache.get<Map<String, Int>>("weekly:$userId:$displayYear")
+            if (cached != null) {
+                dayTotals = cached
+                loading = false
+                return@LaunchedEffect
+            }
+        }
         loading = true
         if (userId != null) {
             val cal = Calendar.getInstance()
@@ -992,7 +1477,9 @@ private fun StatsWeekly() {
                     if (ds <= todayStr) days.add(ds)  // yyyy-MM-dd 문자열 비교 = 날짜 비교
                 }
             }
-            dayTotals = fetchDailyTotalsForDays(userId, days)
+            val result = fetchDailyTotalsForDays(userId, days)
+            StatsCache.put("weekly:$userId:$displayYear", result)
+            dayTotals = result
         }
         loading = false
     }
@@ -1137,6 +1624,16 @@ private fun StatsWeekly() {
                 Calendar.getInstance().apply { timeInMillis = selectedWeek; add(Calendar.DAY_OF_YEAR, peakIdx) }
                     .let { dayFmt.format(it.time) }
             } else null
+
+            // 선택 주의 앱별 카운트 — 로컬 Room (7일 범위)
+            var weekAppCounts by remember(selectedWeek) { mutableStateOf<Map<String, Int>>(emptyMap()) }
+            LaunchedEffect(selectedWeek) {
+                val weekEnd = selectedWeek + 7L * 24L * 60L * 60L * 1000L
+                weekAppCounts = db.scrollHistoryDao()
+                    .countByAppForRange(selectedWeek, weekEnd)
+                    .associate { it.appPkg to it.count }
+            }
+
             Text(
                 longRange(selectedWeek), fontSize = 18.sp, fontWeight = FontWeight.Bold,
                 color = Color(0xFF1A1A1A), modifier = Modifier.padding(start = 4.dp, bottom = 8.dp)
@@ -1158,6 +1655,14 @@ private fun StatsWeekly() {
                     WeekBarChart(counts = dc)
                 }
             }
+            Spacer(Modifier.height(16.dp))
+            Text(
+                "앱별 스크롤 비율",
+                fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = Color(0xFF1A1A1A),
+                modifier = Modifier.padding(start = 4.dp, bottom = 6.dp)
+            )
+            AppShareDonut(weekAppCounts)
+
             Spacer(Modifier.height(24.dp))
         }
     }
@@ -1166,7 +1671,7 @@ private fun StatsWeekly() {
 // ── 월간: 1년치 12달 그리드. 각 달 총 스크롤을 색 농도(히트맵)로 표시, 누르면 그 달 일간 상세로 드릴다운. ──
 // 각 달은 서버 /monthly 로 총 스크롤을 가져옴 (12회 병렬 호출).
 @Composable
-private fun StatsMonthly(onMonthClick: (monthOffset: Int) -> Unit) {
+private fun StatsMonthly() {
     val context = LocalContext.current
     val userId = remember {
         context.getSharedPreferences("short_cut_prefs", Context.MODE_PRIVATE).getString("userId", null)
@@ -1178,9 +1683,25 @@ private fun StatsMonthly(onMonthClick: (monthOffset: Int) -> Unit) {
     var yearOffset by remember { mutableStateOf(0) } // 0 = 올해
     val displayYear = curYear + yearOffset
 
-    var monthTotals by remember(yearOffset) { mutableStateOf<Map<Int, Int>>(emptyMap()) }
-    var loading by remember(yearOffset) { mutableStateOf(true) }
+    // 인라인 펼침 — 선택된 달의 monthOffset(전체 기준). null 이면 닫힘. 같은 셀 다시 누르면 닫힘.
+    var expandedOffset by remember(yearOffset) { mutableStateOf<Int?>(null) }
+
+    var monthTotals by remember(yearOffset) {
+        mutableStateOf<Map<Int, Int>>(
+            userId?.let { StatsCache.get<Map<Int, Int>>("monthly:$it:$displayYear") } ?: emptyMap()
+        )
+    }
+    var loading by remember(yearOffset) { mutableStateOf(monthTotals.isEmpty()) }
     LaunchedEffect(yearOffset, userId) {
+        // 캐시 적중하면 네트워크 생략
+        if (userId != null) {
+            val cached = StatsCache.get<Map<Int, Int>>("monthly:$userId:$displayYear")
+            if (cached != null) {
+                monthTotals = cached
+                loading = false
+                return@LaunchedEffect
+            }
+        }
         loading = true
         val map = mutableMapOf<Int, Int>()
         if (userId != null) {
@@ -1194,6 +1715,7 @@ private fun StatsMonthly(onMonthClick: (monthOffset: Int) -> Unit) {
                 }.awaitAll()
             }
             results.forEach { (m, s) -> if (s != null) map[m] = s.totalScroll }
+            StatsCache.put("monthly:$userId:$displayYear", map.toMap())
         }
         monthTotals = map
         loading = false
@@ -1232,15 +1754,23 @@ private fun StatsMonthly(onMonthClick: (monthOffset: Int) -> Unit) {
                     val isFuture = displayYear > curYear || (displayYear == curYear && m > curMonth)
                     val total = monthTotals[m] ?: 0
                     val intensity = total.toFloat() / maxTotal
-                    val bg = if (isFuture) Color(0xFFFAFAFA) else heatColor(intensity)
+                    val monthOffset = (displayYear - curYear) * 12 + (m - curMonth)
+                    val isSelected = expandedOffset == monthOffset
+                    val bg = when {
+                        isFuture -> Color(0xFFFAFAFA)
+                        isSelected -> Color(0xFF1A1A1A)
+                        else -> heatColor(intensity)
+                    }
                     var cellMod = Modifier
                         .weight(1f)
                         .aspectRatio(1.1f)
                         .padding(4.dp)
                         .background(bg, RoundedCornerShape(10.dp))
                     if (!isFuture) {
-                        val monthOffset = (displayYear - curYear) * 12 + (m - curMonth)
-                        cellMod = cellMod.clickable { onMonthClick(monthOffset) }
+                        cellMod = cellMod.clickable {
+                            // 같은 셀 다시 누르면 닫힘 — 토글
+                            expandedOffset = if (expandedOffset == monthOffset) null else monthOffset
+                        }
                     }
                     Box(modifier = cellMod, contentAlignment = Alignment.Center) {
                         Column(horizontalAlignment = Alignment.CenterHorizontally) {
@@ -1248,6 +1778,7 @@ private fun StatsMonthly(onMonthClick: (monthOffset: Int) -> Unit) {
                                 monthNames[m], fontSize = 15.sp, fontWeight = FontWeight.SemiBold,
                                 color = when {
                                     isFuture -> Color(0xFFCCCCCC)
+                                    isSelected -> Color.White
                                     intensity > 0.55f -> Color.White
                                     else -> Color(0xFF1A1A1A)
                                 }
@@ -1255,7 +1786,11 @@ private fun StatsMonthly(onMonthClick: (monthOffset: Int) -> Unit) {
                             if (!isFuture) {
                                 Text(
                                     "${total}회", fontSize = 12.sp,
-                                    color = if (intensity > 0.55f) Color.White else Color(0xFF555555),
+                                    color = when {
+                                        isSelected -> Color.White
+                                        intensity > 0.55f -> Color.White
+                                        else -> Color(0xFF555555)
+                                    },
                                     modifier = Modifier.padding(top = 2.dp)
                                 )
                             }
@@ -1264,12 +1799,17 @@ private fun StatsMonthly(onMonthClick: (monthOffset: Int) -> Unit) {
                 }
             }
         }
-        Spacer(Modifier.height(16.dp))
+        Spacer(Modifier.height(8.dp))
         Text(
-            "달을 누르면 그 달 일간 통계로 이동합니다.",
+            "달을 누르면 그 달의 상세 통계가 아래에 펼쳐집니다.",
             fontSize = 11.sp, color = Color(0xFF888888),
-            modifier = Modifier.padding(start = 4.dp)
+            modifier = Modifier.padding(start = 4.dp, bottom = 8.dp)
         )
+
+        // ── 인라인 펼침 영역 — 선택한 달의 상세 통계 ──
+        expandedOffset?.let { offset ->
+            MonthInlineDetail(monthOffset = offset)
+        }
     }
 }
 
@@ -1320,12 +1860,15 @@ private fun StatsDaily(monthOffset: Int, onMonthOffsetChange: (Int) -> Unit) {
         context.getSharedPreferences("short_cut_prefs", Context.MODE_PRIVATE).getString("userId", null)
     }
 
-    // 달력 히트맵 일자별 카운트(yyyy-MM-dd → 스크롤 수) + 로컬 폴백용 현재 daily limit.
+    // 달력 히트맵 일자별 카운트(yyyy-MM-dd → 스크롤 수) + 로컬 폴백용 현재 daily/hourly limit.
     // 상세 그래프와 같은 서버 /daily 를 소스로 써서 같은 날 숫자가 어긋나지 않게 함(서버에 없는 날만 로컬 Room 폴백).
     var dayCounts by remember { mutableStateOf<Map<String, Int>>(emptyMap()) }
     var currentDailyLimit by remember { mutableStateOf(0) }
+    var currentHourlyLimit by remember { mutableStateOf(0) }
     LaunchedEffect(userId) {
-        currentDailyLimit = userId?.let { db.userLimitDao().getLimit(it)?.dailyLimit } ?: 0
+        val limit = userId?.let { db.userLimitDao().getLimit(it) }
+        currentDailyLimit = limit?.dailyLimit ?: 0
+        currentHourlyLimit = limit?.hourlyLimit ?: 0
     }
 
     // 달력이 보여주는 달 (0=이번 달, -1=저번 달 ...) — 상위 상태
@@ -1342,22 +1885,18 @@ private fun StatsDaily(monthOffset: Int, onMonthOffsetChange: (Int) -> Unit) {
     val daysInMonth = monthCal.getActualMaximum(Calendar.DAY_OF_MONTH)
     val firstDayOfWeek = (monthCal.get(Calendar.DAY_OF_WEEK) + 5) % 7 // MON=0..SUN=6
 
-    // 월간 서버 요약 카드
     val monthKey = remember(monthOffset) { SimpleDateFormat("yyyy-MM", Locale.US).format(monthCal.time) }
-    var summary by remember(monthOffset) { mutableStateOf<MonthStatsRemote?>(null) }
-    var summaryLoading by remember(monthOffset) { mutableStateOf(true) }
-    var summaryError by remember(monthOffset) { mutableStateOf<String?>(null) }
-    LaunchedEffect(monthOffset, userId) {
-        summaryLoading = true
-        summaryError = null
-        val s = userId?.let { fetchMonthlyStats(it, monthKey) }
-        if (s != null) summary = s else summaryError = "서버 요약을 불러오지 못했습니다"
-        summaryLoading = false
-    }
 
     // 표시 중인 달의 일자별 스크롤 수를 서버 /daily 로 가져옴(상세 그래프와 동일 소스).
     // 서버 응답이 있는 날은 서버값, 없는 날(오프라인 등)만 로컬 Room countByDay 로 폴백.
     LaunchedEffect(monthOffset, userId) {
+        if (userId != null) {
+            val cached = StatsCache.get<Map<String, Int>>("monthDays:$userId:$monthKey")
+            if (cached != null) {
+                dayCounts = cached
+                return@LaunchedEffect
+            }
+        }
         val fmt = SimpleDateFormat("yyyy-MM-dd", Locale.US)
         val tmp = Calendar.getInstance().apply { timeInMillis = monthCal.timeInMillis }
         val monthDays = (1..daysInMonth).map { day ->
@@ -1365,7 +1904,9 @@ private fun StatsDaily(monthOffset: Int, onMonthOffsetChange: (Int) -> Unit) {
         }
         val server = userId?.let { fetchDailyStatsForDays(it, monthDays) } ?: emptyMap()
         val local = db.scrollHistoryDao().countByDay().associate { it.day to it.count }
-        dayCounts = monthDays.associateWith { d -> server[d]?.totalScroll ?: local[d] ?: 0 }
+        val merged = monthDays.associateWith { d -> server[d]?.totalScroll ?: local[d] ?: 0 }
+        dayCounts = merged
+        userId?.let { StatsCache.put("monthDays:$it:$monthKey", merged) }
     }
 
     val countByDate = remember(monthOffset, dayCounts) {
@@ -1401,25 +1942,31 @@ private fun StatsDaily(monthOffset: Int, onMonthOffsetChange: (Int) -> Unit) {
     var counts by remember { mutableStateOf(IntArray(24)) }
     var serverStats by remember { mutableStateOf<DailyStatsRemote?>(null) }
     var source by remember { mutableStateOf("loading") }  // "server" / "local" / "loading"
+    // 선택일의 앱별 카운트(로컬 Room 전용 — 서버는 아직 platform 미저장) — 도넛 그래프용
+    var dayAppCounts by remember { mutableStateOf<Map<String, Int>>(emptyMap()) }
     LaunchedEffect(selectedDayMs, userId) {
         source = "loading"
         val remote = userId?.let { fetchDailyStats(it, selectedDateStr) }
+        val endOfDay = Calendar.getInstance().apply {
+            timeInMillis = selectedDayMs
+            add(Calendar.DAY_OF_YEAR, 1)
+        }.timeInMillis
         if (remote != null) {
             serverStats = remote
             counts = remote.hourlyCounts
             source = "server"
         } else {
             serverStats = null
-            val endOfDay = Calendar.getInstance().apply {
-                timeInMillis = selectedDayMs
-                add(Calendar.DAY_OF_YEAR, 1)
-            }.timeInMillis
             val hourly = db.scrollHistoryDao().countByHourForDay(selectedDayMs, endOfDay)
             counts = IntArray(24).also { arr ->
                 hourly.forEach { if (it.hour in 0..23) arr[it.hour] = it.count }
             }
             source = "local"
         }
+        // 앱별 카운트는 항상 로컬 DB 에서 — 도넛 그래프 소스
+        dayAppCounts = db.scrollHistoryDao()
+            .countByAppForRange(selectedDayMs, endOfDay)
+            .associate { it.appPkg to it.count }
     }
 
     // 누적값 — cumulative[i] = counts[0..i-1] 합. 길이 25
@@ -1446,16 +1993,6 @@ private fun StatsDaily(monthOffset: Int, onMonthOffsetChange: (Int) -> Unit) {
             .fillMaxSize()
             .verticalScroll(rememberScrollState())
     ) {
-        // ── 월간 영역: 서버 요약 + 달력 히트맵 ──
-        StatsSummaryCard(
-            title = "${year}.%02d 서버 요약".format(month + 1),
-            totalScroll = summary?.totalScroll,
-            avgPerDay = summary?.avgScrollPerDay,
-            peakDate = summary?.peakDate,
-            peakCount = summary?.peakCount,
-            loading = summaryLoading,
-            errorMsg = summaryError
-        )
         // 월 네비 ← 2026.05 →
         Row(
             modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp),
@@ -1591,37 +2128,42 @@ private fun StatsDaily(monthOffset: Int, onMonthOffsetChange: (Int) -> Unit) {
             color = Color(0xFF1A1A1A),
             modifier = Modifier.padding(start = 8.dp, bottom = 8.dp)
         )
+
+        // 일일 목표 진행률 박스
+        Box(modifier = Modifier.padding(horizontal = 8.dp)) {
+            DailyGoalProgressBox(
+                total = total,
+                dailyLimit = dailyLimit,
+                exceeded = exceeded,
+                stopCount = serverStats?.stopCount,
+                ignoreCount = serverStats?.ignoreCount,
+                peakHour = peakHour,
+                peakCount = peakCount,
+                source = source
+            )
+        }
+        Spacer(Modifier.height(12.dp))
+
+        // 시간별 목표 달성 현황 박스 — hourlyLimit 은 서버 응답 우선, 없으면 사용자 현재 limit
+        val hourlyLimitForDay = serverStats?.hourlyLimit ?: currentHourlyLimit
+        Box(modifier = Modifier.padding(horizontal = 8.dp)) {
+            HourlyGoalBox(
+                hourlyCounts = counts,
+                hourlyLimit = hourlyLimitForDay
+            )
+        }
+        Spacer(Modifier.height(12.dp))
+
+        // 앱별 비율 도넛 — 서버 byPlatform 있으면 우선, 없으면 로컬 Room
         Text(
-            text = "총 ${total}회" + if (source == "local") " (로컬)" else "",
-            fontSize = 14.sp,
-            color = Color(0xFF555555),
-            modifier = Modifier.padding(start = 8.dp, bottom = 4.dp)
+            "앱별 스크롤 비율",
+            fontSize = 13.sp,
+            fontWeight = FontWeight.SemiBold,
+            color = Color(0xFF1A1A1A),
+            modifier = Modifier.padding(start = 8.dp, bottom = 6.dp)
         )
-        serverStats?.let { s ->
-            Text(
-                text = "정지 ${s.stopCount}회 · 무시 ${s.ignoreCount}회",
-                fontSize = 12.sp,
-                color = Color(0xFF888888),
-                modifier = Modifier.padding(start = 8.dp, bottom = 4.dp)
-            )
-        }
-        if (dailyLimit > 0) {
-            Text(
-                text = if (exceeded) "daily limit ${dailyLimit}회 — 초과 ⚠️" else "daily limit ${dailyLimit}회 — 이내 ✓",
-                fontSize = 13.sp,
-                fontWeight = FontWeight.SemiBold,
-                color = if (exceeded) Color(0xFFC62828) else Color(0xFF2E7D32),
-                modifier = Modifier.padding(start = 8.dp, bottom = 4.dp)
-            )
-        }
-        if (peakCount > 0) {
-            Text(
-                text = "피크 시간대: ${peakHour}시 ~ ${peakHour + 1}시 (${peakCount}회)",
-                fontSize = 13.sp,
-                color = Color(0xFFC62828),
-                fontWeight = FontWeight.SemiBold,
-                modifier = Modifier.padding(start = 8.dp, bottom = 12.dp)
-            )
+        Box(modifier = Modifier.padding(horizontal = 8.dp)) {
+            AppShareDonut(serverStats?.byPlatform ?: dayAppCounts)
         }
 
         // Canvas 차트 영역 — 누적 라인 + 그날 한도 점선
@@ -2430,19 +2972,34 @@ private suspend fun pushLimitToServer(userId: String, hourlyLimit: Int, dailyLim
 private const val SERVER_BASE_URL = "https://short-cut-server-production.up.railway.app"
 
 // 일간 통계 — hourlyCounts 는 0..23 시간대별 카운트 배열 (서버 hourlyGraph 를 24 길이로 펴서 채움)
+// hourlyLimit/byPlatform/violations 은 서버 응답에 없으면 null (점진 확장).
 private data class DailyStatsRemote(
     val totalScroll: Int,
     val dailyLimit: Int,
     val stopCount: Int,
     val ignoreCount: Int,
-    val hourlyCounts: IntArray
+    val hourlyCounts: IntArray,
+    val hourlyLimit: Int? = null,                       // 그 날의 시간별 목표
+    val byPlatform: Map<String, Int>? = null,           // 플랫폼별 집계 (youtube/instagram/tiktok)
+    val violations: List<ViolationRecord>? = null       // 한도 초과 기록(시각 포함)
 )
 
 private data class MonthStatsRemote(
     val totalScroll: Int,
     val avgScrollPerDay: Int,
     val peakDate: String?,
-    val peakCount: Int?
+    val peakCount: Int?,
+    val stopCount: Int? = null,                         // 그 달 누적 '그만보기' 횟수
+    val ignoreCount: Int? = null,                       // 그 달 누적 '무시' 횟수
+    val byPlatform: Map<String, Int>? = null            // 플랫폼별 집계
+)
+
+// 한도 초과 기록(시각/타입/응답) — 일간 통계의 violations 항목.
+private data class ViolationRecord(
+    val timestamp: Long,
+    val limitType: String,   // "hourly" / "daily"
+    val action: String,      // "stop" / "ignore"
+    val hour: Int            // 0..23 — 그날 몇 시 위반인지
 )
 
 // Firebase ID 토큰을 Bearer 헤더로 붙여 GET 요청 → JSON 파싱. 실패 시 null.
@@ -2487,23 +3044,54 @@ private suspend fun fetchDailyStats(userId: String, date: String): DailyStatsRem
             if (hr in 0..23) hourly[hr] = obj.optInt("scrollCount", 0)
         }
     }
+    // 플랫폼별 집계 — 서버가 byPlatform: {youtube, instagram, tiktok} 으로 내려주면 사용
+    val byPlatform = json.optJSONObject("byPlatform")?.let { o ->
+        listOf("youtube", "instagram", "tiktok")
+            .associateWith { o.optInt(it, 0) }
+            .filterValues { it > 0 }
+            .takeIf { it.isNotEmpty() }
+    }
+    // 위반 기록 — 서버가 내려주면 사용 (없어도 hourlyLimit + hourlyCounts 로 시간별 초과 시간 계산 가능)
+    val violations = json.optJSONArray("violations")?.let { arr ->
+        (0 until arr.length()).mapNotNull { i ->
+            val o = arr.optJSONObject(i) ?: return@mapNotNull null
+            ViolationRecord(
+                timestamp = o.optLong("timestamp"),
+                limitType = o.optString("limitType", ""),
+                action = o.optString("action", ""),
+                hour = o.optInt("hour", -1).takeIf { it in 0..23 } ?: 0
+            )
+        }
+    }
     return DailyStatsRemote(
         totalScroll = json.optInt("totalScroll", 0),
         dailyLimit = json.optInt("dailyLimit", 0),
         stopCount = json.optInt("stopCount", 0),
         ignoreCount = json.optInt("ignoreCount", 0),
-        hourlyCounts = hourly
+        hourlyCounts = hourly,
+        hourlyLimit = json.optInt("hourlyLimit", -1).takeIf { it > 0 },
+        byPlatform = byPlatform,
+        violations = violations
     )
 }
 
 private suspend fun fetchMonthlyStats(userId: String, month: String): MonthStatsRemote? {
     val json = authedGetJson("$SERVER_BASE_URL/stats/$userId/monthly?date=$month") ?: return null
     val peak = json.optJSONObject("peakDay")
+    val byPlatform = json.optJSONObject("byPlatform")?.let { o ->
+        listOf("youtube", "instagram", "tiktok")
+            .associateWith { o.optInt(it, 0) }
+            .filterValues { it > 0 }
+            .takeIf { it.isNotEmpty() }
+    }
     return MonthStatsRemote(
         totalScroll = json.optInt("totalScroll", 0),
         avgScrollPerDay = json.optInt("avgScrollPerDay", 0),
         peakDate = peak?.optString("date")?.takeIf { it.isNotEmpty() },
-        peakCount = peak?.optInt("scrollCount")
+        peakCount = peak?.optInt("scrollCount"),
+        stopCount = json.optInt("stopCount", -1).takeIf { it >= 0 },
+        ignoreCount = json.optInt("ignoreCount", -1).takeIf { it >= 0 },
+        byPlatform = byPlatform
     )
 }
 
