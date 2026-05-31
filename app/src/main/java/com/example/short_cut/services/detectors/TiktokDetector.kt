@@ -58,17 +58,22 @@ class TiktokDetector(packageName: String) : AppDetector(packageName) {
             if (scrollY < 0) return Outcome.NONE
 
             // 첫 viewpager scroll = For You 진입 신호
+            // TT 는 ViewPager SCROLLED 가 swipe snap 완료 시점에 1번만 오는 경우가 많음 → 첫 SCROLLED 가
+            // 곧 사용자의 첫 스와이프인 셈. 진입 신호로만 처리하면 첫 스크롤이 씹힘.
+            // → scrollY 가 페이지 경계에 정확히 snap 된 상태면 첫 스와이프로 보고 카운트도 같이 보고.
+            //   (단순히 화면 진입만 한 시점이면 보통 scrollY=0 이라 snapped=false → baseline 만)
             if (!inShortsMode) {
                 inShortsMode = true
                 modeEnteredTime = now
-                // 진입 시점에 이미 N페이지 내려간 상태일 수 있으므로 baseline 기억
-                lastPageIdx = (scrollY + H / 2) / H
-                Log.d(TAG, "[TT] For You 진입 H=$H startIdx=$lastPageIdx")
-                return Outcome(entered = true)
+                val firstPageIdx = (scrollY + H / 2) / H
+                val tol = H / SNAP_TOLERANCE_DIV
+                val snapped = firstPageIdx > 0 && Math.abs(scrollY - firstPageIdx * H) <= tol
+                // snap 된 채 진입했다면 사용자가 이미 swipe 한 셈이라 baseline 을 이전 페이지로 잡고 카운트
+                lastPageIdx = if (snapped) (firstPageIdx - 1).coerceAtLeast(0) else firstPageIdx
+                if (snapped) lastCountTime = now
+                Log.d(TAG, "[TT] For You 진입 H=$H scrollY=$scrollY idx=$firstPageIdx snapped=$snapped → baseline=$lastPageIdx")
+                return Outcome(entered = true, scrolled = snapped)
             }
-
-            // 진입 직후 노이즈 무시 (탭 전환 직후 fling 잔여 이벤트 등)
-            if (now - modeEnteredTime < NOISE_MS) return Outcome.NONE
 
             // 현재 페이지 인덱스(반올림). lastPageIdx 와 같으면 fling 중 — 스킵.
             val pageIdx = (scrollY + H / 2) / H

@@ -2065,8 +2065,11 @@ private fun StatsDaily(monthOffset: Int, onMonthOffsetChange: (Int) -> Unit) {
                         if (!isFuture) {
                             cellMod = cellMod.clickable { selectedDayMs = cellMs }
                         }
-                        Box(modifier = cellMod, contentAlignment = Alignment.Center) {
-                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        Box(modifier = cellMod, contentAlignment = Alignment.TopCenter) {
+                            Column(
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                                modifier = Modifier.padding(top = 3.dp)
+                            ) {
                                 Text(
                                     text = dayNum.toString(),
                                     fontSize = 13.sp,
@@ -2075,12 +2078,14 @@ private fun StatsDaily(monthOffset: Int, onMonthOffsetChange: (Int) -> Unit) {
                                         isFuture -> Color(0xFFCCCCCC)
                                         intensity > 0.55f -> Color.White
                                         else -> Color(0xFF1A1A1A)
-                                    }
+                                    },
+                                    lineHeight = 14.sp
                                 )
                                 if (count > 0) {
                                     Text(
                                         text = count.toString(),
                                         fontSize = 10.sp,
+                                        lineHeight = 11.sp,
                                         color = if (intensity > 0.55f) Color.White else Color(0xFF555555)
                                     )
                                 }
@@ -2955,7 +2960,12 @@ private suspend fun pushLimitToServer(userId: String, hourlyLimit: Int, dailyLim
                 .addHeader("Authorization", "Bearer $token")
                 .post(body)
                 .build()
-            val client = OkHttpClient()
+            // Railway 콜드 스타트가 최대 30초 → 타임아웃 30초로 늘림(기본 10초면 첫 요청 실패)
+            val client = OkHttpClient.Builder()
+                .connectTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+                .readTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+                .writeTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+                .build()
             val response = client.newCall(request).execute()
             val success = response.isSuccessful
             Log.d("LimitSync", "POST /limits 응답 — ${response.code} (success=$success)")
@@ -3012,7 +3022,13 @@ private suspend fun authedGetJson(url: String): org.json.JSONObject? = withConte
             .addHeader("Authorization", "Bearer $token")
             .get()
             .build()
-        val resp = OkHttpClient().newCall(req).execute()
+        // Railway 콜드 스타트가 최대 30초 → 타임아웃 30초로 늘림(기본 10초면 통계 GET 다 실패해 0회로 표시됨)
+        val client = OkHttpClient.Builder()
+            .connectTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+            .readTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+            .writeTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+            .build()
+        val resp = client.newCall(req).execute()
         val body = resp.body?.string()
         val ok = resp.isSuccessful
         resp.close()
@@ -3150,7 +3166,13 @@ private suspend fun deleteAccountOnServer(userId: String): Boolean {
                 .addHeader("Authorization", "Bearer $token")
                 .delete()
                 .build()
-            val response = OkHttpClient().newCall(request).execute()
+            // Railway 콜드 스타트 대비 — 타임아웃 30초
+            val client = OkHttpClient.Builder()
+                .connectTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+                .readTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+                .writeTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+                .build()
+            val response = client.newCall(request).execute()
             val success = response.isSuccessful
             Log.d("AccountDelete", "DELETE /users 응답 — ${response.code} (success=$success)")
             response.close()

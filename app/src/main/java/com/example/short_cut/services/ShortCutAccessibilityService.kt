@@ -254,6 +254,16 @@ class ShortCutAccessibilityService : AccessibilityService() {
         if (startToday == todayStartMs) return
 
         Log.d(TAG, "자정 롤오버 감지 → 상태 재설정")
+
+        // 롤오버 전 어제 날짜·limit 스냅샷 후 서버에 통계 확정 저장
+        // (과거 통계에 "그날 적용됐던 한도"가 남도록 — 현재 한도로 덮이지 않게)
+        val yesterdayDate = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US).apply {
+            timeZone = java.util.TimeZone.getTimeZone("Asia/Seoul")
+        }.format(java.util.Date(todayStartMs))
+        val snapHourly = hourlyLimit
+        val snapDaily  = dailyLimit
+        serviceScope.launch { finalizeStats(userId, yesterdayDate, snapHourly, snapDaily) }
+
         // 날짜가 바뀌기 전에 이전 날 배치를 먼저 flush — batchFirstScrollMs(이전 날 시각)로 전송돼
         // 어제 스크롤이 어제 날짜로 집계됨
         flushBatch()
@@ -300,21 +310,18 @@ class ShortCutAccessibilityService : AccessibilityService() {
         // detector 에 위임
         val outcome = detector.onEvent(this, event)
 
-        // 5분 차단 기간 중 — 쇼츠 모드라면 계속 BACK 으로 밀어냄.
-        // (HOME 보내면 앱 강종 후 쇼츠로 재진입할 때마다 폰 홈으로 튕겨서 앱 자체를 못 쓰게 됨 → BACK 으로 앱 안 다른 화면으로 보냄)
+        // 5분 차단 기간 중 — 쇼츠/릴스 진입(entered) 또는 안에서 스와이프(scrolled) 할 때마다 BACK 으로 밀어냄.
+        // 진입 시점에만 popup 표시. CONTENT_CHANGED 같은 outcome=NONE 이벤트로는 BACK 발사 안 함
+        // (예전 코드처럼 모든 이벤트에 BACK 발사하면 IG 일반 피드 진입할 때 잠깐 노출되는 reel_pager 노드까지
+        //  잡혀서 BACK 무한 루프로 앱 자체에 못 들어가는 문제 발생 → outcome 기반으로 정확히 쇼츠 행위 시에만 차단).
         if (detector.inShortsMode && now < stopUntilMs) {
             if (outcome.entered) {
                 val remaining = ((stopUntilMs - now) / 1000).toInt() + 1
                 Log.d(TAG, "차단 기간 중 쇼츠 진입 시도 (${detector.packageName}) — 남은 ${remaining}초")
                 showBlockPopup(remaining)
             }
-            // WINDOW_STATE/CONTENT/SCROLLED 변화 때만 BACK — 다른 작은 이벤트로 매번 호출되는 것 방지
-            when (event.eventType) {
-                AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED,
-                AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED,
-                AccessibilityEvent.TYPE_VIEW_SCROLLED -> {
-                    performGlobalAction(GLOBAL_ACTION_BACK)
-                }
+            if (outcome.entered || outcome.scrolled) {
+                performGlobalAction(GLOBAL_ACTION_BACK)
             }
             return
         }
@@ -723,7 +730,7 @@ class ShortCutAccessibilityService : AccessibilityService() {
             // 마지막 popup 도 사라짐 → 진짜 ignore 처리
             isPopupShowing = false
             removeScrim()
-            sendViolation(type, lastHourlyCount, "ignore")
+            sendViolation(type, lastHourlyCount, dailyCount, "ignore")
             clearPendingPopup()
             Log.d(TAG, "스택 popup 전부 처리 → ignore 완료")
         } else {
@@ -1008,21 +1015,28 @@ class ShortCutAccessibilityService : AccessibilityService() {
 
     // ── 사용자 응답 처리 액션 ─────────────────────────────────
 
-    // 그만하기 — 5분 차단 시작, popup 전부 dismiss, 홈으로 강제 이동
+    // 그만하기 — 5분 차단 시작, popup 전부 dismiss, 화면 빠져나가기.
+    // 인스타는 앱 전체가 아닌 릴스만 차단 대상 → BACK 으로 릴스 화면만 닫고 IG 일반 화면(피드/검색/DM)은 계속 이용 가능.
+    // YT/TikTok 은 기존대로 HOME (이쪽은 앱 자체가 쇼츠 비중 큼).
+    // 5분 차단 기간 중 다시 릴스/쇼츠에 들어가면 onAccessibilityEvent 의 stopUntilMs 분기가 BACK 으로 또 밀어냄.
     private fun executeStop(type: String) {
         val now = System.currentTimeMillis()
         stopUntilMs = now + STOP_BLOCK_MS
         savePersistedState()
-        sendViolation(type, lastHourlyCount, "stop")
+        sendViolation(type, lastHourlyCount, dailyCount, "stop")
         clearPendingPopup()
         dismissAllPopups()
         Log.d(TAG, "그만하기 선택 → 5분 차단 시작")
-        performGlobalAction(GLOBAL_ACTION_HOME)
+        // 현재 쇼츠 모드 detector 중 인스타가 있으면 BACK, 아니면 HOME
+        val isInstagram = detectors.any {
+            it.packageName == "com.instagram.android" && it.inShortsMode
+        }
+        performGlobalAction(if (isInstagram) GLOBAL_ACTION_BACK else GLOBAL_ACTION_HOME)
     }
 
     // 무시하기 (variant 4 제외) — popup 전부 dismiss + violation 전송
     private fun executeIgnore(type: String) {
-        sendViolation(type, lastHourlyCount, "ignore")
+        sendViolation(type, lastHourlyCount, dailyCount, "ignore")
         clearPendingPopup()
         dismissAllPopups()
         Log.d(TAG, "무시하기 선택 → 다음 milestone 까지 대기")
@@ -1074,7 +1088,8 @@ class ShortCutAccessibilityService : AccessibilityService() {
     }
 
     // violation 발생 시 서버로 POST /violations 전송
-    private fun sendViolation(limitType: String, scrollCount: Int, action: String) {
+    // 서버 계약: scrollCount(단일) → hourlyScrollCount + dailyScrollCount 두 필드로 분리(2026-05-31).
+    private fun sendViolation(limitType: String, hourlyScrollCount: Int, dailyScrollCount: Int, action: String) {
         val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
         val userId = prefs.getString("userId", "unknown") ?: "unknown"
 
@@ -1083,7 +1098,8 @@ class ShortCutAccessibilityService : AccessibilityService() {
             "userId": "$userId",
             "timestamp": ${System.currentTimeMillis()},
             "limitType": "$limitType",
-            "scrollCount": $scrollCount,
+            "hourlyScrollCount": $hourlyScrollCount,
+            "dailyScrollCount": $dailyScrollCount,
             "action": "$action",
             "platform": "${platformOf(lastScrollPkg)}"
         }
@@ -1111,6 +1127,35 @@ class ShortCutAccessibilityService : AccessibilityService() {
             } catch (e: Exception) {
                 Log.e(TAG, "violation 전송 실패 — ${e.message}")
             }
+        }
+    }
+
+    // 자정 롤오버 시 호출 — 어제 날짜와 "그때 적용됐던" hourly/daily limit 스냅샷을 서버에 보내
+    // 과거 통계가 현재 한도로 덮이지 않게 확정 저장(POST /stats/:userId/daily/finalize).
+    // 실패는 치명적 X (서버가 재계산 가능) — 토큰 없거나 네트워크 안 되면 그냥 로그만 남기고 종료.
+    private suspend fun finalizeStats(userId: String, date: String, hourlyLimitSnap: Int, dailyLimitSnap: Int) {
+        try {
+            val token = getFirebaseToken() ?: run {
+                Log.e(TAG, "finalize 전송 실패 — 토큰 없음 (date=$date)")
+                return
+            }
+            val json = """{"date":"$date","dailyLimit":$dailyLimitSnap,"hourlyLimit":$hourlyLimitSnap}"""
+            val client = okhttp3.OkHttpClient.Builder()
+                .connectTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+                .readTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+                .writeTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+                .build()
+            val body = json.toRequestBody("application/json".toMediaType())
+            val request = okhttp3.Request.Builder()
+                .url("https://short-cut-server-production.up.railway.app/stats/$userId/daily/finalize")
+                .addHeader("Authorization", "Bearer $token")
+                .post(body)
+                .build()
+            val response = client.newCall(request).execute()
+            Log.d(TAG, "daily finalize 전송 완료 — date=$date, code=${response.code}")
+            response.close()
+        } catch (e: Exception) {
+            Log.e(TAG, "daily finalize 전송 실패 — date=$date, ${e.message}")
         }
     }
 
