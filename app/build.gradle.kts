@@ -59,6 +59,9 @@ dependencies {
     // OkHttp — REST API HTTP 요청용 라이브러리 (POST /violations 전송에 사용)
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
 
+    // WorkManager — 주간 리포트(일요일 저녁) 백그라운드 스케줄링용
+    implementation("androidx.work:work-runtime-ktx:2.9.1")
+
     // Firebase BoM — Firebase 라이브러리 버전 통합 관리
     implementation(platform("com.google.firebase:firebase-bom:33.7.0"))
 

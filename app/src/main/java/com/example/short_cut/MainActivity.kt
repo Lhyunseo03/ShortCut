@@ -3,6 +3,7 @@ package com.example.short_cut
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
@@ -95,8 +96,20 @@ enum class Screen {
 }
 
 class MainActivity : ComponentActivity() {
+    // Android 13+ 알림 권한 런처 — 거부해도 다른 기능엔 영향 없고 주간 리포트 알림만 안 뜸
+    private val requestNotifPermission =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { /* 결과 무시 */ }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // 주간 리포트 알림용 권한 (Android 13+). 이미 있거나 하위 버전이면 그냥 패스.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            androidx.core.content.ContextCompat.checkSelfPermission(
+                this, android.Manifest.permission.POST_NOTIFICATIONS
+            ) != android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) {
+            requestNotifPermission.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+        }
         setContent {
             ShortCutTheme {
                 AppRoot()
@@ -115,8 +128,9 @@ fun AppRoot() {
 
     fun resolveScreen(): Screen = when {
         auth.currentUser == null -> Screen.LOGIN
-        // 접근성 또는 사용 통계 둘 중 하나라도 OFF 면 권한 안내로 — 두 권한 다 켜야 우회 차단 안전망 완성
-        !isAccessibilityServiceEnabled(context) || !hasUsageStatsPermission(context) -> Screen.ACCESSIBILITY_GUIDE
+        // 접근성·사용통계·오버레이 셋 중 하나라도 OFF 면 권한 안내로 — 셋 다 켜야 우회 차단 안전망 완성.
+        // 오버레이('다른 앱 위에 표시')가 없으면 접근성 OFF 시 가드가 홈으로 못 보냄(백그라운드 액티비티 시작 제한).
+        !isAccessibilityServiceEnabled(context) || !hasUsageStatsPermission(context) || !hasOverlayPermission(context) -> Screen.ACCESSIBILITY_GUIDE
         else -> Screen.HOME
     }
 
@@ -130,6 +144,10 @@ fun AppRoot() {
                 // 사용 통계 권한이 있으면 GuardForegroundService 시작(이미 실행 중이면 무시)
                 // — 접근성 OFF 우회 차단용. 권한이 없으면 그냥 패스.
                 startGuardServiceIfReady(context)
+                // 로그인 상태면 주간 리포트(일요일 저녁) 예약 — REPLACE 라 매 resume 마다 다음 일요일로 맞춰짐
+                if (auth.currentUser != null) {
+                    com.example.short_cut.services.WeeklyReportScheduler.schedule(context)
+                }
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
@@ -184,6 +202,13 @@ private fun hasUsageStatsPermission(context: Context): Boolean {
     }
     return mode == android.app.AppOpsManager.MODE_ALLOWED
 }
+
+// '다른 앱 위에 표시'(SYSTEM_ALERT_WINDOW) 권한 부여 여부.
+// 접근성 OFF 시 GuardForegroundService 가 백그라운드에서 홈 인텐트를 실행하려면 이 권한이 필요하다.
+// Android 10+ 의 '백그라운드 액티비티 시작 제한' 때문에, 이 권한이 없으면 startActivity(home) 가
+// 조용히 무시돼 "타겟앱 감지는 되는데 홈으로 안 가는" 증상이 생긴다. 이 권한이 있으면 제한이 면제됨.
+private fun hasOverlayPermission(context: Context): Boolean =
+    Settings.canDrawOverlays(context)
 
 // GuardForegroundService 시작 — 사용 통계 권한 있을 때만. 이미 실행 중이면 시스템이 무시.
 private fun startGuardServiceIfReady(context: Context) {
@@ -333,6 +358,7 @@ fun AccessibilityGuideScreen() {
     }
     val accessibilityOn = remember(refreshKey) { isAccessibilityServiceEnabled(context) }
     val usageStatsOn = remember(refreshKey) { hasUsageStatsPermission(context) }
+    val overlayOn = remember(refreshKey) { hasOverlayPermission(context) }
 
     Box(
         modifier = Modifier
@@ -376,6 +402,21 @@ fun AccessibilityGuideScreen() {
                 description = "접근성 권한이 꺼졌을 때 우회 차단(타겟 앱 진입 시 홈으로 이동)",
                 granted = usageStatsOn,
                 onClick = { context.startActivity(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS)) }
+            )
+
+            // 다른 앱 위에 표시 권한 행 — 접근성 OFF 시 가드가 홈으로 보낼 수 있게 하는 핵심 권한
+            PermissionRow(
+                title = "다른 앱 위에 표시",
+                description = "접근성이 꺼진 상태에서도 타겟 앱을 감지하면 홈으로 보낼 수 있게 함 (없으면 차단이 동작하지 않음)",
+                granted = overlayOn,
+                onClick = {
+                    context.startActivity(
+                        Intent(
+                            Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                            Uri.fromParts("package", context.packageName, null)
+                        )
+                    )
+                }
             )
         }
     }
@@ -594,8 +635,12 @@ private fun SectionTitle(text: String) {
     )
 }
 
-// 한도값 입력 — +/− 버튼 대신 숫자 키보드로 직접 입력. minValue 미만이면 minValue 로 보정.
-// step 은 placeholder 힌트로만 쓰임 (자유 입력이라 강제 안 함).
+// 값을 step 그리드로 내림 정렬 (minValue 하한). 과거 자유 입력으로 저장된 비-배수 값도 자동 보정.
+private fun snapToStep(v: Int, step: Int, minValue: Int): Int =
+    ((v / step) * step).coerceAtLeast(minValue)
+
+// 한도값 입력 — −/＋ 스테퍼로 step 단위(daily 100 / hourly 10)로만 변경 가능.
+// 자유 입력을 막아 항상 step 의 배수만 설정되도록 한다. minValue 미만으로는 못 내려감.
 @Composable
 private fun LimitRow(
     label: String,
@@ -604,8 +649,6 @@ private fun LimitRow(
     minValue: Int,
     onChange: (Int) -> Unit
 ) {
-    // 입력 도중 비어있는 상태("")를 허용해야 사용자가 전체 지우고 다시 칠 수 있음
-    var text by remember(value) { mutableStateOf(value.toString()) }
     Row(
         modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
         verticalAlignment = Alignment.CenterVertically,
@@ -618,25 +661,42 @@ private fun LimitRow(
             color = Color(0xFF1A1A1A)
         )
         Row(verticalAlignment = Alignment.CenterVertically) {
-            OutlinedTextField(
-                value = text,
-                onValueChange = { input ->
-                    val filtered = input.filter { it.isDigit() }.take(6)
-                    text = filtered
-                    val parsed = filtered.toIntOrNull()
-                    if (parsed != null) onChange(parsed.coerceAtLeast(minValue))
-                },
-                modifier = Modifier.widthIn(min = 110.dp, max = 150.dp),
-                singleLine = true,
-                placeholder = { Text("${step} 단위", fontSize = 12.sp, color = Color(0xFFAAAAAA)) },
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                shape = RoundedCornerShape(8.dp)
-            )
+            // − : 다음 낮은 step 그리드로 (예: 150 → 100), minValue 하한
+            StepButton(symbol = "−", enabled = value > minValue) {
+                onChange((((value - 1) / step) * step).coerceAtLeast(minValue))
+            }
             Text(
-                "회",
-                fontSize = 14.sp,
-                color = Color(0xFF555555),
-                modifier = Modifier.padding(start = 6.dp)
+                text = "${value}회",
+                fontSize = 16.sp,
+                fontWeight = FontWeight.Bold,
+                color = Color(0xFF1A1A1A),
+                textAlign = TextAlign.Center,
+                modifier = Modifier.widthIn(min = 72.dp).padding(horizontal = 4.dp)
+            )
+            // ＋ : 다음 높은 step 그리드로 (예: 150 → 200)
+            StepButton(symbol = "＋", enabled = true) {
+                onChange(((value / step) + 1) * step)
+            }
+        }
+    }
+}
+
+// 한도 −/＋ 버튼 — 비활성(하한 도달)이면 흐리게.
+@Composable
+private fun StepButton(symbol: String, enabled: Boolean, onClick: () -> Unit) {
+    Surface(
+        modifier = Modifier
+            .size(40.dp)
+            .clickable(enabled = enabled, onClick = onClick),
+        shape = RoundedCornerShape(8.dp),
+        color = if (enabled) Color(0xFF1A1A1A) else Color(0xFFE0E0E0)
+    ) {
+        Box(contentAlignment = Alignment.Center) {
+            Text(
+                text = symbol,
+                fontSize = 20.sp,
+                fontWeight = FontWeight.Bold,
+                color = if (enabled) Color.White else Color(0xFFAAAAAA)
             )
         }
     }
@@ -2564,99 +2624,135 @@ private fun mondayOf(timeMs: Long): Long {
 
 // 한 주의 막대 그래프 — counts 는 [월, 화, 수, 목, 금, 토, 일] 순서.
 // dailyLimit 기준으로 막대 색: 이내(달성) 초록, 초과 빨강. 한도 0(미설정) 이면 기존 검정.
+// 그 주의 데일리 리밋을 가로 점선으로 겹쳐 표시 — 막대와 같은 스케일을 공유해
+// 어느 날이 한도를 넘었는지(빨강 + 점선 위로 솟음) 한 눈에 보이게 한다.
 @Composable
 private fun WeekBarChart(counts: List<Int>, dailyLimit: Int) {
     val dayLabels = listOf("월", "화", "수", "목", "금", "토", "일")
     val maxCount = counts.max().coerceAtLeast(1)
-
-    Row(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(horizontal = 8.dp, vertical = 8.dp),
-        horizontalArrangement = Arrangement.spacedBy(4.dp),
-        verticalAlignment = Alignment.Bottom
-    ) {
-        counts.forEachIndexed { idx, count ->
-            val barColor = when {
-                dailyLimit <= 0 -> Color(0xFF1A1A1A)
-                count == 0 -> Color(0xFF1A1A1A)  // 활동 없음 — 표시 안 되니까 그냥 기본값
-                count <= dailyLimit -> Color(0xFF2E7D32)
-                else -> Color(0xFFC62828)
-            }
-            BarColumn(
-                count = count,
-                maxCount = maxCount,
-                label = dayLabels[idx],
-                barColor = barColor,
-                modifier = Modifier.weight(1f)
-            )
-        }
-    }
-}
-
-// 막대 하나 — count=0 이면 회색 placeholder, 그 외엔 barColor 막대
-@Composable
-private fun BarColumn(
-    count: Int,
-    maxCount: Int,
-    label: String,
-    barColor: Color = Color(0xFF1A1A1A),
-    modifier: Modifier = Modifier
-) {
-    val fraction = (count.toFloat() / maxCount).coerceIn(0f, 1f)
+    // 점선이 항상 화면 안에 보이도록 막대·점선이 같은 y 스케일을 공유 (한도가 최댓값보다 커도 잘리지 않음)
+    val scale = (if (dailyLimit > 0) maxOf(maxCount, dailyLimit) else maxCount).coerceAtLeast(1)
 
     Column(
-        modifier = modifier.fillMaxHeight(),
-        horizontalAlignment = Alignment.CenterHorizontally
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(horizontal = 8.dp, vertical = 8.dp)
     ) {
-        Text(
-            text = if (count > 0) "$count" else "",
-            fontSize = 11.sp,
-            color = Color(0xFF666666),
-            modifier = Modifier.padding(bottom = 4.dp)
-        )
-
-        // 막대 영역 — 빈 공간(위) + 막대(아래) 를 weight 로 비율 제어
-        Column(
-            modifier = Modifier
-                .weight(1f)
-                .fillMaxWidth(),
-            verticalArrangement = Arrangement.Bottom,
-            horizontalAlignment = Alignment.CenterHorizontally
-        ) {
-            if (count == 0) {
-                // 미래/빈 요일 — 회색 얇은 placeholder
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth(0.6f)
-                        .height(4.dp)
-                        .background(Color(0xFFEEEEEE), RoundedCornerShape(2.dp))
-                )
-            } else {
-                // 그 주 최댓값 막대는 fraction == 1f → Spacer.weight(0f) 가 되어 크래시.
-                // fraction < 1f 일 때만 위쪽 Spacer 추가.
-                if (fraction < 1f) {
-                    Spacer(modifier = Modifier.weight(1f - fraction))
+        // 플롯 영역 — 막대 Row + 한도 점선 Canvas 오버레이 (둘 다 이 Box 높이를 기준으로)
+        Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
+            Row(
+                modifier = Modifier.fillMaxSize(),
+                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                verticalAlignment = Alignment.Bottom
+            ) {
+                counts.forEachIndexed { idx, count ->
+                    val barColor = when {
+                        dailyLimit <= 0 -> Color(0xFF1A1A1A)
+                        count == 0 -> Color(0xFF1A1A1A)  // 활동 없음 — 표시 안 되니까 그냥 기본값
+                        count <= dailyLimit -> Color(0xFF2E7D32)
+                        else -> Color(0xFFC62828)
+                    }
+                    WeekBar(
+                        count = count,
+                        scale = scale,
+                        barColor = barColor,
+                        modifier = Modifier.weight(1f)
+                    )
                 }
-                Box(
-                    modifier = Modifier
-                        .weight(fraction)
-                        .fillMaxWidth(0.7f)
-                        .background(
-                            color = barColor,
-                            shape = RoundedCornerShape(topStart = 6.dp, topEnd = 6.dp)
-                        )
-                )
+            }
+            // 데일리 리밋 — 주황 가로 점선 (플롯 높이 기준, 막대와 동일 스케일)
+            if (dailyLimit > 0) {
+                Canvas(modifier = Modifier.fillMaxSize()) {
+                    val y = size.height * (1f - dailyLimit.toFloat() / scale)
+                    drawLine(
+                        color = Color(0xFFFF8F00),
+                        start = Offset(0f, y),
+                        end = Offset(size.width, y),
+                        strokeWidth = 3f,
+                        pathEffect = PathEffect.dashPathEffect(floatArrayOf(14f, 10f))
+                    )
+                }
             }
         }
 
         Spacer(modifier = Modifier.height(6.dp))
-        Text(
-            text = label,
-            fontSize = 12.sp,
-            fontWeight = FontWeight.SemiBold,
-            color = Color(0xFF1A1A1A)
-        )
+
+        // 요일 라벨 — 막대와 같은 weight/간격으로 정렬
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(4.dp)
+        ) {
+            dayLabels.forEach { label ->
+                Text(
+                    text = label,
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = Color(0xFF1A1A1A),
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.weight(1f)
+                )
+            }
+        }
+
+        // 한도 점선 범례
+        if (dailyLimit > 0) {
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(top = 6.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Box(modifier = Modifier.size(width = 18.dp, height = 3.dp).background(Color(0xFFFF8F00)))
+                Spacer(Modifier.width(6.dp))
+                Text("daily limit (${dailyLimit}회)", fontSize = 11.sp, color = Color(0xFF888888))
+            }
+        }
+    }
+}
+
+// 막대 하나 — count=0 이면 회색 placeholder, 그 외엔 barColor 막대.
+// fraction 은 플롯 영역(부모 Box) 높이 기준이라 한도 점선과 정확히 같은 스케일.
+@Composable
+private fun WeekBar(
+    count: Int,
+    scale: Int,
+    barColor: Color = Color(0xFF1A1A1A),
+    modifier: Modifier = Modifier
+) {
+    val fraction = (count.toFloat() / scale).coerceIn(0f, 1f)
+
+    Column(
+        modifier = modifier.fillMaxHeight(),
+        verticalArrangement = Arrangement.Bottom,
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        if (count == 0) {
+            // 미래/빈 요일 — 회색 얇은 placeholder
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth(0.6f)
+                    .height(4.dp)
+                    .background(Color(0xFFEEEEEE), RoundedCornerShape(2.dp))
+            )
+        } else {
+            Text(
+                text = "$count",
+                fontSize = 10.sp,
+                color = Color(0xFF666666),
+                modifier = Modifier.padding(bottom = 2.dp)
+            )
+            // 최댓값 막대는 fraction == 1f → Spacer.weight(0f) 크래시 방지로 fraction<1f 일 때만 위 Spacer
+            if (fraction < 1f) {
+                Spacer(modifier = Modifier.weight(1f - fraction))
+            }
+            Box(
+                modifier = Modifier
+                    .weight(fraction.coerceAtLeast(0.0001f))
+                    .fillMaxWidth(0.7f)
+                    .background(
+                        color = barColor,
+                        shape = RoundedCornerShape(topStart = 6.dp, topEnd = 6.dp)
+                    )
+            )
+        }
     }
 }
 
@@ -3044,8 +3140,9 @@ private fun SettingsLimitScreen(onBack: () -> Unit) {
                 currentDaily = limit.dailyLimit
                 pendingHourly = limit.pendingHourlyLimit
                 pendingDaily = limit.pendingDailyLimit
-                draftHourly = limit.pendingHourlyLimit ?: limit.hourlyLimit
-                draftDaily = limit.pendingDailyLimit ?: limit.dailyLimit
+                // step 그리드로 보정 — 과거 자유 입력으로 저장된 비-배수 값 정규화
+                draftHourly = snapToStep(limit.pendingHourlyLimit ?: limit.hourlyLimit, 10, 10)
+                draftDaily = snapToStep(limit.pendingDailyLimit ?: limit.dailyLimit, 100, 100)
             } else {
                 draftHourly = currentHourly
                 draftDaily = currentDaily
@@ -3054,10 +3151,10 @@ private fun SettingsLimitScreen(onBack: () -> Unit) {
         loaded = true
     }
 
-    // 내일 적용 예정 값 (저장 직전에는 pending, 미설정시엔 current)
-    val tomorrowHourly = pendingHourly ?: currentHourly
-    val tomorrowDaily = pendingDaily ?: currentDaily
-    val canCommit = loaded && (draftHourly != tomorrowHourly || draftDaily != tomorrowDaily)
+    // 다음 주 적용 예정 값 (pending 있으면 그 값, 없으면 현재 적용값)
+    val nextWeekHourly = pendingHourly ?: currentHourly
+    val nextWeekDaily = pendingDaily ?: currentDaily
+    val canCommit = loaded && (draftHourly != nextWeekHourly || draftDaily != nextWeekDaily)
 
     // 헤더 + 스크롤 가능 컨텐츠 + 하단 고정 버튼 구조
     // 컨텐츠가 길어져도 변경하기 버튼이 화면 밖으로 잘리지 않도록
@@ -3089,7 +3186,7 @@ private fun SettingsLimitScreen(onBack: () -> Unit) {
         ) {
             // 내일 적용 예정 — pending 이 있을 때만 표시
             if (pendingHourly != null || pendingDaily != null) {
-                SectionTitle("내일부터 적용 예정")
+                SectionTitle("다음 주 월요일부터 적용 예정")
                 InfoRow("Daily Limit", "${pendingDaily ?: currentDaily}회")
                 InfoRow("Hourly Limit", "${pendingHourly ?: currentHourly}회")
                 Spacer(Modifier.height(4.dp))
@@ -3144,7 +3241,7 @@ private fun SettingsLimitScreen(onBack: () -> Unit) {
         AlertDialog(
             onDismissRequest = { showConfirm = false },
             title = { Text("Limit 변경") },
-            text = { Text("다음날부터 적용됩니다. 바꾸시겠습니까?") },
+            text = { Text("다음 주 월요일부터 한 주 동안 적용됩니다. 바꾸시겠습니까?") },
             confirmButton = {
                 TextButton(onClick = {
                     if (userId == null) {
@@ -3157,7 +3254,7 @@ private fun SettingsLimitScreen(onBack: () -> Unit) {
                         val newPendingHourly = if (draftHourly != currentHourly) draftHourly else null
                         val newPendingDaily = if (draftDaily != currentDaily) draftDaily else null
                         val effectiveAt =
-                            if (newPendingHourly != null || newPendingDaily != null) startOfTomorrowMs()
+                            if (newPendingHourly != null || newPendingDaily != null) startOfNextMondayMs()
                             else null
                         db.userLimitDao().insert(
                             UserLimit(
@@ -3171,8 +3268,8 @@ private fun SettingsLimitScreen(onBack: () -> Unit) {
                         )
                         // 서버에도 새 값 push (draft 기준으로 — 서버는 pending 개념 없으니 새 limit 으로 즉시 동기화)
                         val ok = pushLimitToServer(userId, draftHourly, draftDaily)
-                        val msg = if (ok) "내일부터 새 limit 적용 (서버 동기화 완료)"
-                                  else "내일부터 새 limit 적용 (서버 동기화 실패)"
+                        val msg = if (ok) "다음 주 월요일부터 새 limit 적용 (서버 동기화 완료)"
+                                  else "다음 주 월요일부터 새 limit 적용 (서버 동기화 실패)"
                         Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
                         showConfirm = false
                         onBack()
@@ -3213,6 +3310,23 @@ private fun startOfDayMs(offset: Int = 0): Long {
 
 // 내일 자정 0시 (local) Unix ms — limit 변경이 effective 가 되는 시각
 private fun startOfTomorrowMs(): Long = startOfDayMs(1)
+
+// '다음 주' 월요일 0시 (local) Unix ms — limit 변경이 effective 가 되는 시각.
+// 주간 단위 적용: 오늘이 무슨 요일이든 이번 주 월요일 + 7일 = 다음 주 월요일.
+// 한 번 승격되면 다음 변경(역시 다음 주 월요일 예약) 전까지 그 값이 한 주 내내 고정된다.
+private fun startOfNextMondayMs(): Long {
+    val cal = Calendar.getInstance().apply {
+        set(Calendar.HOUR_OF_DAY, 0)
+        set(Calendar.MINUTE, 0)
+        set(Calendar.SECOND, 0)
+        set(Calendar.MILLISECOND, 0)
+    }
+    // Calendar.DAY_OF_WEEK: SUNDAY=1, MONDAY=2, ..., SATURDAY=7 → 월=0 ... 일=6
+    val daysFromMonday = (cal.get(Calendar.DAY_OF_WEEK) + 5) % 7
+    cal.add(Calendar.DAY_OF_YEAR, -daysFromMonday) // 이번 주 월요일 00:00
+    cal.add(Calendar.DAY_OF_YEAR, 7)               // 다음 주 월요일 00:00
+    return cal.timeInMillis
+}
 
 // POST /limits/:userId — 서버에 새 limit 동기화
 // Firebase ID 토큰을 Authorization: Bearer 헤더로 전송 (서버 미들웨어가 검증)

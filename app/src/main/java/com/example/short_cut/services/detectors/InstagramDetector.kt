@@ -22,7 +22,11 @@ class InstagramDetector : AppDetector(PACKAGE) {
     companion object {
         const val PACKAGE = "com.instagram.android"
         const val REEL_PAGER_ID = "com.instagram.android:id/clips_viewer_view_pager"
-        const val NOISE_MS = 1500L
+        // 진입 직후 ViewPager inflate/settle 버스트만 거르는 짧은 창.
+        // 과거 1500ms 는 진입 1.5초 안의 첫 스와이프까지 같이 삼켜 "첫 스크롤 씹힘"의 원인이었다.
+        // 가짜 이벤트는 dy==0 필터 + accumDy>=0.9*H 임계값이 이미 걸러주므로 짧게 둬도 안전.
+        // (정확한 값은 실기기 logcat 으로 조정 — 진입 settle 이 더 길면 소폭 늘릴 것)
+        const val NOISE_MS = 400L
         // 한 페이지 이동으로 인정할 dy 누적 임계값 — H 의 90% (snap 안 끝난 fling 도 충분히 잡힘)
         const val PAGE_THRESHOLD_NUM = 9
         const val PAGE_THRESHOLD_DEN = 10

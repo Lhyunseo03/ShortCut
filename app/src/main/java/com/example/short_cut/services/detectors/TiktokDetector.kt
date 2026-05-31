@@ -68,8 +68,12 @@ class TiktokDetector(packageName: String) : AppDetector(packageName) {
                 val firstPageIdx = (scrollY + H / 2) / H
                 val tol = H / SNAP_TOLERANCE_DIV
                 val snapped = firstPageIdx > 0 && Math.abs(scrollY - firstPageIdx * H) <= tol
-                // snap 된 채 진입했다면 사용자가 이미 swipe 한 셈이라 baseline 을 이전 페이지로 잡고 카운트
-                lastPageIdx = if (snapped) (firstPageIdx - 1).coerceAtLeast(0) else firstPageIdx
+                // baseline 설정:
+                //  - snapped: 이미 스와이프 완료된 채 진입 → 이전 페이지를 baseline 으로 잡고 이번 진입에서 카운트.
+                //  - 그 외(fling 중간에 첫 SCROLLED 도착 포함): 목적지(반올림)가 아니라 출발 페이지(내림 floor)를
+                //    baseline 으로. 이렇게 해야 뒤따르는 snap 완료 이벤트의 pageIdx 가 baseline 과 달라져 첫 스크롤이
+                //    카운트된다. (과거엔 반올림한 목적지를 baseline 으로 잡아 완료 이벤트가 dedup 돼 첫 스크롤이 씹혔음)
+                lastPageIdx = if (snapped) (firstPageIdx - 1).coerceAtLeast(0) else (scrollY / H)
                 if (snapped) lastCountTime = now
                 Log.d(TAG, "[TT] For You 진입 H=$H scrollY=$scrollY idx=$firstPageIdx snapped=$snapped → baseline=$lastPageIdx")
                 return Outcome(entered = true, scrolled = snapped)
