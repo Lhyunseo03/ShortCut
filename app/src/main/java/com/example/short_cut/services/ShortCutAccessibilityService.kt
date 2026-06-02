@@ -191,7 +191,10 @@ class ShortCutAccessibilityService : AccessibilityService() {
         }
 
         // pending limit 변경 예약이 만료됐으면 promote
-        userLimitDao.promoteExpiredPending(now)
+        // [변경됨] promoteExpiredPending → promoteAndSyncLimit:
+        //   서비스 시작 시점에 승격이 일어나면(주말 동안 앱을 안 열었다가 월요일 재시작 등)
+        //   그 순간 서버에도 새 한도를 동기화한다.
+        promoteAndSyncLimit(userId)
         val userLimit = userLimitDao.getLimit(userId)
         if (userLimit != null) {
             hourlyLimit = userLimit.hourlyLimit
@@ -272,7 +275,10 @@ class ShortCutAccessibilityService : AccessibilityService() {
         dailyMilestone = -1
 
         // pending limit 변경이 있었다면 새 날짜에 맞춰 적용
-        userLimitDao.promoteExpiredPending(now)
+        // [변경됨] promoteExpiredPending → promoteAndSyncLimit:
+        //   자정 롤오버(특히 월요일 0시)에 승격이 일어나면 그 순간 서버도 동기화한다.
+        //   ← 이 케이스가 "다음 주 월요일부터 적용"이 실제 발생하는 핵심 지점.
+        promoteAndSyncLimit(userId)
         userLimitDao.getLimit(userId)?.let {
             hourlyLimit = it.hourlyLimit
             dailyLimit = it.dailyLimit
@@ -1163,6 +1169,63 @@ class ShortCutAccessibilityService : AccessibilityService() {
         }
     }
 
+    // [신규] pending limit 승격 + (승격됐을 때만) 서버 동기화
+    // MainActivity.promoteAndSyncLimit 과 같은 목적의 서비스(백그라운드) 버전.
+    //
+    // [왜 필요한가]
+    //   새 한도는 "다음 주 월요일 0시"부터 적용된다. 그 시각엔 앱 UI 가 닫혀 있고
+    //   접근성 서비스만 떠 있는 경우가 대부분이다. 예전엔 서비스가 로컬 승격만 하고
+    //   서버엔 알리지 않아, UI 를 다시 열기 전까지 서버 한도가 옛 값 그대로 남았다.
+    //   (= 편집 시 즉시 push 하던 동작을 제거한 뒤 생기는 공백을 여기서 메운다.)
+    //
+    // [동작]
+    //   승격 대상(pendingEffectiveAt 도달)이 있으면 승격 후 새 한도를 서버에 push.
+    //   없으면 기존과 동일하게 로컬 정렬만 한다.
+    private suspend fun promoteAndSyncLimit(userId: String) {
+        val now = System.currentTimeMillis()
+        val limit = userLimitDao.getLimit(userId) ?: return
+
+        val effectiveAt = limit.pendingEffectiveAt
+        val willPromote = effectiveAt != null && effectiveAt <= now
+        val promotedHourly = limit.pendingHourlyLimit ?: limit.hourlyLimit
+        val promotedDaily  = limit.pendingDailyLimit  ?: limit.dailyLimit
+
+        // 로컬 승격 — 기존 동작 그대로
+        userLimitDao.promoteExpiredPending(now)
+
+        // 승격이 실제로 일어난 경우에만 서버 동기화 (네트워크는 serviceScope 로 분리)
+        if (willPromote) {
+            serviceScope.launch { pushLimitToServer(userId, promotedHourly, promotedDaily) }
+        }
+    }
+
+    // POST /limits/:userId — 승격된 "현재 적용 한도"를 서버에 반영 (finalizeStats 와 동일 패턴)
+    private suspend fun pushLimitToServer(userId: String, hourlyLimitSnap: Int, dailyLimitSnap: Int) {
+        try {
+            val token = getFirebaseToken() ?: run {
+                Log.e(TAG, "limit 동기화 실패 — 토큰 없음")
+                return
+            }
+            val json = """{"hourlyLimit":$hourlyLimitSnap,"dailyLimit":$dailyLimitSnap}"""
+            val client = okhttp3.OkHttpClient.Builder()
+                .connectTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+                .readTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+                .writeTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+                .build()
+            val body = json.toRequestBody("application/json".toMediaType())
+            val request = okhttp3.Request.Builder()
+                .url("https://short-cut-server-production.up.railway.app/limits/$userId")
+                .addHeader("Authorization", "Bearer $token")
+                .post(body)
+                .build()
+            val response = client.newCall(request).execute()
+            Log.d(TAG, "limit 동기화 전송 완료 — code=${response.code}")
+            response.close()
+        } catch (e: Exception) {
+            Log.e(TAG, "limit 동기화 전송 실패 — ${e.message}")
+        }
+    }
+
     // ── userlog pending 큐 (prefs 영속) ───────────────────────
     // 큐는 JSON 배열 [{"id":String,"ts":Long,"count":Int}, ...] 로 prefs 에 저장 — 앱이 강제종료돼도 살아남음.
     // 전송 성공이 확인된 항목만 큐에서 빠지므로, 네트워크/토큰 실패 시 스크롤이 유실되지 않음.
@@ -1277,7 +1340,7 @@ class ShortCutAccessibilityService : AccessibilityService() {
                 val keepLooping = synchronized(pendingLock) {
                     val current = readPendingLocked()
                     val newer = if (current.size > queue.size) current.subList(queue.size, current.size).toList()
-                                else emptyList()
+                    else emptyList()
                     writePendingLocked(failed + newer)
                     // 실패가 있으면 네트워크 불안정으로 보고 중단(다음 flush/시작 시 재시도). 없으면 newer 만큼 더 처리.
                     failed.isEmpty() && newer.isNotEmpty()

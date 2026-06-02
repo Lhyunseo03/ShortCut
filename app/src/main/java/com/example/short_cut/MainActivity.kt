@@ -572,7 +572,9 @@ private fun HomeTabContent() {
             lastHourCount = db.scrollHistoryDao().countLastHour(now - 60 * 60 * 1000)
             if (userId != null) {
                 // 만료된 pending 먼저 promote 해서 오늘 적용되는 값으로 정렬
-                db.userLimitDao().promoteExpiredPending(now)
+                // [변경됨] promoteExpiredPending → promoteAndSyncLimit:
+                //   승격(새 한도 적용)이 일어나는 그 순간 서버에도 새 값을 동기화한다.
+                promoteAndSyncLimit(db, userId)
                 db.userLimitDao().getLimit(userId)?.let {
                     dailyLimit = it.dailyLimit
                     hourlyLimit = it.hourlyLimit
@@ -874,7 +876,8 @@ private fun AiAnalysisContent(onBack: () -> Unit) {
             return@LaunchedEffect
         }
         try {
-            db.userLimitDao().promoteExpiredPending(System.currentTimeMillis())
+            // [변경됨] promoteExpiredPending → promoteAndSyncLimit (승격 시 서버 동기화 포함)
+            promoteAndSyncLimit(db, userId)
             val limit = db.userLimitDao().getLimit(userId)
             val dailyLimit = limit?.dailyLimit ?: 0
             val hourlyLimit = limit?.hourlyLimit ?: 0
@@ -3133,7 +3136,8 @@ private fun SettingsLimitScreen(onBack: () -> Unit) {
     LaunchedEffect(userId) {
         if (userId != null) {
             // 만료된 pending 먼저 승격
-            db.userLimitDao().promoteExpiredPending(System.currentTimeMillis())
+            // [변경됨] promoteExpiredPending → promoteAndSyncLimit (승격 시 서버 동기화 포함)
+            promoteAndSyncLimit(db, userId)
             val limit = db.userLimitDao().getLimit(userId)
             if (limit != null) {
                 currentHourly = limit.hourlyLimit
@@ -3266,11 +3270,13 @@ private fun SettingsLimitScreen(onBack: () -> Unit) {
                                 pendingEffectiveAt = effectiveAt
                             )
                         )
-                        // 서버에도 새 값 push (draft 기준으로 — 서버는 pending 개념 없으니 새 limit 으로 즉시 동기화)
-                        val ok = pushLimitToServer(userId, draftHourly, draftDaily)
-                        val msg = if (ok) "다음 주 월요일부터 새 limit 적용 (서버 동기화 완료)"
-                                  else "다음 주 월요일부터 새 limit 적용 (서버 동기화 실패)"
-                        Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+                        // [변경됨] 예전엔 여기서 pushLimitToServer(draft...) 로 새 값을 즉시 서버에 보냈다.
+                        //   하지만 새 한도는 다음 주 월요일부터 적용인데 서버가 미리 새 값을 갖게 되어,
+                        //   오늘(이번 주) 통계가 아직 적용 안 된 한도로 계산되는 버그가 있었다.
+                        // → 즉시 push 제거. 서버 동기화는 pending 이 실제로 승격되는 시점에
+                        //   promoteAndSyncLimit() 가 대신 처리한다.
+                        //   (현재 적용값은 서버에 그대로 남아 있으므로 이번 주 통계는 옛 한도 기준으로 정확히 유지됨)
+                        Toast.makeText(context, "다음 주 월요일부터 새 limit 적용 예정", Toast.LENGTH_SHORT).show()
                         showConfirm = false
                         onBack()
                     }
@@ -3330,8 +3336,9 @@ private fun startOfNextMondayMs(): Long {
 
 // POST /limits/:userId — 서버에 새 limit 동기화
 // Firebase ID 토큰을 Authorization: Bearer 헤더로 전송 (서버 미들웨어가 검증)
-// 서버는 pending 개념이 없으므로 사용자가 변경한 값(draft)을 그대로 보냄.
-// 로컬은 다음날부터 적용이지만 서버 기록은 변경 시점 = 적용으로 본다.
+// 서버는 pending 개념이 없으므로 "현재 실제로 적용 중인 값"만 보낸다.
+// [변경됨] 예전 주석: "변경 시점 = 적용으로 본다" → 더 이상 변경 시점에 호출하지 않는다.
+//   이제 이 함수는 (1) 신규 한도가 실제로 적용되는 순간(promoteAndSyncLimit) 에만 호출된다.
 private suspend fun pushLimitToServer(userId: String, hourlyLimit: Int, dailyLimit: Int): Boolean {
     return withContext(Dispatchers.IO) {
         try {
@@ -3362,6 +3369,42 @@ private suspend fun pushLimitToServer(userId: String, hourlyLimit: Int, dailyLim
             Log.e("LimitSync", "전송 실패 — ${e.message}")
             false
         }
+    }
+}
+
+// ── [신규] pending limit 승격 + 서버 동기화 ────────────────────────────────
+// 기존 promoteExpiredPending() 호출을 이 함수로 감싼 것.
+//
+// [왜 만들었나]
+//   한도를 바꾸면 로컬(Room)은 "다음 주 월요일부터" 적용(pending)인데,
+//   예전 코드는 편집하는 순간 새 값을 서버로 즉시 push 했다.
+//   그러면 서버 limits/{userId} 가 아직 적용도 안 된 미래 값을 갖게 되고,
+//   GET /stats/daily 가 그 값을 읽어 "오늘(이번 주)" 통계를 새 한도로 계산해
+//   화면에 잘못된 한도가 표시되는 버그가 있었다.
+//
+// [어떻게 고치나]
+//   새 값은 "실제로 적용되는 순간"(= pending 이 승격되는 시점)에만 서버로 보낸다.
+//   이 함수는 승격 직전에 승격 대상이 있는지 확인하고, 승격이 일어났다면
+//   그때 비로소 pushLimitToServer() 로 새 값을 서버에 반영한다.
+//   승격할 게 없으면 기존과 똑같이 로컬 정렬만 하고 서버는 옛 값을 유지한다.
+private suspend fun promoteAndSyncLimit(db: AppDatabase, userId: String) {
+    val now = System.currentTimeMillis()
+    val limit = db.userLimitDao().getLimit(userId) ?: return
+
+    // 승격 대상인지 판단 — pendingEffectiveAt 가 설정돼 있고 이미 그 시각을 지났는가
+    val effectiveAt = limit.pendingEffectiveAt
+    val willPromote = effectiveAt != null && effectiveAt <= now
+
+    // 승격 후 실제로 적용될 값(= 서버에 보낼 값)을 승격 전에 미리 계산
+    val promotedHourly = limit.pendingHourlyLimit ?: limit.hourlyLimit
+    val promotedDaily  = limit.pendingDailyLimit  ?: limit.dailyLimit
+
+    // 로컬 승격 — 기존 동작 그대로 (pending → 현재 값)
+    db.userLimitDao().promoteExpiredPending(now)
+
+    // 승격이 실제로 일어난 경우에만 서버 동기화 — 이 순간이 "새 한도가 적용된 시점"
+    if (willPromote) {
+        pushLimitToServer(userId, promotedHourly, promotedDaily)
     }
 }
 
