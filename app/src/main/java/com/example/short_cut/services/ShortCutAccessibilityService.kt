@@ -1113,7 +1113,11 @@ class ShortCutAccessibilityService : AccessibilityService() {
                     return@launch
                 }
 
-                val client = okhttp3.OkHttpClient()
+                val client = okhttp3.OkHttpClient.Builder()
+                    .connectTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+                    .readTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+                    .writeTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+                    .build()
                 val mediaType = "application/json".toMediaType()
                 val body = json.toRequestBody(mediaType)
                 val request = okhttp3.Request.Builder()
@@ -1221,7 +1225,11 @@ class ShortCutAccessibilityService : AccessibilityService() {
                 "platform": "${platformOf(log.appPkg)}"
             }
         """.trimIndent()
-            val client = okhttp3.OkHttpClient()
+            val client = okhttp3.OkHttpClient.Builder()
+                .connectTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+                .readTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+                .writeTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+                .build()
             val body = json.toRequestBody("application/json".toMediaType())
             val request = okhttp3.Request.Builder()
                 .url("https://short-cut-server-production.up.railway.app/userlogs")
