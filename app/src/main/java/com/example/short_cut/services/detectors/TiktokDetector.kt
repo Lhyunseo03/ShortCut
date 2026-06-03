@@ -24,6 +24,7 @@ class TiktokDetector(packageName: String) : AppDetector(packageName) {
         // scrollY 가 페이지 경계에 얼마나 가까워야 "snap 완료" 로 볼지 — H 의 1/10
         const val SNAP_TOLERANCE_DIV = 10
         private const val TAG = "ShortCut"
+        @Suppress("unused")
         private const val VIEWPAGER_ID_SUFFIX = ":id/viewpager"
         private const val VIEWPAGER_CLASS = "androidx.viewpager.widget.ViewPager"
     }
@@ -40,10 +41,14 @@ class TiktokDetector(packageName: String) : AppDetector(packageName) {
 
         val src = event.source ?: return Outcome.NONE
         try {
-            val srcId = src.viewIdResourceName ?: ""
             val srcClass = src.className?.toString() ?: ""
-            // For You 피드의 ViewPager 스크롤만 — 다른 RecyclerView 등은 무시
-            if (!srcId.endsWith(VIEWPAGER_ID_SUFFIX)) return Outcome.NONE
+            // For You 피드의 ViewPager 스크롤만 — 다른 RecyclerView 등은 무시.
+            // [변경됨] 예전엔 resource-id 가 ":id/viewpager" 로 끝나야 통과했는데, 트릴 버전은
+            //   id 가 난독화돼(예: com.ss.android.ugc.trill:id/hhd) 매칭에 실패 → 트릴에서
+            //   스크롤이 전혀 감지되지 않는 버그가 있었다.
+            //   이벤트는 서비스가 이미 틱톡 패키지로 라우팅하므로(packageName 매칭, 서비스 line 300),
+            //   여기선 ViewPager 클래스만으로 피드를 식별한다.
+            //   (글로벌 musically / 트릴 trill 모두 동일 클래스 androidx.viewpager.widget.ViewPager → 둘 다 커버)
             if (srcClass != VIEWPAGER_CLASS) return Outcome.NONE
 
             // page height — viewpager 실제 화면 높이
