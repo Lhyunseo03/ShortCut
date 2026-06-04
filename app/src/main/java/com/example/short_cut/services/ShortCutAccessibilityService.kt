@@ -353,6 +353,21 @@ class ShortCutAccessibilityService : AccessibilityService() {
         }
     }
 
+    // [신규] Detector 의 비동기 지문 재확인 결과(느린 스크롤 복구) — 동기 outcome.scrolled 와 같은 처리.
+    // 동기 경로의 5분 차단(stopUntilMs) 분기를 그대로 적용해야 차단 중 카운트되는 일이 없다.
+    // 호출 시점에 detector 가 이미 inShortsMode 여부/지문 변화/debounce 를 모두 통과시킨 상태.
+    fun onDeferredScroll(appPkg: String) {
+        val now = System.currentTimeMillis()
+        val detector = detectors.firstOrNull { it.packageName == appPkg } ?: return
+        if (!detector.inShortsMode) return
+        if (now < stopUntilMs) {
+            // 차단 기간 중 — 카운트하지 않고 동기 경로처럼 사용자를 밀어냄
+            performGlobalAction(GLOBAL_ACTION_BACK)
+            return
+        }
+        countShorts(now, appPkg)
+    }
+
     // 스크롤 한 건 처리 — debounce/noise 검사는 각 detector 가 이미 수행함.
     // appPkg: 어느 앱(YT/IG/TT)에서 발생한 스크롤인지 — DB 저장용.
     private fun countShorts(now: Long, appPkg: String) {

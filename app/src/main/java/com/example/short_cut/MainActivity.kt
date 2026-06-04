@@ -1154,8 +1154,9 @@ private suspend fun computeMilestones(
     return MilestoneTimes(dailyExceed, dailyExtras, hourlyFirst, hourlyExtras)
 }
 
-// 목표 달성 색 — 한도 이내(성공) 초록, 초과(실패) 빨강(오버할수록 진하게).
+// 목표 달성 색 — 한도 이내(성공) 단색 초록, 초과(실패) 빨강(오버할수록 진하게).
 // dailyLimit 가 0(미설정)이면 기존 히트맵으로 폴백. 두 번째 Boolean 은 흰 글씨가 어울리는 어두운 배경인지.
+// [변경됨] 달성한 날 사이의 그라데이션 제거 — "스크롤이 많을수록 진해지는" 표시는 한도 초과 시에만 의미가 있음.
 private fun goalColor(count: Int, dailyLimit: Int, maxCount: Int, maxOverage: Int): Pair<Color, Boolean> {
     if (dailyLimit <= 0) {
         if (count == 0) return Color(0xFFF5F5F5) to false
@@ -1163,10 +1164,7 @@ private fun goalColor(count: Int, dailyLimit: Int, maxCount: Int, maxOverage: In
         return lerp(Color(0xFFFFE5E5), Color(0xFFC62828), 0.15f + 0.85f * intensity) to (intensity > 0.55f)
     }
     if (count == 0) return Color(0xFFEFF6F0) to false  // 활동 없음 = 자연 달성(아주 옅은 초록)
-    if (count <= dailyLimit) {
-        val frac = (count.toFloat() / dailyLimit).coerceIn(0f, 1f)
-        return lerp(Color(0xFFC8E6C9), Color(0xFF2E7D32), 0.15f + 0.7f * frac) to (frac > 0.55f)
-    }
+    if (count <= dailyLimit) return Color(0xFF66BB6A) to false  // 달성 — 카운트 크기와 무관하게 단색
     val frac = ((count - dailyLimit).toFloat() / maxOverage.coerceAtLeast(1)).coerceIn(0f, 1f)
     return lerp(Color(0xFFEF9A9A), Color(0xFFB71C1C), 0.15f + 0.85f * frac) to (frac > 0.4f)
 }
@@ -1263,7 +1261,7 @@ private fun DailyGoalProgressBox(
     }
 }
 
-// 시간별 한도 팝업 시각 박스 — hourly limit 처음 도달 시각 + 추가 팝업(milestone) 시각만 표시.
+// hourly 한도 초과 팝업 시각 박스 — hourly limit 처음 도달 시각 + 추가 팝업(milestone) 시각만 표시.
 @Composable
 private fun HourlyGoalBox(
     hourlyLimit: Int,
@@ -1277,7 +1275,9 @@ private fun HourlyGoalBox(
     ) {
         Column(modifier = Modifier.padding(14.dp)) {
             Text(
-                "시간별 한도 팝업" + if (hourlyLimit > 0) " (한도 ${hourlyLimit}회)" else "",
+                // 한도 처음 도달 시 1번 + 그 이후 10회씩 더 볼 때마다(=한도+10, +20, ...). "0부터 10마다" 가 아님.
+                "hourly 한도 초과 팝업" +
+                    if (hourlyLimit > 0) " (한도 ${hourlyLimit}회, 이후 +10회마다)" else "",
                 fontSize = 13.sp,
                 fontWeight = FontWeight.SemiBold,
                 color = Color(0xFF1A1A1A)
@@ -2276,8 +2276,16 @@ private fun StatsDaily(monthOffset: Int, onMonthOffsetChange: (Int) -> Unit) {
             .countByAppForRange(selectedDayMs, endOfDay)
             .associate { it.appPkg to it.count }
         // milestone 시각 — 로컬 timestamps 로 정확히 계산 (분 단위까지)
-        val dLim = (remote?.dailyLimit?.takeIf { it > 0 }) ?: currentDailyLimit
-        val hLim = remote?.hourlyLimit ?: currentHourlyLimit
+        // [중요] "그날 실제로 팝업을 트리거한 한도값" 을 써야 한다:
+        //   - 오늘: 로컬 current(=오늘 실제로 적용 중인 값). 서버 limits/{userId} 는
+        //     limit-sync 가 promote 시점(다음 주 월요일)에만 push 되므로 stale 일 수 있음.
+        //     예: 서버=10, 로컬=50 인데 오늘 31회 → 서버값 쓰면 10,20,30 시점 "가짜 팝업 3건" 생김.
+        //   - 과거: 서버 스냅샷 우선(finalizeStats 가 그날 적용 값을 박제). 없으면 로컬로 폴백.
+        val selectedIsToday = selectedDayMs == todayMidnight
+        val dLim = if (selectedIsToday) currentDailyLimit
+                   else (remote?.dailyLimit?.takeIf { it > 0 } ?: currentDailyLimit)
+        val hLim = if (selectedIsToday) currentHourlyLimit
+                   else (remote?.hourlyLimit ?: currentHourlyLimit)
         if (dLim > 0 || hLim > 0) {
             val m = computeMilestones(db, selectedDayMs, endOfDay, dLim, hLim)
             dailyExceedTime = m.dailyExceed
@@ -2307,8 +2315,12 @@ private fun StatsDaily(monthOffset: Int, onMonthOffsetChange: (Int) -> Unit) {
     val peakHour = counts.indices.maxByOrNull { counts[it] } ?: 0
     val peakCount = counts.getOrNull(peakHour) ?: 0
 
-    // 그 날의 daily limit — 서버값(그 날 기준) 우선, 없으면 현재 limit 으로 대체
-    val dailyLimit = (serverStats?.dailyLimit?.takeIf { it > 0 }) ?: currentDailyLimit
+    // 그 날의 daily limit — 과거: 서버값(finalizeStats 스냅샷) 우선, 오늘: 로컬 current.
+    // [중요] 오늘에 서버값을 쓰면 안 됨 — limit-sync 가 다음 주 월요일 promote 때까지 안 일어나서
+    // 서버 limits/{userId} 가 stale 일 수 있음(예: 한도 변경 직후엔 옛 값).
+    val selectedIsToday = selectedDayMs == todayMidnight
+    val dailyLimit = if (selectedIsToday) currentDailyLimit
+                     else (serverStats?.dailyLimit?.takeIf { it > 0 } ?: currentDailyLimit)
     val exceeded = dailyLimit > 0 && total > dailyLimit
 
     Column(
@@ -2471,7 +2483,9 @@ private fun StatsDaily(monthOffset: Int, onMonthOffsetChange: (Int) -> Unit) {
         Spacer(Modifier.height(12.dp))
 
         // 시간별 한도 팝업 박스 — 도달 시각 + 추가 팝업(milestone) 시각만
-        val hourlyLimitForDay = serverStats?.hourlyLimit ?: currentHourlyLimit
+        // dailyLimit 와 동일한 이유로 오늘은 로컬 current, 과거는 서버 스냅샷.
+        val hourlyLimitForDay = if (selectedIsToday) currentHourlyLimit
+                                else (serverStats?.hourlyLimit ?: currentHourlyLimit)
         Box(modifier = Modifier.padding(horizontal = 8.dp)) {
             HourlyGoalBox(
                 hourlyLimit = hourlyLimitForDay,
