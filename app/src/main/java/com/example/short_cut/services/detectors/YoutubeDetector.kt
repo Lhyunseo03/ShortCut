@@ -24,6 +24,9 @@ class YoutubeDetector : AppDetector(PACKAGE) {
         // 측정상 느린 스크롤에서 새 영상 desc 가 들어오기까지의 갭을 덮을 정도로 충분히 길고,
         // 사용자가 곧바로 다음 스와이프를 시도할 정도로 짧지 않은 값.
         const val FINGERPRINT_RECHECK_MS = 250L
+        // [신규] 진입 fallback 노드 탐색 throttle — CONTENT_CHANGED 는 매우 자주 와서
+        // 매 이벤트마다 노드 트리를 뒤지면 비싸므로, 쇼츠 모드 밖에선 이 간격으로만 진입 여부를 확인.
+        const val ENTRY_PROBE_MS = 600L
         private const val TAG = "ShortCut"
     }
 
@@ -31,6 +34,8 @@ class YoutubeDetector : AppDetector(PACKAGE) {
     private var lastCountTime = 0L
     private var lastNodeCount = 0
     private var lastContentDesc = ""
+    // 마지막으로 fallback 진입 탐색을 수행한 시각 — ENTRY_PROBE_MS throttle 용
+    private var lastEntryProbe = 0L
 
     private val handler = Handler(Looper.getMainLooper())
     private var pendingRecheck: Runnable? = null
@@ -63,7 +68,25 @@ class YoutubeDetector : AppDetector(PACKAGE) {
                 }
             }
             AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED -> {
-                if (!inShortsMode) return Outcome.NONE
+                if (!inShortsMode) {
+                    // [신규] fallback 진입 — WINDOW_STATE_CHANGED 진입 이벤트가 누락되는 랜덤 케이스 보정.
+                    // (인스타 detector 의 스크롤 이벤트 fallback 과 같은 취지. YT 는 진입 신호로 CONTENT_CHANGED 를 씀.)
+                    // CONTENT_CHANGED 는 빈번하므로 ENTRY_PROBE_MS 간격으로만 노드를 확인해 비용을 제한.
+                    if (now - lastEntryProbe >= ENTRY_PROBE_MS) {
+                        lastEntryProbe = now
+                        val nodeCount = service.countNodesById(SHORTS_NODE_ID)
+                        if (nodeCount >= 1) {
+                            inShortsMode = true
+                            shortsEnteredTime = now
+                            lastCountTime = now
+                            lastNodeCount = nodeCount
+                            lastContentDesc = service.getContentFingerprint()
+                            Log.d(TAG, "[YT] (fallback) 쇼츠 진입 노드=$nodeCount")
+                            return Outcome(entered = true)
+                        }
+                    }
+                    return Outcome.NONE
+                }
                 val nodeCount = service.countNodesById(SHORTS_NODE_ID)
                 if (lastNodeCount == 2 && nodeCount == 1) {
                     val currentDesc = service.getContentFingerprint()

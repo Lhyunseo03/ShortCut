@@ -69,7 +69,9 @@ import com.google.android.gms.auth.api.signin.GoogleSignInOptions
 import com.google.android.gms.common.api.ApiException
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.auth.GoogleAuthProvider
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
@@ -86,6 +88,12 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Locale
+
+// 화면 전환(컴포저블 이탈)으로 취소되면 안 되는 백그라운드 작업용 앱 수명 스코프.
+// rememberCoroutineScope 는 컴포저블이 composition 을 떠나면 즉시 취소되므로,
+// 로그인 직후 한도 fetch+Room 저장처럼 화면이 곧바로 전환되는 시점에 끝까지 돌아야 하는 작업엔 부적합.
+// (이 fetch 가 죽으면 로컬에 한도가 저장되지 않아 서비스가 기본값 50/100 으로 과잉 차단함.)
+private val appScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
 // 앱 화면 상태
 // LOGIN: 로그인 필요
@@ -226,8 +234,6 @@ fun LoginScreen(onLoginSuccess: () -> Unit = {}) {
     // Firebase Auth 인스턴스 — 로그인/로그아웃/토큰 관리
     val auth = FirebaseAuth.getInstance()
 
-    val scope = rememberCoroutineScope()
-
     // 구글 로그인 옵션 설정
     // requestIdToken: 서버에서 토큰 검증할 때 필요한 ID 토큰 요청
     // web client ID — google-services.json의 client_type: 3 값
@@ -264,7 +270,9 @@ fun LoginScreen(onLoginSuccess: () -> Unit = {}) {
                     prefs.edit().putString("userId", userId).apply()
 
                     // 서버에 저장된 hourly/daily limit 동기화 — 다른 기기에서 변경한 값이 있다면 가져옴
-                    scope.launch {
+                    // appScope(앱 수명) 에서 실행 — onLoginSuccess() 로 화면이 곧바로 전환돼도
+                    // fetch+Room 저장이 취소되지 않고 끝까지 완료됨(과잉 차단 방지).
+                    appScope.launch {
                         val limits = fetchLimitsFromServer(userId)
                         if (limits != null) {
                             val (h, d) = limits
@@ -286,8 +294,13 @@ fun LoginScreen(onLoginSuccess: () -> Unit = {}) {
         } catch (e: ApiException) {
             // 구글 계정 선택 실패 또는 취소
             // statusCode=10 → DEVELOPER_ERROR: SHA-1/웹클라이언트ID/패키지명 중 하나가 Firebase 설정과 불일치
-            Log.e("Auth", "구글 로그인 실패 — code=${e.statusCode}, msg=${e.message}")
-            Toast.makeText(context, "구글 로그인 실패 (code=${e.statusCode})", Toast.LENGTH_LONG).show()
+            // statusCode=12501 → SIGN_IN_CANCELLED: 사용자가 계정 선택 화면을 그냥 닫음(실패 아님) → 조용히 무시
+            if (e.statusCode == 12501) {
+                Log.d("Auth", "구글 로그인 취소됨 (code=12501) — 토스트 생략")
+            } else {
+                Log.e("Auth", "구글 로그인 실패 — code=${e.statusCode}, msg=${e.message}")
+                Toast.makeText(context, "구글 로그인 실패 (code=${e.statusCode})", Toast.LENGTH_LONG).show()
+            }
         }
     }
 
@@ -379,7 +392,7 @@ fun AccessibilityGuideScreen() {
                 color = Color(0xFF1A1A1A)
             )
             Text(
-                text = "두 권한 모두 켜야 쇼츠/릴스 차단이 동작해요.\n앱을 끄거나 권한을 꺼도 우회되지 않도록 합니다.",
+                text = "세 권한 모두 켜야 쇼츠/릴스 차단이 동작해요.\n앱을 끄거나 권한을 꺼도 우회되지 않도록 합니다.",
                 fontSize = 14.sp,
                 color = Color(0xFF888888),
                 textAlign = TextAlign.Center,
@@ -2848,6 +2861,7 @@ private fun SettingsRootScreen(
     Column(
         modifier = Modifier
             .fillMaxSize()
+            .verticalScroll(rememberScrollState())  // 화면이 짧은 기기에서 계정 버튼이 잘리지 않도록 스크롤 허용
             .padding(horizontal = 24.dp, vertical = 24.dp),
         verticalArrangement = Arrangement.spacedBy(20.dp)
     ) {

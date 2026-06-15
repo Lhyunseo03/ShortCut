@@ -2,6 +2,10 @@ package com.example.short_cut.services
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.AccessibilityServiceInfo
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.graphics.PixelFormat
 import android.os.Handler
 import android.os.Looper
@@ -52,6 +56,7 @@ class ShortCutAccessibilityService : AccessibilityService() {
         const val PK_PENDING_OVERAGE = "pendingPopupOverage"   // 현재 미응답 popup 의 overage (0,10,20.../0,100,200...)
         const val PK_TODAY_START = "todayStartMs"              // 마지막으로 처리한 "오늘 0시" — 날짜 롤오버 감지용
         const val PK_PENDING_USERLOGS = "pendingUserLogs"      // 서버 전송 대기/실패한 userlog 큐 (JSON 배열 [{ts,count}])
+        const val PK_PENDING_VIOLATIONS = "pendingViolations"  // 서버 전송 대기/실패한 violation 큐 (JSON 배열)
     }
 
     // ── Room DB ───────────────────────────────────────────────
@@ -111,6 +116,20 @@ class ShortCutAccessibilityService : AccessibilityService() {
     private var blockPopupShowing = false
     private val mainHandler = Handler(Looper.getMainLooper())
 
+    // 화면이 꺼지면(전원 버튼 등) 떠 있던 popup 을 내려서 잠금화면 위에 남지 않게 함.
+    // pending 상태는 그대로 유지 → 잠금 해제 후 타겟 앱에 "다시 진입할 때만" popup 이 복원된다
+    // (다른 앱 전환 처리와 동일한 패턴). detector 의 inShortsMode 도 리셋해야 재진입 시 entered 가 다시 발사됨.
+    private val screenStateReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action != Intent.ACTION_SCREEN_OFF) return
+            if (popupViews.isNotEmpty()) {
+                Log.d(TAG, "화면 꺼짐 → popup 숨김 (pending 유지)")
+                dismissAllPopups()
+            }
+            detectors.forEach { if (it.inShortsMode) it.onPackageLeft() }
+        }
+    }
+
     // ── 배치 전송 ─────────────────────────────────────────────
     // 현재 쌓이는 중인 배치. batchFirstScrollMs = 이 배치의 첫 스크롤 시각(전송 timestamp 로 사용).
     // batchAppPkg = 이 배치가 어느 앱에서 발생한 스크롤인지 — 다른 앱 스크롤이 끼면 먼저 flush 후 새 배치 시작
@@ -130,6 +149,9 @@ class ShortCutAccessibilityService : AccessibilityService() {
     private val pendingLock = Any()
     // 동시에 두 전송이 큐 앞쪽을 중복 제거하지 않도록 — 전송은 한 번에 하나만
     private val isSending = java.util.concurrent.atomic.AtomicBoolean(false)
+    // violation 큐 전용 락/전송 가드 (userlog 큐와 독립적으로 동작)
+    private val violationLock = Any()
+    private val isSendingViolations = java.util.concurrent.atomic.AtomicBoolean(false)
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -155,6 +177,9 @@ class ShortCutAccessibilityService : AccessibilityService() {
         }
 
         Log.d(TAG, "서비스 연결 | API ${android.os.Build.VERSION.SDK_INT}")
+
+        // 화면 꺼짐 감지 — ACTION_SCREEN_OFF 는 동적 등록만 가능(매니페스트 불가)
+        registerReceiver(screenStateReceiver, IntentFilter(Intent.ACTION_SCREEN_OFF))
 
         scheduleBatchTimer()
     }
@@ -227,8 +252,58 @@ class ShortCutAccessibilityService : AccessibilityService() {
         savePersistedState()
         Log.d(TAG, "상태 복원 — dailyMilestone=$dailyMilestone, hourlyMilestone=$hourlyMilestone, stopUntilMs=$stopUntilMs, pending=$pendingPopupType($pendingPopupOverage)")
 
-        // 지난 실행에서 전송 못 하고 남은 userlog 가 있으면 재시도 (앱 강제종료 등으로 유실 방지)
+        // 지난 실행에서 전송 못 하고 남은 userlog/violation 이 있으면 재시도 (앱 강제종료 등으로 유실 방지)
         sendPendingUserLogs()
+        sendPendingViolations()
+
+        // 재설치/데이터 손실 후 당일 카운트 복원 — 서버 /daily 의 totalScroll 로 시드.
+        // 네트워크 의존이므로 위 로컬 복원/상태저장을 막지 않게 별도 코루틴에서 수행.
+        serviceScope.launch { seedDailyCountFromServer(userId) }
+    }
+
+    // [신규] 재설치/데이터 손실 시 당일 카운트 복원 — 서버 GET /stats/:userId/daily 의 totalScroll 로 시드.
+    // 서버가 canonical 이므로(통계 source of truth) 로컬보다 크면 그 값으로 올린다 → 한도 차단이 0 부터 다시 세지 않음.
+    // 로컬보다 작거나 같으면(서버 배치 지연 등) 손대지 않음.
+    private suspend fun seedDailyCountFromServer(userId: String) {
+        if (userId == "unknown") return
+        val todayStr = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US).apply {
+            timeZone = java.util.TimeZone.getTimeZone("Asia/Seoul")
+        }.format(java.util.Date(todayStartMs))
+        val serverTotal = fetchServerDailyTotal(userId, todayStr) ?: return
+        if (serverTotal > dailyCount) {
+            Log.d(TAG, "당일 카운트 서버 시드 — local=$dailyCount → server=$serverTotal")
+            dailyCount = serverTotal
+        }
+    }
+
+    // GET /stats/:userId/daily?date= → totalScroll. 실패/없으면 null.
+    private suspend fun fetchServerDailyTotal(userId: String, date: String): Int? {
+        return try {
+            val token = getFirebaseToken() ?: return null
+            val client = okhttp3.OkHttpClient.Builder()
+                .connectTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+                .readTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+                .writeTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+                .build()
+            val request = okhttp3.Request.Builder()
+                .url("https://short-cut-server-production.up.railway.app/stats/$userId/daily?date=$date")
+                .addHeader("Authorization", "Bearer $token")
+                .get()
+                .build()
+            val response = client.newCall(request).execute()
+            val body = response.body?.string()
+            val ok = response.isSuccessful
+            response.close()
+            if (ok && body != null) {
+                org.json.JSONObject(body).optInt("totalScroll", -1).takeIf { it >= 0 }
+            } else {
+                Log.w(TAG, "당일 카운트 시드 GET 실패 — code=${response.code}")
+                null
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "당일 카운트 시드 GET 실패 — ${e.message}")
+            null
+        }
     }
 
     // 두 시각이 같은 '시(hour)'(로컬 타임존, 같은 날 같은 시)인지 — 배치가 시 경계를 넘는지 판단용
@@ -410,11 +485,24 @@ class ShortCutAccessibilityService : AccessibilityService() {
 
             Log.d(TAG, "스크롤 카운트 — hourly: $hourlyCount/$hourlyLimit, daily: $dailyCount/$dailyLimit")
 
-            // hourly 가 limit 아래로 떨어졌으면 milestone 리셋
-            // (슬라이딩 윈도우로 옛 카운트가 빠져나가 자연 회복된 경우 — 다음에 다시 limit 도달 시 "첫 팝업" 부터)
-            if (hourlyCount < hourlyLimit && hourlyMilestone >= 0) {
-                hourlyMilestone = -1
-                savePersistedState()
+            // hourly milestone 하향 조정 — 슬라이딩 윈도우로 카운트가 줄면 milestone 도 따라 낮춘다.
+            //  (예전엔 "한도 미만으로 떨어졌을 때만" 리셋해서, 한도 위에서 카운트가 줄었다 다시 오르는
+            //   binge 중에는 milestone 이 높은 값에 stuck 돼 재경고가 안 뜨던 문제가 있었음.)
+            //  - 한도 미만으로 떨어지면 완전 리셋(-1): 다음에 다시 limit 도달 시 "첫 팝업"부터.
+            //  - 한도 이상이지만 현재 카운트가 milestone 보다 낮아졌으면, 현재 카운트의 step 레벨로 낮춤
+            //    → 거기서 다시 STEP 만큼 오르면 재경고. (예: limit50, 63→milestone60 후 55로 감소 → milestone50,
+            //       다시 60 도달 시 재경고)
+            if (hourlyMilestone >= 0) {
+                if (hourlyCount < hourlyLimit) {
+                    hourlyMilestone = -1
+                    savePersistedState()
+                } else if (hourlyCount < hourlyMilestone) {
+                    val stepLevel = hourlyLimit + ((hourlyCount - hourlyLimit) / HOURLY_STEP) * HOURLY_STEP
+                    if (stepLevel < hourlyMilestone) {
+                        hourlyMilestone = stepLevel
+                        savePersistedState()
+                    }
+                }
             }
 
             // hourly 체크 — milestone 단위로 트리거.
@@ -559,7 +647,7 @@ class ShortCutAccessibilityService : AccessibilityService() {
         }
     }
 
-    // ── Variant 1 — 무시하기 버튼 60초 카운트다운 후 활성화 ──────
+    // ── Variant 1 — 계속보기 버튼 60초 카운트다운 후 활성화 ──────
     private fun showHardCountdown(overage: Int) {
         val type = "hourly"
         val (title, body) = buildPopupTexts(type, overage)
@@ -573,10 +661,10 @@ class ShortCutAccessibilityService : AccessibilityService() {
             val btnIgnore = view.findViewById<Button>(R.id.btnIgnore)
             val countdownTv = view.findViewById<TextView>(R.id.ignoreCountdown)
 
-            btnStop.text = "그만하기"
+            btnStop.text = "그만보기"
             btnStop.setOnClickListener { executeStop(type) }
 
-            btnIgnore.text = "무시하기"
+            btnIgnore.text = "계속보기"
             btnIgnore.isEnabled = false
             btnIgnore.alpha = 0.5f
             btnIgnore.setOnClickListener { executeIgnore(type) }
@@ -606,8 +694,8 @@ class ShortCutAccessibilityService : AccessibilityService() {
         }
     }
 
-    // ── Variant 2 — 세로 스크롤. 처음엔 일반 팝업과 똑같은 크기/버튼 위치로 보이되 둘 다 "그만하기"(=stop).
-    //   ScrollView 높이를 딱 한 줄로 고정해 첫 줄만 노출 → 아래로 스크롤하면 나오는 줄들 중 1곳에만 진짜 무시하기. ──
+    // ── Variant 2 — 세로 스크롤. 처음엔 일반 팝업과 똑같은 크기/버튼 위치로 보이되 둘 다 "그만보기"(=stop).
+    //   ScrollView 높이를 딱 한 줄로 고정해 첫 줄만 노출 → 아래로 스크롤하면 나오는 줄들 중 1곳에만 진짜 계속보기. ──
     private fun showHardVerticalGrid(overage: Int) {
         val type = "hourly"
         val (title, body) = buildPopupTexts(type, overage)
@@ -620,12 +708,12 @@ class ShortCutAccessibilityService : AccessibilityService() {
 
             val density = resources.displayMetrics.density
             val rowCount = 10
-            // 진짜 무시하기 — 첫 줄(0)은 제외, 1..9 줄 중 한 곳의 좌/우 랜덤
+            // 진짜 계속보기 — 첫 줄(0)은 제외, 1..9 줄 중 한 곳의 좌/우 랜덤
             val realRow = (1 until rowCount).random()
             val realRight = (0..1).random() == 1
 
             val red = android.graphics.Color.parseColor("#FF4444")   // 일반 팝업 그만보기 색(왼쪽)
-            val gray = android.graphics.Color.parseColor("#888888")  // 일반 팝업 무시하기 색(오른쪽)
+            val gray = android.graphics.Color.parseColor("#888888")  // 일반 팝업 계속보기 색(오른쪽)
             val gapPx = (20 * density).toInt()                       // 일반 팝업과 동일한 버튼 간격
             val btnHeightPx = (48 * density).toInt()
             val rowMarginPx = (4 * density).toInt()
@@ -648,13 +736,13 @@ class ShortCutAccessibilityService : AccessibilityService() {
                         LinearLayout.LayoutParams.WRAP_CONTENT
                     ).apply { setMargins(0, rowMarginPx, 0, rowMarginPx) }
                 }
-                // 모든 줄을 빨강|회색 쌍으로 — 첫 줄은 일반 팝업과 동일하게 보이고, 둘 다 그만하기.
+                // 모든 줄을 빨강|회색 쌍으로 — 첫 줄은 일반 팝업과 동일하게 보이고, 둘 다 그만보기.
                 val leftReal = (r == realRow && !realRight)
                 val rightReal = (r == realRow && realRight)
-                row.addView(cell(if (leftReal) "무시하기" else "그만하기", red, gapPx) {
+                row.addView(cell(if (leftReal) "계속보기" else "그만보기", red, gapPx) {
                     if (leftReal) executeIgnore(type) else executeStop(type)
                 })
-                row.addView(cell(if (rightReal) "무시하기" else "그만하기", gray, 0) {
+                row.addView(cell(if (rightReal) "계속보기" else "그만보기", gray, 0) {
                     if (rightReal) executeIgnore(type) else executeStop(type)
                 })
                 container.addView(row)
@@ -670,19 +758,19 @@ class ShortCutAccessibilityService : AccessibilityService() {
         }
     }
 
-    // ── Variant 3 — 색상 위치 고정, 글자만 swap (red=무시하기, gray=그만하기) ──
+    // ── Variant 3 — 색상 위치 고정, 글자만 swap (red=계속보기, gray=그만보기) ──
     private fun showHardSwappedLabels(overage: Int) {
         val type = "hourly"
         val (title, body) = buildPopupTexts(type, overage)
         mainHandler.post {
             dismissAllPopups()
-            // btnStop (red, 왼쪽) 라벨 = "무시하기" → 클릭 시 ignore
-            // btnIgnore (gray, 오른쪽) 라벨 = "그만하기" → 클릭 시 stop
+            // btnStop (red, 왼쪽) 라벨 = "계속보기" → 클릭 시 ignore
+            // btnIgnore (gray, 오른쪽) 라벨 = "그만보기" → 클릭 시 stop
             val view = makeStandardPopupView(
                 title = title,
                 message = body,
-                stopText = "무시하기",
-                ignoreText = "그만하기",
+                stopText = "계속보기",
+                ignoreText = "그만보기",
                 onStopClick = { executeIgnore(type) },  // 라벨 따라 동작
                 onIgnoreClick = { executeStop(type) }
             )
@@ -710,8 +798,8 @@ class ShortCutAccessibilityService : AccessibilityService() {
                     makeStandardPopupView(
                         title = title,
                         message = body,
-                        stopText = "무시하기",  // red 위치에 무시하기 라벨
-                        ignoreText = "그만하기",  // gray 위치에 그만하기 라벨
+                        stopText = "계속보기",  // red 위치에 계속보기 라벨
+                        ignoreText = "그만보기",  // gray 위치에 그만보기 라벨
                         onStopClick = { handleStackedIgnore(type) },  // 라벨 따라 동작
                         onIgnoreClick = { executeStop(type) }
                     )
@@ -719,8 +807,8 @@ class ShortCutAccessibilityService : AccessibilityService() {
                     makeStandardPopupView(
                         title = title,
                         message = body,
-                        stopText = "그만하기",
-                        ignoreText = "무시하기",
+                        stopText = "그만보기",
+                        ignoreText = "계속보기",
                         onStopClick = { executeStop(type) },
                         onIgnoreClick = { handleStackedIgnore(type) }
                     )
@@ -740,7 +828,7 @@ class ShortCutAccessibilityService : AccessibilityService() {
         }
     }
 
-    // Stacked 모드에서 무시하기 클릭 시: 현재 top popup 하나만 dismiss, 모두 사라지면 ignore 처리
+    // Stacked 모드에서 계속보기 클릭 시: 현재 top popup 하나만 dismiss, 모두 사라지면 ignore 처리
     private fun handleStackedIgnore(type: String) {
         if (popupViews.isEmpty()) return
         val top = popupViews.last()
@@ -769,8 +857,8 @@ class ShortCutAccessibilityService : AccessibilityService() {
         }
     }
 
-    // ── Variant 5 — 가로 스크롤. 처음엔 일반 팝업과 똑같은 크기/버튼 위치로 보이되 둘 다 "그만하기"(=stop).
-    //   버튼 폭을 딱 2개만 보이게 고정 → 오른쪽으로 스크롤하면 나오는 버튼들 중 단 1개만 진짜 무시하기. ──
+    // ── Variant 5 — 가로 스크롤. 처음엔 일반 팝업과 똑같은 크기/버튼 위치로 보이되 둘 다 "그만보기"(=stop).
+    //   버튼 폭을 딱 2개만 보이게 고정 → 오른쪽으로 스크롤하면 나오는 버튼들 중 단 1개만 진짜 계속보기. ──
     private fun showHardHorizontalScroll(overage: Int) {
         val type = "hourly"
         val (title, body) = buildPopupTexts(type, overage)
@@ -783,7 +871,7 @@ class ShortCutAccessibilityService : AccessibilityService() {
 
             val density = resources.displayMetrics.density
             val total = 20
-            // 진짜 무시하기 — 처음 보이는 2칸(0,1) 밖에 한 개만 숨김
+            // 진짜 계속보기 — 처음 보이는 2칸(0,1) 밖에 한 개만 숨김
             val ignoreIdx = (2 until total).random()
 
             // 일반 팝업과 동일: 폭 280dp, padding 24, 버튼 간격 20dp → 버튼 폭 = (280-48-20)/2
@@ -793,12 +881,12 @@ class ShortCutAccessibilityService : AccessibilityService() {
             val gapPx = (gapDp * density).toInt()
 
             val red = android.graphics.Color.parseColor("#FF4444")   // 일반 팝업 그만보기 색(왼쪽)
-            val gray = android.graphics.Color.parseColor("#888888")  // 일반 팝업 무시하기 색(오른쪽)
+            val gray = android.graphics.Color.parseColor("#888888")  // 일반 팝업 계속보기 색(오른쪽)
 
             for (i in 0 until total) {
                 val isReal = (i == ignoreIdx)
                 val btn = Button(this).apply {
-                    text = if (isReal) "무시하기" else "그만하기"
+                    text = if (isReal) "계속보기" else "그만보기"
                     setTextColor(android.graphics.Color.WHITE)
                     // 빨강|회색 번갈아 → 첫 화면(0,1)이 빨강+회색 = 일반 팝업 모양
                     setBackgroundColor(if (i % 2 == 0) red else gray)
@@ -813,7 +901,7 @@ class ShortCutAccessibilityService : AccessibilityService() {
         }
     }
 
-    // ── Variant 6 — 수학 문제. 정답이면 그만하기/무시하기 둘 다 활성화(선택권), 오답이면 그만하기만 활성화 ──
+    // ── Variant 6 — 수학 문제. 정답이면 그만보기/계속보기 둘 다 활성화(선택권), 오답이면 그만보기만 활성화 ──
     // 5지선다 중 1개 정답. 한 번 선택하면 다른 선택지는 잠금 — 재시도 불가.
     private fun showHardMath(overage: Int) {
         val type = "hourly"
@@ -834,12 +922,12 @@ class ShortCutAccessibilityService : AccessibilityService() {
             val btnStop = view.findViewById<Button>(R.id.btnStop)
             val btnIgnore = view.findViewById<Button>(R.id.btnIgnore)
 
-            btnStop.text = "그만하기"
+            btnStop.text = "그만보기"
             btnStop.isEnabled = false
             btnStop.alpha = 0.5f
             btnStop.setOnClickListener { executeStop(type) }
 
-            btnIgnore.text = "무시하기"
+            btnIgnore.text = "계속보기"
             btnIgnore.isEnabled = false
             btnIgnore.alpha = 0.5f
             btnIgnore.setOnClickListener { executeIgnore(type) }
@@ -862,13 +950,13 @@ class ShortCutAccessibilityService : AccessibilityService() {
                         // 다른 선택지 잠금
                         choiceButtons.forEach { it.isEnabled = false }
                         if (choice == correctAnswer) {
-                            // 정답 — 그만하기/무시하기 둘 다 활성화해 사용자가 직접 선택
+                            // 정답 — 그만보기/계속보기 둘 다 활성화해 사용자가 직접 선택
                             btnStop.isEnabled = true
                             btnStop.alpha = 1f
                             btnIgnore.isEnabled = true
                             btnIgnore.alpha = 1f
                         } else {
-                            // 오답 — 그만하기만 활성화
+                            // 오답 — 그만보기만 활성화
                             btnStop.isEnabled = true
                             btnStop.alpha = 1f
                         }
@@ -1036,7 +1124,7 @@ class ShortCutAccessibilityService : AccessibilityService() {
 
     // ── 사용자 응답 처리 액션 ─────────────────────────────────
 
-    // 그만하기 — 5분 차단 시작, popup 전부 dismiss, 화면 빠져나가기.
+    // 그만보기 — 5분 차단 시작, popup 전부 dismiss, 화면 빠져나가기.
     // 인스타는 앱 전체가 아닌 릴스만 차단 대상 → BACK 으로 릴스 화면만 닫고 IG 일반 화면(피드/검색/DM)은 계속 이용 가능.
     // YT/TikTok 은 기존대로 HOME (이쪽은 앱 자체가 쇼츠 비중 큼).
     // 5분 차단 기간 중 다시 릴스/쇼츠에 들어가면 onAccessibilityEvent 의 stopUntilMs 분기가 BACK 으로 또 밀어냄.
@@ -1047,7 +1135,7 @@ class ShortCutAccessibilityService : AccessibilityService() {
         sendViolation(type, lastHourlyCount, dailyCount, "stop")
         clearPendingPopup()
         dismissAllPopups()
-        Log.d(TAG, "그만하기 선택 → 5분 차단 시작")
+        Log.d(TAG, "그만보기 선택 → 5분 차단 시작")
         // 현재 쇼츠 모드 detector 중 인스타가 있으면 BACK, 아니면 HOME
         val isInstagram = detectors.any {
             it.packageName == "com.instagram.android" && it.inShortsMode
@@ -1055,12 +1143,12 @@ class ShortCutAccessibilityService : AccessibilityService() {
         performGlobalAction(if (isInstagram) GLOBAL_ACTION_BACK else GLOBAL_ACTION_HOME)
     }
 
-    // 무시하기 (variant 4 제외) — popup 전부 dismiss + violation 전송
+    // 계속보기 (variant 4 제외) — popup 전부 dismiss + violation 전송
     private fun executeIgnore(type: String) {
         sendViolation(type, lastHourlyCount, dailyCount, "ignore")
         clearPendingPopup()
         dismissAllPopups()
-        Log.d(TAG, "무시하기 선택 → 다음 milestone 까지 대기")
+        Log.d(TAG, "계속보기 선택 → 다음 milestone 까지 대기")
     }
 
     // ── 상태 저장 헬퍼 ────────────────────────────────────────
@@ -1108,50 +1196,159 @@ class ShortCutAccessibilityService : AccessibilityService() {
         }
     }
 
-    // violation 발생 시 서버로 POST /violations 전송
-    // 서버 계약: scrollCount(단일) → hourlyScrollCount + dailyScrollCount 두 필드로 분리(2026-05-31).
+    // violation 발생 시 — 영속 큐에 적재 후 전송 트리거.
+    // [변경됨] 예전엔 즉시 fire-and-forget POST 라 토큰/네트워크 실패 시 그대로 유실(월간 '그만보기/무시' 누락)됐다.
+    //   이제 userlog 큐와 같은 패턴: prefs 에 먼저 적재 → 전송 성공이 확인된 항목만 큐에서 제거.
+    //   각 violation 에 고유 id 부여(서버 dedup/멱등성용 — 재전송돼도 서버가 같은 id 를 중복 집계하지 않게).
     private fun sendViolation(limitType: String, hourlyScrollCount: Int, dailyScrollCount: Int, action: String) {
         val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
         val userId = prefs.getString("userId", "unknown") ?: "unknown"
+        val v = PendingViolation(
+            id = java.util.UUID.randomUUID().toString(),
+            userId = userId,
+            ts = System.currentTimeMillis(),
+            limitType = limitType,
+            hourlyScrollCount = hourlyScrollCount,
+            dailyScrollCount = dailyScrollCount,
+            action = action,
+            platform = platformOf(lastScrollPkg)
+        )
+        // prefs 에 먼저 영속화(동기) — 큐에 들어간 뒤에만 전송을 시도하므로, 전송 전에 프로세스가 죽어도 유실되지 않음.
+        synchronized(violationLock) { appendViolationLocked(v) }
+        serviceScope.launch { sendPendingViolations() }
+    }
 
-        val json = """
-        {
-            "userId": "$userId",
-            "timestamp": ${System.currentTimeMillis()},
-            "limitType": "$limitType",
-            "hourlyScrollCount": $hourlyScrollCount,
-            "dailyScrollCount": $dailyScrollCount,
-            "action": "$action",
-            "platform": "${platformOf(lastScrollPkg)}"
+    // ── violation pending 큐 (prefs 영속) ───────────────────────
+    // userlog 큐와 동일한 패턴 — 전송 성공이 확인된 항목만 큐에서 빠짐. 아래 read/write/append 헬퍼는
+    // 모두 synchronized(violationLock) 안에서만 호출해야 함.
+    private data class PendingViolation(
+        val id: String,
+        val userId: String,
+        val ts: Long,
+        val limitType: String,
+        val hourlyScrollCount: Int,
+        val dailyScrollCount: Int,
+        val action: String,
+        val platform: String
+    )
+
+    private fun readViolationsLocked(): List<PendingViolation> {
+        val raw = getSharedPreferences(PREFS, MODE_PRIVATE).getString(PK_PENDING_VIOLATIONS, "[]") ?: "[]"
+        return try {
+            val arr = org.json.JSONArray(raw)
+            (0 until arr.length()).mapNotNull { i ->
+                arr.optJSONObject(i)?.let { o ->
+                    val id = o.optString("id").takeIf { it.isNotEmpty() }
+                        ?: java.util.UUID.randomUUID().toString()
+                    PendingViolation(
+                        id = id,
+                        userId = o.optString("userId", "unknown"),
+                        ts = o.optLong("ts"),
+                        limitType = o.optString("limitType", ""),
+                        hourlyScrollCount = o.optInt("hourlyScrollCount"),
+                        dailyScrollCount = o.optInt("dailyScrollCount"),
+                        action = o.optString("action", ""),
+                        platform = o.optString("platform", "unknown")
+                    )
+                }
+            }
+        } catch (_: Exception) {
+            emptyList()
         }
-    """.trimIndent()
+    }
 
-        serviceScope.launch {
-            try {
+    private fun writeViolationsLocked(list: List<PendingViolation>) {
+        val arr = org.json.JSONArray()
+        list.forEach { v ->
+            arr.put(org.json.JSONObject()
+                .put("id", v.id)
+                .put("userId", v.userId)
+                .put("ts", v.ts)
+                .put("limitType", v.limitType)
+                .put("hourlyScrollCount", v.hourlyScrollCount)
+                .put("dailyScrollCount", v.dailyScrollCount)
+                .put("action", v.action)
+                .put("platform", v.platform))
+        }
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+            .putString(PK_PENDING_VIOLATIONS, arr.toString()).apply()
+    }
+
+    private fun appendViolationLocked(v: PendingViolation) {
+        writeViolationsLocked(readViolationsLocked() + v)
+    }
+
+    // /violations 1건 전송(블로킹). 성공하면 true. violationId 를 함께 보내 서버가 재전송 중복을 dedup 하도록 함.
+    private fun postViolationBlocking(token: String, v: PendingViolation): Boolean {
+        return try {
+            val json = """
+            {
+                "userId": "${v.userId}",
+                "violationId": "${v.id}",
+                "timestamp": ${v.ts},
+                "limitType": "${v.limitType}",
+                "hourlyScrollCount": ${v.hourlyScrollCount},
+                "dailyScrollCount": ${v.dailyScrollCount},
+                "action": "${v.action}",
+                "platform": "${v.platform}"
+            }
+        """.trimIndent()
+            val client = okhttp3.OkHttpClient.Builder()
+                .connectTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+                .readTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+                .writeTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+                .build()
+            val body = json.toRequestBody("application/json".toMediaType())
+            val request = okhttp3.Request.Builder()
+                .url("https://short-cut-server-production.up.railway.app/violations")
+                .addHeader("Authorization", "Bearer $token")
+                .post(body)
+                .build()
+            val response = client.newCall(request).execute()
+            val ok = response.isSuccessful
+            val code = response.code
+            response.close()
+            Log.d(TAG, "violation 전송 — id=${v.id}, action=${v.action}, success=$ok ($code)")
+            ok
+        } catch (e: Exception) {
+            Log.e(TAG, "violation 전송 실패 — ${e.message}")
+            false
+        }
+    }
+
+    // pending violation 큐를 서버로 전송. 성공분만 큐에서 제거, 실패분은 남겨 다음 기회에 재시도.
+    // sendPendingUserLogs 와 동일 구조 — isSendingViolations 가드로 한 번에 하나만 실행.
+    private suspend fun sendPendingViolations() {
+        if (!isSendingViolations.compareAndSet(false, true)) return  // 이미 전송 중
+        try {
+            while (true) {
+                val queue = synchronized(violationLock) { readViolationsLocked() }
+                if (queue.isEmpty()) return
+
                 val token = getFirebaseToken()
                 if (token == null) {
-                    Log.e(TAG, "violation 전송 실패 — 토큰 없음")
-                    return@launch
+                    Log.e(TAG, "violation 전송 보류 — 토큰 없음 (다음 기회 재시도)")
+                    return
                 }
 
-                val client = okhttp3.OkHttpClient.Builder()
-                    .connectTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
-                    .readTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
-                    .writeTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
-                    .build()
-                val mediaType = "application/json".toMediaType()
-                val body = json.toRequestBody(mediaType)
-                val request = okhttp3.Request.Builder()
-                    .url("https://short-cut-server-production.up.railway.app/violations")
-                    .addHeader("Authorization", "Bearer $token")
-                    .post(body)
-                    .build()
+                // 네트워크 I/O 는 락 밖에서
+                val failed = ArrayList<PendingViolation>()
+                for (v in queue) {
+                    if (!postViolationBlocking(token, v)) failed.add(v)
+                }
 
-                val response = client.newCall(request).execute()
-                Log.d(TAG, "violation 전송 완료 — ${response.code}")
-            } catch (e: Exception) {
-                Log.e(TAG, "violation 전송 실패 — ${e.message}")
+                val keepLooping = synchronized(violationLock) {
+                    val current = readViolationsLocked()
+                    val newer = if (current.size > queue.size) current.subList(queue.size, current.size).toList()
+                    else emptyList()
+                    writeViolationsLocked(failed + newer)
+                    // 실패가 있으면 네트워크 불안정으로 보고 중단(다음 기회 재시도). 없으면 newer 만큼 더 처리.
+                    failed.isEmpty() && newer.isNotEmpty()
+                }
+                if (!keepLooping) return
             }
+        } finally {
+            isSendingViolations.set(false)
         }
     }
 
@@ -1404,6 +1601,7 @@ class ShortCutAccessibilityService : AccessibilityService() {
 
     override fun onDestroy() {
         dismissAllPopups()
+        try { unregisterReceiver(screenStateReceiver) } catch (_: Exception) {}
         batchHandler.removeCallbacks(batchTimerRunnable)
         flushBatch()
         super.onDestroy()
