@@ -15,12 +15,14 @@ interface ScrollHistoryDao {
 
     // 슬라이딩 윈도우 — 현재 시각 기준 최근 1시간 이내 스크롤 횟수 조회
     // hourly limit 초과 여부 판단에 사용
-    @Query("SELECT COUNT(*) FROM scroll_history WHERE timestamp >= :oneHourAgo")
-    suspend fun countLastHour(oneHourAgo: Long): Int
+    // 상한(:now)을 둬서 기기 시계를 과거로 되돌려도 '미래' timestamp 기록이 잡히지 않게 함.
+    @Query("SELECT COUNT(*) FROM scroll_history WHERE timestamp >= :oneHourAgo AND timestamp <= :now")
+    suspend fun countLastHour(oneHourAgo: Long, now: Long): Int
 
-    // 오늘 자정 이후 스크롤 횟수 조회 — daily limit 초과 여부 판단에 사용
-    @Query("SELECT COUNT(*) FROM scroll_history WHERE timestamp >= :startOfDay")
-    suspend fun countToday(startOfDay: Long): Int
+    // 오늘 [자정, 다음 자정) 스크롤 횟수 조회 — daily limit 초과 여부 판단에 사용
+    // 상한(:endOfDay)을 둬서 기기 시계를 과거로 되돌려도 '미래'(=실제 오늘) 기록이 잡히지 않게 함.
+    @Query("SELECT COUNT(*) FROM scroll_history WHERE timestamp >= :startOfDay AND timestamp < :endOfDay")
+    suspend fun countToday(startOfDay: Long, endOfDay: Long): Int
 
     // 1주일 이상 된 데이터 삭제 — 앱 시작 시 오래된 로그 정리용
     @Query("DELETE FROM scroll_history WHERE timestamp < :oneWeekAgo")

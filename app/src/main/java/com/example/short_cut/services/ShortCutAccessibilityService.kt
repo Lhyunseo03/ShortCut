@@ -112,7 +112,7 @@ class ShortCutAccessibilityService : AccessibilityService() {
     private val popupViews = mutableListOf<View>()
     // 팝업 뒤 전체화면 차단막 — 카드 밖 영역 터치를 흡수해 뒤(유튜브)가 스크롤/터치되지 않게 함.
     private var scrimView: View? = null
-    // 5분 차단 안내 popup 표시 중 여부 — 쇼츠 이탈(BACK) 로 조기 dismiss 되지 않고 6초 타이머로만 닫히게 구분
+    // 5분 차단 안내 popup 표시 중 여부 — 쇼츠 이탈(BACK) 로 조기 dismiss 되지 않고 3초 타이머로만 닫히게 구분
     private var blockPopupShowing = false
     private val mainHandler = Handler(Looper.getMainLooper())
 
@@ -195,7 +195,7 @@ class ShortCutAccessibilityService : AccessibilityService() {
 
         // 오늘 자정 이후 스크롤 횟수를 Room DB 에서 불러와 dailyCount 복원
         todayStartMs = getStartOfDayTimestamp()
-        dailyCount = scrollHistoryDao.countToday(todayStartMs)
+        dailyCount = scrollHistoryDao.countToday(todayStartMs, todayStartMs + 24L * 60L * 60L * 1000L)
         Log.d(TAG, "오늘 스크롤 복원: $dailyCount")
 
         // userId 변경 감지 → 다른 유저 데이터 흔적 제거
@@ -239,7 +239,7 @@ class ShortCutAccessibilityService : AccessibilityService() {
         if (dailyMilestone >= 0 && dailyCount < dailyMilestone) {
             dailyMilestone = -1
         }
-        val hourlyAtStart = scrollHistoryDao.countLastHour(now - 60L * 60L * 1000L)
+        val hourlyAtStart = scrollHistoryDao.countLastHour(now - 60L * 60L * 1000L, now)
         if (hourlyMilestone >= 0 && hourlyAtStart < hourlyMilestone) {
             hourlyMilestone = -1
         }
@@ -346,7 +346,7 @@ class ShortCutAccessibilityService : AccessibilityService() {
         // 어제 스크롤이 어제 날짜로 집계됨
         flushBatch()
         todayStartMs = startToday
-        dailyCount = scrollHistoryDao.countToday(startToday)
+        dailyCount = scrollHistoryDao.countToday(startToday, startToday + 24L * 60L * 60L * 1000L)
         dailyMilestone = -1
 
         // pending limit 변경이 있었다면 새 날짜에 맞춰 적용
@@ -480,7 +480,7 @@ class ShortCutAccessibilityService : AccessibilityService() {
 
             // 최근 1시간 스크롤 횟수 조회 (슬라이딩 윈도우)
             val oneHourAgo = now - (60 * 60 * 1000L)
-            val hourlyCount = scrollHistoryDao.countLastHour(oneHourAgo)
+            val hourlyCount = scrollHistoryDao.countLastHour(oneHourAgo, now)
             lastHourlyCount = hourlyCount
 
             Log.d(TAG, "스크롤 카운트 — hourly: $hourlyCount/$hourlyLimit, daily: $dailyCount/$dailyLimit")
@@ -594,7 +594,7 @@ class ShortCutAccessibilityService : AccessibilityService() {
         }
     }
 
-    // 5분 차단 안내 popup — 버튼 없이 6초 후 자동 dismiss (튕겨내기[BACK]는 호출부에서 그대로 수행)
+    // 5분 차단 안내 popup — 버튼 없이 3초 후 자동 dismiss (튕겨내기[BACK]는 호출부에서 그대로 수행)
     private fun showBlockPopup(remainingSec: Int) {
         mainHandler.post {
             dismissAllPopups()
@@ -604,7 +604,7 @@ class ShortCutAccessibilityService : AccessibilityService() {
             view.findViewById<LinearLayout>(R.id.popupButtonRow).visibility = View.GONE
             blockPopupShowing = true
             addPopupView(view, standardCenterParams(280))
-            mainHandler.postDelayed({ dismissAllPopups() }, 6000L)
+            mainHandler.postDelayed({ dismissAllPopups() }, 3000L)
         }
     }
 
@@ -944,11 +944,19 @@ class ShortCutAccessibilityService : AccessibilityService() {
                     setBackgroundColor(uniformColor)
                     layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
                         .apply { setMargins((4 * density).toInt(), 0, (4 * density).toInt(), 0) }
-                    setOnClickListener {
+                    setOnClickListener { clicked ->
                         if (answered) return@setOnClickListener
                         answered = true
                         // 다른 선택지 잠금
                         choiceButtons.forEach { it.isEnabled = false }
+                        // 내가 선택한 답 하이라이트 — 파란 배경 + 흰 테두리로 어떤 답을 골랐는지 표시
+                        val highlight = android.graphics.drawable.GradientDrawable().apply {
+                            setColor(android.graphics.Color.parseColor("#1E88E5"))
+                            cornerRadius = 8 * density
+                            setStroke((2 * density).toInt(), android.graphics.Color.WHITE)
+                        }
+                        clicked.background = highlight
+                        clicked.alpha = 1f  // 비활성화로 흐려지지 않게 선택지만 또렷하게
                         if (choice == correctAnswer) {
                             // 정답 — 그만보기/계속보기 둘 다 활성화해 사용자가 직접 선택
                             btnStop.isEnabled = true

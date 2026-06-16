@@ -110,7 +110,7 @@ class WeeklyReportWorker(
 
         val title = "주간 스크롤 리포트"
         val shortText = "이번 주 ${thisWeekTotal}회 · $trend"
-        val bigText = "이번 주 총 ${thisWeekTotal}회 (지난주 ${lastWeekTotal}회)\n$trend\n\n$recLine"
+        val bigText = "이번 주 총 ${thisWeekTotal}회 (지난주 ${lastWeekTotal}회)\n$trend\n\n$recLine\n\n탭하면 지난주·이번주 그래프를 볼 수 있어요."
 
         notify(ctx, title, shortText, bigText)
     }
@@ -153,8 +153,11 @@ class WeeklyReportWorker(
         }
         createChannel(ctx)
 
+        // 알림을 누르면 주간 리포트 화면(지난주 vs 이번주 그래프)이 열리도록 extra 전달
         val openIntent = Intent(ctx, MainActivity::class.java).apply {
-            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or
+                Intent.FLAG_ACTIVITY_SINGLE_TOP
+            putExtra(MainActivity.EXTRA_OPEN_WEEKLY_REPORT, true)
         }
         val pi = PendingIntent.getActivity(
             ctx, 0, openIntent,
