@@ -407,8 +407,13 @@ class ShortCutAccessibilityService : AccessibilityService() {
             return
         }
 
-        if (outcome.entered) {
-            // 미응답 popup 이 있으면 재표시 (앱 강제종료 후 재진입 시나리오)
+        // 미응답 popup 복원 — 다음 두 경우에 즉시 다시 띄운다.
+        //  1) detector 가 진입(entered)을 보고했을 때 (YT/IG: 창 전환으로 진입 감지, 앱 강제종료 후 재진입 등)
+        //  2) [신규] 타겟 앱으로 창이 전환됐을 때 (WINDOW_STATE_CHANGED).
+        //     TikTok 은 진입을 '첫 스크롤'로 감지해서 outcome.entered 가 늦게 떴고, 그래서 홈→재진입 시
+        //     스크롤을 한 번 더 해야 popup 이 떴다. 창 전환만으로도 복원되게 해 돌아오자마자 다시 뜨게 한다.
+        val reenteredTargetWindow = event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED
+        if ((outcome.entered || reenteredTargetWindow) && now >= stopUntilMs && popupViews.isEmpty()) {
             pendingPopupType?.let { type ->
                 Log.d(TAG, "미응답 popup 재표시 — type=$type, overage=$pendingPopupOverage")
                 showLimitPopup(type, pendingPopupOverage)
@@ -1088,8 +1093,11 @@ class ShortCutAccessibilityService : AccessibilityService() {
     // popup view 를 list 에 등록 + WindowManager 에 추가
     private fun addPopupView(view: View, params: WindowManager.LayoutParams) {
         try {
-            // 팝업보다 먼저 차단막을 깔아 두면(z-order 상 아래) 카드 밖 터치가 유튜브로 통과되지 않음
-            ensureScrim()
+            // [변경됨] 전체화면 차단막(scrim) 제거 — 팝업이 떠 있어도 홈으로 나갔다가 다시 돌아올 수 있게 한다.
+            //   팝업 창은 FLAG_NOT_TOUCH_MODAL 이라 카드 밖 터치는 뒤(유튜브/시스템 네비)로 통과하고
+            //   팝업 버튼만 동작한다. 다른 앱/홈으로 나가면 popup 은 숨겨지지만 pending 상태는 유지되어
+            //   타겟 앱에 재진입할 때 다시 복원된다.
+            removeScrim()
             windowManager?.addView(view, params)
             popupViews.add(view)
             isPopupShowing = true
