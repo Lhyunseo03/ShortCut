@@ -79,6 +79,8 @@ dependencies {
 
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
+    // viewModel() — Compose 화면에서 ViewModel 을 받기 위해 필요 (설정 > Devices). 버전은 lifecycle-runtime-ktx 와 맞춤.
+    implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.10.0")
     implementation(libs.androidx.activity.compose)
     implementation(platform(libs.androidx.compose.bom))
     implementation(libs.androidx.compose.ui)

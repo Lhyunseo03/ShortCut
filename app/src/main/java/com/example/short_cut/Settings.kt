@@ -89,7 +89,7 @@ import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Locale
 
-internal enum class SettingsSubScreen { ROOT, LIMIT, ACCOUNT }
+internal enum class SettingsSubScreen { ROOT, LIMIT, ACCOUNT, DEVICES }
 
 @Composable
 internal fun SettingsTabContent(
@@ -113,7 +113,8 @@ internal fun SettingsTabContent(
     when (subScreen) {
         SettingsSubScreen.ROOT -> SettingsRootScreen(
             onOpenLimit = { subScreen = SettingsSubScreen.LIMIT },
-            onOpenAccount = { subScreen = SettingsSubScreen.ACCOUNT }
+            onOpenAccount = { subScreen = SettingsSubScreen.ACCOUNT },
+            onOpenDevices = { subScreen = SettingsSubScreen.DEVICES }
         )
         SettingsSubScreen.LIMIT -> SettingsLimitScreen(
             onBack = { subScreen = SettingsSubScreen.ROOT; onConsumePrefill() },
@@ -124,13 +125,17 @@ internal fun SettingsTabContent(
             onBack = { subScreen = SettingsSubScreen.ROOT },
             onAuthChanged = onAuthChanged
         )
+        SettingsSubScreen.DEVICES -> SettingsDevicesScreen(
+            onBack = { subScreen = SettingsSubScreen.ROOT }
+        )
     }
 }
 
 @Composable
 internal fun SettingsRootScreen(
     onOpenLimit: () -> Unit,
-    onOpenAccount: () -> Unit
+    onOpenAccount: () -> Unit,
+    onOpenDevices: () -> Unit = {}
 ) {
     val context = LocalContext.current
     val auth = remember { FirebaseAuth.getInstance() }
@@ -242,6 +247,12 @@ internal fun SettingsRootScreen(
             label = "계정 관리",
             value = "열기 →",
             onClick = onOpenAccount
+        )
+        // 이 계정으로 로그인한 기기 목록 (다중 기기 동기화)
+        SettingsRow(
+            label = "Devices",
+            value = "열기 →",
+            onClick = onOpenDevices
         )
     }
 }
@@ -369,7 +380,7 @@ internal fun SettingsAccountScreen(onBack: () -> Unit, onAuthChanged: () -> Unit
                         scope.launch {
                             val ok = deleteAccountOnServer(user.uid)
                             if (ok) {
-                                db.scrollHistoryDao().deleteAll()
+                                com.example.short_cut.db.ScrollCountRepository.get(context).deleteAll()
                                 db.groupLimitDao().deleteAll()
                                 // deviceId 는 계정과 무관하게 기기에 유지(API 스펙 §0) — prefs 전체 삭제 후 다시 써 둔다.
                                 val deviceId = DeviceId.get(context)

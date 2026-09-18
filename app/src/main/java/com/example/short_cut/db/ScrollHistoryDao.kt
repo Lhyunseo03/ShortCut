@@ -13,6 +13,14 @@ interface ScrollHistoryDao {
     @Insert
     suspend fun insert(scroll: ScrollHistory)
 
+    // 여러 행 한 번에 추가 — 재설치 후 서버 기록 복원용
+    @Insert
+    suspend fun insertAll(scrolls: List<ScrollHistory>)
+
+    // 전체 행 수 — 기록이 비어 있는지(재설치 직후인지) 판단용
+    @Query("SELECT COUNT(*) FROM scroll_history")
+    suspend fun countAll(): Int
+
     // 슬라이딩 윈도우 — 현재 시각 기준 최근 1시간 이내 스크롤 횟수 조회
     // hourly limit 초과 여부 판단에 사용
     // 상한(:now)을 둬서 기기 시계를 과거로 되돌려도 '미래' timestamp 기록이 잡히지 않게 함.

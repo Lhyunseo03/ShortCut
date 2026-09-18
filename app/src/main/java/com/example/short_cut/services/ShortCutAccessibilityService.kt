@@ -20,7 +20,6 @@ import android.widget.LinearLayout
 import android.widget.TextView
 import com.example.short_cut.R
 import com.example.short_cut.db.AppDatabase
-import com.example.short_cut.db.ScrollHistory
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -65,7 +64,8 @@ class ShortCutAccessibilityService : AccessibilityService() {
     }
 
     // ── Room DB ───────────────────────────────────────────────
-    private lateinit var scrollHistoryDao: com.example.short_cut.db.ScrollHistoryDao
+    // 스크롤 카운트 읽기/쓰기는 전부 이 저장소를 거친다 (단일 스레드로 직렬화 — 동시 쓰기 경합 방지)
+    private lateinit var scrollCounts: com.example.short_cut.db.ScrollCountRepository
     private lateinit var userLimitDao: com.example.short_cut.db.UserLimitDao
 
     // 코루틴 스코프 — DB 작업은 메인 스레드에서 실행하면 안 되므로 별도 스코프 사용
@@ -177,7 +177,7 @@ class ShortCutAccessibilityService : AccessibilityService() {
         instance = this
 
         val db = AppDatabase.getDatabase(this)
-        scrollHistoryDao = db.scrollHistoryDao()
+        scrollCounts = com.example.short_cut.db.ScrollCountRepository.get(this)
         userLimitDao = db.userLimitDao()
 
         serviceScope.launch {
@@ -199,18 +199,18 @@ class ShortCutAccessibilityService : AccessibilityService() {
 
         // 1주일 이상 된 스크롤 기록 삭제
         val oneWeekAgo = now - (7 * 24 * 60 * 60 * 1000L)
-        scrollHistoryDao.deleteOlderThan(oneWeekAgo)
+        scrollCounts.deleteOlderThan(oneWeekAgo)
 
         // 오늘 자정 이후 스크롤 횟수를 Room DB 에서 불러와 dailyCount 복원
         todayStartMs = getStartOfDayTimestamp()
-        dailyCount = scrollHistoryDao.countToday(todayStartMs, todayStartMs + 24L * 60L * 60L * 1000L)
+        dailyCount = scrollCounts.dailyCount(todayStartMs)
         Log.d(TAG, "오늘 스크롤 복원: $dailyCount")
 
         // userId 변경 감지 → 다른 유저 데이터 흔적 제거
         val userId = prefs.getString("userId", "unknown") ?: "unknown"
         val lastUserId = prefs.getString("lastUserId", "") ?: ""
         if (userId != lastUserId) {
-            scrollHistoryDao.deleteOlderThan(now + 1L) // 전체 삭제
+            scrollCounts.deleteOlderThan(now + 1L) // 전체 삭제
             prefs.edit()
                 .putString("lastUserId", userId)
                 .remove(PK_DAILY_MILESTONE)
@@ -247,7 +247,7 @@ class ShortCutAccessibilityService : AccessibilityService() {
         if (dailyMilestone >= 0 && dailyCount < dailyMilestone) {
             dailyMilestone = -1
         }
-        val hourlyAtStart = scrollHistoryDao.countLastHour(now - 60L * 60L * 1000L, now)
+        val hourlyAtStart = scrollCounts.hourlyCount(now)
         if (hourlyMilestone >= 0 && hourlyAtStart < hourlyMilestone) {
             hourlyMilestone = -1
         }
@@ -266,7 +266,19 @@ class ShortCutAccessibilityService : AccessibilityService() {
 
         // 재설치/데이터 손실 후 당일 카운트 복원 — 서버 /daily 의 totalScroll 로 시드.
         // 네트워크 의존이므로 위 로컬 복원/상태저장을 막지 않게 별도 코루틴에서 수행.
-        serviceScope.launch { seedDailyCountFromServer(userId) }
+        serviceScope.launch {
+            // 재설치 직후(폰 안 기록이 비어 있음)면 서버의 최근 7일 기록으로 Room 을 먼저 채운다
+            // → 홈 탭 · 통계 · 시간당 한도가 0 부터가 아니라 서버 값에서 이어서 쌓인다.
+            // 위의 "계정 변경 시 전체 삭제" 보다 뒤에서 실행돼야 복원한 기록이 지워지지 않는다.
+            val restored = com.example.short_cut.HistoryRestore
+                .restoreIfNeeded(this@ShortCutAccessibilityService, userId)
+            if (restored) {
+                val fromRoom = scrollCounts.dailyCount(todayStartMs)
+                if (fromRoom > dailyCount) dailyCount = fromRoom
+                Log.d(TAG, "서버 기록 복원 후 오늘 카운트: $dailyCount")
+            }
+            seedDailyCountFromServer(userId)
+        }
     }
 
     // [신규] 재설치/데이터 손실 시 당일 카운트 복원 — 서버 GET /stats/:userId/daily 의 totalScroll 로 시드.
@@ -354,7 +366,7 @@ class ShortCutAccessibilityService : AccessibilityService() {
         // 어제 스크롤이 어제 날짜로 집계됨
         flushBatch()
         todayStartMs = startToday
-        dailyCount = scrollHistoryDao.countToday(startToday, startToday + 24L * 60L * 60L * 1000L)
+        dailyCount = scrollCounts.dailyCount(startToday)
         dailyMilestone = -1
 
         // pending limit 변경이 있었다면 새 날짜에 맞춰 적용
@@ -476,7 +488,7 @@ class ShortCutAccessibilityService : AccessibilityService() {
             handleDayRolloverIfNeeded(now, userId)
 
             // 스크롤 이벤트를 Room DB 에 저장
-            scrollHistoryDao.insert(ScrollHistory(appPkg = appPkg, timestamp = now))
+            scrollCounts.recordScroll(appPkg, now)
 
             dailyCount++
 
@@ -500,65 +512,76 @@ class ShortCutAccessibilityService : AccessibilityService() {
             if (reachedBatch) flushBatch()
 
             // 최근 1시간 스크롤 횟수 조회 (슬라이딩 윈도우)
-            val oneHourAgo = now - (60 * 60 * 1000L)
-            val hourlyCount = scrollHistoryDao.countLastHour(oneHourAgo, now)
+            val hourlyCount = scrollCounts.hourlyCount(now)
             lastHourlyCount = hourlyCount
 
             Log.d(TAG, "스크롤 카운트 — hourly: $hourlyCount/$hourlyLimit, daily: $dailyCount/$dailyLimit")
 
-            // hourly milestone 하향 조정 — 슬라이딩 윈도우로 카운트가 줄면 milestone 도 따라 낮춘다.
-            //  (예전엔 "한도 미만으로 떨어졌을 때만" 리셋해서, 한도 위에서 카운트가 줄었다 다시 오르는
-            //   binge 중에는 milestone 이 높은 값에 stuck 돼 재경고가 안 뜨던 문제가 있었음.)
-            //  - 한도 미만으로 떨어지면 완전 리셋(-1): 다음에 다시 limit 도달 시 "첫 팝업"부터.
-            //  - 한도 이상이지만 현재 카운트가 milestone 보다 낮아졌으면, 현재 카운트의 step 레벨로 낮춤
-            //    → 거기서 다시 STEP 만큼 오르면 재경고. (예: limit50, 63→milestone60 후 55로 감소 → milestone50,
-            //       다시 60 도달 시 재경고)
-            if (hourlyMilestone >= 0) {
-                if (hourlyCount < hourlyLimit) {
-                    hourlyMilestone = -1
+            // 한도 검사 — 스크롤 직후. (3주차: 서버 /sync 값을 반영한 직후에도 같은 함수를 호출)
+            checkLimits(hourlyCount, dailyCount)
+        }
+    }
+
+    // 한도 검사 — 현재 카운트를 한도와 비교(≥)해서 필요하면 팝업을 띄운다. 팝업을 띄웠으면 true.
+    // 스크롤할 때마다 호출되고, 카운트가 다른 경로(서버 동기화 등)로 바뀐 직후에도 그대로 호출할 수 있다.
+    // hourly 팝업이 뜨면 daily 는 이번에 검사하지 않는다(팝업은 한 번에 하나) — 기존 동작 그대로.
+    private suspend fun checkLimits(hourlyNow: Int, dailyNow: Int): Boolean {
+        // hourly milestone 하향 조정 — 슬라이딩 윈도우로 카운트가 줄면 milestone 도 따라 낮춘다.
+        //  (예전엔 "한도 미만으로 떨어졌을 때만" 리셋해서, 한도 위에서 카운트가 줄었다 다시 오르는
+        //   binge 중에는 milestone 이 높은 값에 stuck 돼 재경고가 안 뜨던 문제가 있었음.)
+        //  - 한도 미만으로 떨어지면 완전 리셋(-1): 다음에 다시 limit 도달 시 "첫 팝업"부터.
+        //  - 한도 이상이지만 현재 카운트가 milestone 보다 낮아졌으면, 현재 카운트의 step 레벨로 낮춤
+        //    → 거기서 다시 STEP 만큼 오르면 재경고. (예: limit50, 63→milestone60 후 55로 감소 → milestone50,
+        //       다시 60 도달 시 재경고)
+        if (hourlyMilestone >= 0) {
+            if (hourlyNow < hourlyLimit) {
+                hourlyMilestone = -1
+                savePersistedState()
+            } else if (hourlyNow < hourlyMilestone) {
+                val stepLevel = hourlyLimit + ((hourlyNow - hourlyLimit) / HOURLY_STEP) * HOURLY_STEP
+                if (stepLevel < hourlyMilestone) {
+                    hourlyMilestone = stepLevel
                     savePersistedState()
-                } else if (hourlyCount < hourlyMilestone) {
-                    val stepLevel = hourlyLimit + ((hourlyCount - hourlyLimit) / HOURLY_STEP) * HOURLY_STEP
-                    if (stepLevel < hourlyMilestone) {
-                        hourlyMilestone = stepLevel
-                        savePersistedState()
-                    }
-                }
-            }
-
-            // hourly 체크 — milestone 단위로 트리거.
-            // milestone=-1 (서비스 재시작/슬라이딩 윈도우로 reset 직후) 인데 카운트가 이미 limit+N*STEP 이상이면,
-            // 가장 가까운 STEP 배수로 첫 트리거를 맞춤. (아니면 limit→limit+STEP→... 까지 매 스크롤마다 popup 폭주)
-            if (hourlyCount >= hourlyLimit) {
-                val nextTrigger = if (hourlyMilestone < 0) {
-                    hourlyLimit + ((hourlyCount - hourlyLimit) / HOURLY_STEP) * HOURLY_STEP
-                } else {
-                    hourlyMilestone + HOURLY_STEP
-                }
-                if (hourlyCount >= nextTrigger) {
-                    hourlyMilestone = nextTrigger
-                    val overage = nextTrigger - hourlyLimit
-                    setPendingPopup("hourly", overage)
-                    withContext(Dispatchers.Main) { showLimitPopup("hourly", overage) }
-                    return@launch
-                }
-            }
-
-            // daily 체크 — milestone 단위로 트리거. (hourly 와 동일한 따라잡기 처리)
-            if (dailyCount >= dailyLimit) {
-                val nextTrigger = if (dailyMilestone < 0) {
-                    dailyLimit + ((dailyCount - dailyLimit) / DAILY_STEP) * DAILY_STEP
-                } else {
-                    dailyMilestone + DAILY_STEP
-                }
-                if (dailyCount >= nextTrigger) {
-                    dailyMilestone = nextTrigger
-                    val overage = nextTrigger - dailyLimit
-                    setPendingPopup("daily", overage)
-                    withContext(Dispatchers.Main) { showLimitPopup("daily", overage) }
                 }
             }
         }
+
+        // hourly 체크
+        val hourlyTrigger = reachedMilestone(hourlyNow, hourlyLimit, hourlyMilestone, HOURLY_STEP)
+        if (hourlyTrigger != null) {
+            hourlyMilestone = hourlyTrigger
+            val overage = hourlyTrigger - hourlyLimit
+            setPendingPopup("hourly", overage)
+            withContext(Dispatchers.Main) { showLimitPopup("hourly", overage) }
+            return true
+        }
+
+        // daily 체크
+        val dailyTrigger = reachedMilestone(dailyNow, dailyLimit, dailyMilestone, DAILY_STEP)
+        if (dailyTrigger != null) {
+            dailyMilestone = dailyTrigger
+            val overage = dailyTrigger - dailyLimit
+            setPendingPopup("daily", overage)
+            withContext(Dispatchers.Main) { showLimitPopup("daily", overage) }
+            return true
+        }
+        return false
+    }
+
+    // 이번에 팝업을 띄워야 하는 milestone 값. 아직 아니면 null. (hourly/daily 공통 — 비교는 전부 ≥)
+    //  - milestone = -1 (오늘/이번 윈도우 첫 팝업, 또는 서비스 재시작 · 슬라이딩 윈도우 리셋 직후):
+    //    카운트가 이미 limit+N*STEP 이상이면 가장 가까운 STEP 배수로 맞춘다.
+    //    (아니면 limit → limit+STEP → ... 까지 매 스크롤마다 popup 폭주)
+    //  - milestone ≥ 0: 직전 팝업에서 STEP 만큼 더 올라야 다음 팝업.
+    //    스크롤은 1씩 오르므로 결과는 항상 milestone+STEP — 기존과 동일.
+    //    카운트가 한 번에 여러 STEP 을 건너뛴 경우(서버 동기화로 값이 점프)에는 현재 단계로 바로 맞춰서
+    //    팝업이 1번만 뜬다. (아니면 이후 스크롤마다 밀린 단계 수만큼 팝업이 연달아 뜸)
+    private fun reachedMilestone(count: Int, limit: Int, milestone: Int, step: Int): Int? {
+        if (count < limit) return null
+        if (milestone < 0) return limit + ((count - limit) / step) * step
+        val next = milestone + step
+        if (count < next) return null
+        return next + ((count - next) / step) * step
     }
 
     // ── Popup 빌더 ────────────────────────────────────────────

@@ -1,19 +1,25 @@
-<?xml version="1.0" encoding="utf-8"?><!--
-   Sample data extraction rules file; uncomment and customize as necessary.
-   See https://developer.android.com/about/versions/12/backup-restore#xml-changes
-   for details.
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+   백업 · 기기 간 데이터 이전을 전부 막는다 (API 31+).
+   이유: 앱 데이터에 deviceId · FCM 토큰 · 로그인 상태가 들어 있어서, 복원되면
+     - 재설치 후에도 옛 deviceId 가 돌아오고 (스펙: 재설치 = 새 기기)
+     - 새 기기로 이전하면 두 기기가 같은 deviceId 를 갖게 돼 다중 기기 합산이 틀어진다.
+   스크롤 기록 · 한도 등 중요한 데이터는 서버에 있으므로 백업이 없어도 된다.
+   (API 30 이하는 매니페스트의 allowBackup="false" 로 막힘)
 -->
 <data-extraction-rules>
     <cloud-backup>
-        <!-- TODO: Use <include> and <exclude> to control what is backed up.
-        <include .../>
-        <exclude .../>
-        -->
+        <exclude domain="root" path="." />
+        <exclude domain="file" path="." />
+        <exclude domain="database" path="." />
+        <exclude domain="sharedpref" path="." />
+        <exclude domain="external" path="." />
     </cloud-backup>
-    <!--
     <device-transfer>
-        <include .../>
-        <exclude .../>
+        <exclude domain="root" path="." />
+        <exclude domain="file" path="." />
+        <exclude domain="database" path="." />
+        <exclude domain="sharedpref" path="." />
+        <exclude domain="external" path="." />
     </device-transfer>
-    -->
 </data-extraction-rules>

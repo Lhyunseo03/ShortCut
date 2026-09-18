@@ -183,8 +183,9 @@ internal fun HomeTabContent() {
     LaunchedEffect(Unit) {
         while (true) {
             val now = System.currentTimeMillis()
-            todayCount = db.scrollHistoryDao().countToday(startOfDayMs(), startOfDayMs(1))
-            lastHourCount = db.scrollHistoryDao().countLastHour(now - 60 * 60 * 1000, now)
+            val scrollCounts = com.example.short_cut.db.ScrollCountRepository.get(context)
+            todayCount = scrollCounts.dailyCount(startOfDayMs())
+            lastHourCount = scrollCounts.hourlyCount(now)
             if (userId != null) {
                 // 만료된 pending 먼저 promote 해서 오늘 적용되는 값으로 정렬
                 // [변경됨] promoteExpiredPending → promoteAndSyncLimit:

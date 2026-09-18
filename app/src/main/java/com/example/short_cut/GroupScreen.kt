@@ -158,8 +158,7 @@ private fun GroupListScreen(onCreate: () -> Unit, onOpen: (String) -> Unit) {
         loading = true
         error = null
         // 서버가 myTodayCount 를 안 주면 이 기기의 오늘 카운트로 대체
-        val dayStart = startOfDayMs()
-        localToday = db.scrollHistoryDao().countToday(dayStart, dayStart + 24L * 60 * 60 * 1000)
+        localToday = com.example.short_cut.db.ScrollCountRepository.get(context).dailyCount(startOfDayMs())
 
         val res = fetchGroups()
         val list = res.value
