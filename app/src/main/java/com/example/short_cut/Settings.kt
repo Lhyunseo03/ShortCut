@@ -335,6 +335,8 @@ internal fun SettingsAccountScreen(onBack: () -> Unit, onAuthChanged: () -> Unit
                 TextButton(onClick = {
                     auth.signOut()
                     prefs.edit().remove("userId").apply()
+                    // 그룹 한도 캐시는 계정별 데이터 — 다른 계정으로 로그인했을 때 남아 있지 않게 비움
+                    appScope.launch { db.groupLimitDao().deleteAll() }
                     showLogoutConfirm = false
                     onAuthChanged()
                 }) { Text("예") }
@@ -368,7 +370,10 @@ internal fun SettingsAccountScreen(onBack: () -> Unit, onAuthChanged: () -> Unit
                             val ok = deleteAccountOnServer(user.uid)
                             if (ok) {
                                 db.scrollHistoryDao().deleteAll()
-                                prefs.edit().clear().apply()
+                                db.groupLimitDao().deleteAll()
+                                // deviceId 는 계정과 무관하게 기기에 유지(API 스펙 §0) — prefs 전체 삭제 후 다시 써 둔다.
+                                val deviceId = DeviceId.get(context)
+                                prefs.edit().clear().putString("deviceId", deviceId).apply()
                                 try { auth.signOut() } catch (_: Exception) {}
                                 Toast.makeText(context, "탈퇴 완료", Toast.LENGTH_SHORT).show()
                                 showDeleteConfirm = false
