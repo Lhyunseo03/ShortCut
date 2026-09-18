@@ -137,6 +137,8 @@ fun LoginScreen(onLoginSuccess: () -> Unit = {}) {
                     // appScope(앱 수명) 에서 실행 — onLoginSuccess() 로 화면이 곧바로 전환돼도
                     // fetch+Room 저장이 취소되지 않고 끝까지 완료됨(과잉 차단 방지).
                     appScope.launch {
+                        // 다중 기기 — 이 기기를 서버에 등록(FCM 토큰 포함). 실패해도 다음 앱 시작 때 재시도됨.
+                        registerDevice(context)
                         val limits = fetchLimitsFromServer(userId)
                         if (limits != null) {
                             val (h, d) = limits

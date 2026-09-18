@@ -169,6 +169,11 @@ fun AppRoot(openWeeklyReport: MutableState<Boolean> = remember { mutableStateOf(
 
     var currentScreen by remember { mutableStateOf(resolveScreen()) }
 
+    // 앱 시작 시 기기 등록 갱신 (lastSeen · FCM 토큰 · 권한 상태 · deviceCount). 미로그인이면 아무것도 안 함.
+    LaunchedEffect(Unit) {
+        appScope.launch { registerDevice(context) }
+    }
+
     val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->

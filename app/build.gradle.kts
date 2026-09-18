@@ -68,6 +68,9 @@ dependencies {
     // Firebase Auth — 구글 로그인 인증
     implementation("com.google.firebase:firebase-auth-ktx")
 
+    // Firebase Cloud Messaging — 다중 기기 동기화용 무음 data message(FLUSH / COUNT_UPDATED) 수신
+    implementation("com.google.firebase:firebase-messaging-ktx")
+
     // Google Sign-In — 구글 계정 선택 UI 제공
     implementation("com.google.android.gms:play-services-auth:21.2.0")
 

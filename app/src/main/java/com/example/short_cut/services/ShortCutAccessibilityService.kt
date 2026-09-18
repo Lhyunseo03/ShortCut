@@ -57,6 +57,11 @@ class ShortCutAccessibilityService : AccessibilityService() {
         const val PK_TODAY_START = "todayStartMs"              // 마지막으로 처리한 "오늘 0시" — 날짜 롤오버 감지용
         const val PK_PENDING_USERLOGS = "pendingUserLogs"      // 서버 전송 대기/실패한 userlog 큐 (JSON 배열 [{ts,count}])
         const val PK_PENDING_VIOLATIONS = "pendingViolations"  // 서버 전송 대기/실패한 violation 큐 (JSON 배열)
+
+        // 실행 중인 서비스 인스턴스 — FCM 서비스(같은 프로세스)가 FLUSH 수신 시 즉시 업로드를 요청하는 데 사용.
+        // onServiceConnected 에서 설정, onDestroy 에서 해제.
+        @Volatile var instance: ShortCutAccessibilityService? = null
+            private set
     }
 
     // ── Room DB ───────────────────────────────────────────────
@@ -127,6 +132,8 @@ class ShortCutAccessibilityService : AccessibilityService() {
                 dismissAllPopups()
             }
             detectors.forEach { if (it.inShortsMode) it.onPackageLeft() }
+            // 화면 꺼짐 → 미전송분 즉시 업로드 (다른 기기의 첫 /sync 조회가 바로 정확하도록)
+            flushIfUnsent("화면 꺼짐")
         }
     }
 
@@ -167,6 +174,7 @@ class ShortCutAccessibilityService : AccessibilityService() {
         }
         serviceInfo = info
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
+        instance = this
 
         val db = AppDatabase.getDatabase(this)
         scrollHistoryDao = db.scrollHistoryDao()
@@ -384,6 +392,8 @@ class ShortCutAccessibilityService : AccessibilityService() {
                     dismissAllPopups()
                 }
                 detectors.forEach { if (it.inShortsMode) it.onPackageLeft() }
+                // 홈/다른 앱 전환 → 미전송분 즉시 업로드
+                flushIfUnsent("다른 앱($pkg) 전환")
             }
             return
         }
@@ -407,6 +417,10 @@ class ShortCutAccessibilityService : AccessibilityService() {
             return
         }
 
+        // 기기 2대 이상이면 쇼츠 진입 시점부터 1분 주기로 — 이미 예약된 5분 타이머가 울릴 때까지 기다리지 않게 다시 예약.
+        // (1대뿐이면 건드리지 않음 — 진입할 때마다 5분 타이머가 리셋되면 안 되므로)
+        if (outcome.entered && isMultiDevice()) scheduleBatchTimer()
+
         // 미응답 popup 복원 — 다음 두 경우에 즉시 다시 띄운다.
         //  1) detector 가 진입(entered)을 보고했을 때 (YT/IG: 창 전환으로 진입 감지, 앱 강제종료 후 재진입 등)
         //  2) [신규] 타겟 앱으로 창이 전환됐을 때 (WINDOW_STATE_CHANGED).
@@ -426,6 +440,8 @@ class ShortCutAccessibilityService : AccessibilityService() {
                 Log.d(TAG, "쇼츠 이탈 → popup 숨김 (pending 유지)")
                 dismissAllPopups()
             }
+            // 쇼츠 이탈 → 미전송분 즉시 업로드
+            flushIfUnsent("쇼츠 이탈")
         }
 
         if (outcome.scrolled) {
@@ -1152,6 +1168,8 @@ class ShortCutAccessibilityService : AccessibilityService() {
         clearPendingPopup()
         dismissAllPopups()
         Log.d(TAG, "그만보기 선택 → 5분 차단 시작")
+        // Stop → 미전송분 즉시 업로드
+        flushIfUnsent("그만보기")
         // 현재 쇼츠 모드 detector 중 인스타가 있으면 BACK, 아니면 HOME
         val isInstagram = detectors.any {
             it.packageName == "com.instagram.android" && it.inShortsMode
@@ -1513,7 +1531,8 @@ class ShortCutAccessibilityService : AccessibilityService() {
                 "logId": "${log.id}",
                 "timestamp": ${log.ts},
                 "scrollCount": ${log.count},
-                "platform": "${platformOf(log.appPkg)}"
+                "platform": "${platformOf(log.appPkg)}",
+                "deviceId": "${com.example.short_cut.DeviceId.get(this)}"
             }
         """.trimIndent()
             val client = okhttp3.OkHttpClient.Builder()
@@ -1580,8 +1599,17 @@ class ShortCutAccessibilityService : AccessibilityService() {
         }
     }
 
+    // 이 계정의 로그인 상태 기기가 2대 이상인지 — /devices/register 응답의 deviceCount(prefs) 기준.
+    private fun isMultiDevice(): Boolean =
+        getSharedPreferences(PREFS, MODE_PRIVATE).getInt(com.example.short_cut.PK_DEVICE_COUNT, 1) >= 2
+
+    // 배치 타이머 주기(D2): 기기 2대 이상 + 지금 쇼츠를 보는 중이면 1분, 그 외에는 기존대로 5분.
+    // 타이머가 울릴 때마다 다시 계산하므로 쇼츠에서 나가면 다음 주기부터 자동으로 5분으로 돌아간다.
     private fun scheduleBatchTimer() {
-        batchHandler.postDelayed(batchTimerRunnable, 5 * 60 * 1000L)
+        val watching = detectors.any { it.inShortsMode }
+        val delayMs = if (watching && isMultiDevice()) 60 * 1000L else 5 * 60 * 1000L
+        batchHandler.removeCallbacks(batchTimerRunnable)   // 중복 예약 방지 — 타이머는 항상 하나만
+        batchHandler.postDelayed(batchTimerRunnable, delayMs)
     }
 
     // 현재 배치를 pending 큐에 영속화(즉시, 동기)하고 전송을 트리거.
@@ -1596,6 +1624,23 @@ class ShortCutAccessibilityService : AccessibilityService() {
             }
         }
         serviceScope.launch { sendPendingUserLogs() }
+    }
+
+    // 즉시 업로드 트리거(쇼츠 이탈 · 앱 전환 · Stop · 화면 꺼짐)용 — 아직 큐에 안 들어간 스크롤이 있을 때만 flush.
+    // 다른 앱의 창 전환마다 불릴 수 있으므로, 보낼 게 없으면 코루틴도 띄우지 않고 바로 반환한다.
+    // (10회/5분 트리거는 기존대로 flushBatch 를 직접 호출)
+    private fun flushIfUnsent(reason: String) {
+        val unsent = synchronized(pendingLock) { batchScrollCount }
+        if (unsent <= 0) return
+        Log.d(TAG, "즉시 업로드 — $reason (미전송 ${unsent}회)")
+        flushBatch()
+    }
+
+    // FCM FLUSH 수신 시 ShortCutMessagingService 가 호출 — 현재 배치 + 큐에 남은 실패분까지 바로 전송.
+    // 보낼 게 없으면 sendPendingUserLogs 가 아무 요청 없이 끝난다.
+    fun flushFromRemote() {
+        Log.d(TAG, "즉시 업로드 — FCM FLUSH")
+        flushBatch()
     }
 
     // 모든 popup view 제거 — variant 4 stacked 포함 전체 dismiss
@@ -1616,6 +1661,7 @@ class ShortCutAccessibilityService : AccessibilityService() {
     }
 
     override fun onDestroy() {
+        if (instance === this) instance = null
         dismissAllPopups()
         try { unregisterReceiver(screenStateReceiver) } catch (_: Exception) {}
         batchHandler.removeCallbacks(batchTimerRunnable)
