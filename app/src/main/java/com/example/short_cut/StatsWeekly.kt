@@ -165,12 +165,11 @@ internal fun StatsWeekly() {
             dayTotals = days.associateWith { local[it] ?: 0 }
             loading = false
 
-            // 2단계: 미싱 날짜만 서버에서 백그라운드로 보강해 dayTotals 갱신
-            val missing = days.filter { !local.containsKey(it) }
-            if (missing.isNotEmpty()) {
+            // 2단계: 서버(모든 기기 합) 로 보강 — 날짜별로 로컬/서버 중 큰 쪽
+            if (days.isNotEmpty()) {
                 refreshing = true
-                val server = fetchDailyTotalsForDays(userId, missing)
-                val result = days.associateWith { d -> local[d] ?: server[d] ?: 0 }
+                val server = fetchDailyTotalsForDays(userId, days)
+                val result = days.associateWith { d -> maxOf(local[d] ?: 0, server[d] ?: 0) }
                 dayTotals = result
                 StatsCache.put("weekly:$userId:$displayYear", result)
                 refreshing = false

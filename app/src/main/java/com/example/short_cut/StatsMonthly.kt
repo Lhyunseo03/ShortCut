@@ -154,11 +154,12 @@ internal fun MonthInlineDetail(monthOffset: Int) {
             val monthDays = (1..daysInMonth).map { day ->
                 tmp.set(Calendar.DAY_OF_MONTH, day); fmt.format(tmp.time)
             }
-            // 로컬 우선 — 로컬에 행이 있는 날짜는 그 값, 없는 날짜만 서버 폴백
+            // 서버(모든 기기 합) 와 로컬 중 큰 쪽. 미래 날짜는 서버에 안 물어봄.
             val local = db.scrollHistoryDao().countByDay().associate { it.day to it.count }
-            val missing = monthDays.filter { !local.containsKey(it) }
-            val server = if (missing.isNotEmpty()) fetchDailyStatsForDays(userId, missing) else emptyMap()
-            val merged = monthDays.associateWith { d -> local[d] ?: server[d]?.totalScroll ?: 0 }
+            val todayKey = fmt.format(java.util.Date(startOfDayMs(0)))
+            val askServer = monthDays.filter { it <= todayKey }
+            val server = if (askServer.isNotEmpty()) fetchDailyStatsForDays(userId, askServer) else emptyMap()
+            val merged = monthDays.associateWith { d -> maxOf(local[d] ?: 0, server[d]?.totalScroll ?: 0) }
             dayCounts = merged
             StatsCache.put("monthDays:$userId:$monthKey", merged)
         }

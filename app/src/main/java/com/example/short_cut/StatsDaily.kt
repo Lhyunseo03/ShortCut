@@ -327,6 +327,13 @@ internal fun StatsDaily(monthOffset: Int, onMonthOffsetChange: (Int) -> Unit) {
 
     val monthKey = remember(monthOffset) { SimpleDateFormat("yyyy-MM", Locale.US).format(monthCal.time) }
 
+    // 달력 각 줄(월~일 한 주)에 적용됐던 한도 — 셀 색(그 주 한도 초과 여부)과 줄 왼쪽 표시에 사용.
+    // 한도는 월요일에만 바뀌므로 주 단위로 하나면 된다. key = 그 주 월요일 0시 ms, value = (daily, hourly).
+    //  - 오늘이 속한 주: 로컬 현재 한도 (서버 스냅샷은 그날 밤 finalize 때 생겨서 오늘 건 아직 없음)
+    //  - 지난 주: 서버 /daily 가 박제한 그날의 dailyLimit/hourlyLimit. 그 주 첫 날부터 순서대로 찾아 처음 나온 값.
+    //    (서비스가 꺼져 있던 날은 스냅샷이 없을 수 있어 여러 날을 시도)
+    var weekLimits by remember { mutableStateOf<Map<Long, Pair<Int, Int>>>(emptyMap()) }
+
     // 표시 중인 달의 일자별 스크롤 수를 서버 /daily 로 가져옴(상세 그래프와 동일 소스).
     // 서버 응답이 있는 날은 서버값, 없는 날(오프라인 등)만 로컬 Room countByDay 로 폴백.
     LaunchedEffect(monthOffset, userId) {
@@ -342,14 +349,15 @@ internal fun StatsDaily(monthOffset: Int, onMonthOffsetChange: (Int) -> Unit) {
         val monthDays = (1..daysInMonth).map { day ->
             tmp.set(Calendar.DAY_OF_MONTH, day); fmt.format(tmp.time)
         }
-        // 로컬 우선 — 7일치 보관 한도 안의 날짜는 로컬이 항상 최신(홈탭과 일치).
-        // 로컬에 행 자체가 없는(8일 이전 등) 날짜만 서버에서 가져와 폴백 → 서버 호출 최소화.
+        // 서버(모든 기기 합) 와 로컬(이 기기) 중 큰 쪽 — 서버가 기준이고, 로컬이 더 큰 경우는 아직 안 올라간 스크롤.
+        // 미래 날짜는 서버에 물어볼 필요 없음. (로컬은 7일치뿐이라 서버 호출은 기존보다 최대 7건 늘어남)
         val local = db.scrollHistoryDao().countByDay().associate { it.day to it.count }
-        val missing = monthDays.filter { !local.containsKey(it) }
-        val server = if (missing.isNotEmpty() && userId != null) {
-            fetchDailyStatsForDays(userId, missing)
+        val todayKey = fmt.format(java.util.Date(startOfDayMs(0)))
+        val askServer = monthDays.filter { it <= todayKey }
+        val server = if (askServer.isNotEmpty() && userId != null) {
+            fetchDailyStatsForDays(userId, askServer)
         } else emptyMap()
-        val merged = monthDays.associateWith { d -> local[d] ?: server[d]?.totalScroll ?: 0 }
+        val merged = monthDays.associateWith { d -> maxOf(local[d] ?: 0, server[d]?.totalScroll ?: 0) }
         dayCounts = merged
         userId?.let { StatsCache.put("monthDays:$it:$monthKey", merged) }
     }
@@ -367,6 +375,44 @@ internal fun StatsDaily(monthOffset: Int, onMonthOffsetChange: (Int) -> Unit) {
 
     // 선택된 날짜 — 절대 자정 millis. 기본값 = 오늘.
     val todayMidnight = remember { startOfDayMs(0) }
+    val thisMonday = remember(todayMidnight) { mondayOf(todayMidnight) }
+
+    // 표시 중인 달의 지난 주들에 적용됐던 한도를 서버 스냅샷에서 가져온다 (주마다 보통 1회 호출, 1분 캐시).
+    LaunchedEffect(monthOffset, userId, currentDailyLimit, currentHourlyLimit) {
+        val fmt = SimpleDateFormat("yyyy-MM-dd", Locale.US)
+        val result = mutableMapOf<Long, Pair<Int, Int>>()
+        val firstRowMonday = monthCal.timeInMillis - firstDayOfWeek * 24L * 60 * 60 * 1000
+        val totalRowsForFetch = (firstDayOfWeek + daysInMonth + 6) / 7
+        val pastWeeks = ArrayList<Pair<Long, List<String>>>()   // (월요일 ms, 그 주에 속하면서 이 달 안 · 과거인 날짜들)
+        for (rowIdx in 0 until totalRowsForFetch) {
+            val monday = firstRowMonday + rowIdx * 7L * 24 * 60 * 60 * 1000
+            if (monday == thisMonday) { result[monday] = currentDailyLimit to currentHourlyLimit; continue }
+            if (monday > thisMonday) continue   // 미래 주
+            val days = (0 until 7).mapNotNull { d ->
+                val ms = monday + d * 24L * 60 * 60 * 1000
+                val cal = Calendar.getInstance().apply { timeInMillis = ms }
+                if (cal.get(Calendar.YEAR) == year && cal.get(Calendar.MONTH) == month && ms < todayMidnight) fmt.format(cal.time) else null
+            }
+            if (days.isNotEmpty()) pastWeeks += monday to days
+        }
+        // 과거 주는 현재 한도로 먼저 채워 두고(즉시 표시), 서버 스냅샷이 오면 교체
+        pastWeeks.forEach { (monday, _) -> result[monday] = currentDailyLimit to currentHourlyLimit }
+        weekLimits = result.toMap()
+        if (userId == null) return@LaunchedEffect
+        pastWeeks.forEach { (monday, days) ->
+            val cacheKey = "weekLimits:$userId:$monday"
+            val cached = StatsCache.get<Pair<Int, Int>>(cacheKey)
+            val found = cached ?: run {
+                var f: Pair<Int, Int>? = null
+                for (d in days) {
+                    val st = fetchDailyStats(userId, d) ?: continue
+                    if (st.dailyLimit > 0) { f = st.dailyLimit to (st.hourlyLimit ?: 0); break }
+                }
+                f?.also { StatsCache.put(cacheKey, it) }
+            }
+            if (found != null) weekLimits = weekLimits + (monday to found)
+        }
+    }
     var selectedDayMs by remember { mutableStateOf(todayMidnight) }
     val selectedDateStr = remember(selectedDayMs) {
         SimpleDateFormat("yyyy-MM-dd", Locale.US).format(java.util.Date(selectedDayMs))
@@ -387,6 +433,9 @@ internal fun StatsDaily(monthOffset: Int, onMonthOffsetChange: (Int) -> Unit) {
     // serverStats 는 별도로 계속 가져옴(stopCount/ignoreCount/hourlyLimit 같은 메트릭은 서버에만 있음).
     var counts by remember { mutableStateOf(IntArray(24)) }
     var serverStats by remember { mutableStateOf<DailyStatsRemote?>(null) }
+    // 선택일 합계 — 달력과 같은 기준(서버 totalScroll 과 로컬 중 큰 쪽). 시간대 그래프 합과 다를 수 있어 따로 둔다.
+    // (서버 hourlyGraph 합이 totalScroll 보다 작게 오는 경우가 있어 그래프 합만 쓰면 달력 숫자와 어긋났음)
+    var selectedDayTotal by remember { mutableStateOf(0) }
     var source by remember { mutableStateOf("loading") }  // "server" / "local" / "loading"
     var dayAppCounts by remember { mutableStateOf<Map<String, Int>>(emptyMap()) }
     // milestone 시각 (분까지 정확) — Service 트리거 로직 모방으로 로컬 timestamps 에서 계산
@@ -405,19 +454,23 @@ internal fun StatsDaily(monthOffset: Int, onMonthOffsetChange: (Int) -> Unit) {
         val localCounts = IntArray(24).also { arr ->
             hourly.forEach { if (it.hour in 0..23) arr[it.hour] = it.count }
         }
-        val hasLocal = localCounts.sum() > 0
-        // 서버 메트릭(stopCount/ignoreCount/hourlyLimit)은 항상 같이 가져옴 — 표시용 그래프는 로컬 우선
+        val localTotal = localCounts.sum()
+        // 서버(모든 기기 합) 가 기준. 로컬 합계가 더 클 때만(아직 안 올라간 스크롤) 로컬 그래프를 쓴다.
         val remote = userId?.let { fetchDailyStats(it, selectedDateStr) }
         serverStats = remote
-        if (hasLocal) {
-            counts = localCounts
-            source = "local"
-        } else if (remote != null) {
+        if (remote != null && remote.totalScroll >= localTotal) {
             counts = remote.hourlyCounts
             source = "server"
         } else {
-            counts = localCounts  // 0 배열
+            counts = localCounts
             source = "local"
+        }
+        // 합계는 달력과 같은 값으로 — 달력이 1분 캐시된 옛 값을 들고 있으면 달력 쪽도 이 값으로 맞춘다
+        val dayTotal = maxOf(remote?.totalScroll ?: 0, localTotal, counts.sum())
+        selectedDayTotal = dayTotal
+        if ((dayCounts[selectedDateStr] ?: 0) != dayTotal) {
+            dayCounts = dayCounts + (selectedDateStr to dayTotal)
+            userId?.let { StatsCache.put("monthDays:$it:$monthKey", dayCounts) }
         }
         // 도넛은 항상 로컬 DB 기반
         dayAppCounts = db.scrollHistoryDao()
@@ -459,7 +512,7 @@ internal fun StatsDaily(monthOffset: Int, onMonthOffsetChange: (Int) -> Unit) {
             arr[24] = sum
         }
     }
-    val total = cumulative[24]
+    val total = maxOf(cumulative[24], selectedDayTotal)
     val peakHour = counts.indices.maxByOrNull { counts[it] } ?: 0
     val peakCount = counts.getOrNull(peakHour) ?: 0
 
@@ -502,7 +555,16 @@ internal fun StatsDaily(monthOffset: Int, onMonthOffsetChange: (Int) -> Unit) {
 
         // 요일 헤더
         val dayLabels = listOf("월", "화", "수", "목", "금", "토", "일")
+        val limitColWeight = 1.25f   // 줄 왼쪽 "그 주 한도" 칸 — 날짜 셀보다 조금 넓게
         Row(modifier = Modifier.fillMaxWidth()) {
+            Text(
+                text = "한도",
+                modifier = Modifier.weight(limitColWeight).padding(vertical = 6.dp),
+                textAlign = TextAlign.Center,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = Color(0xFF888888)
+            )
             dayLabels.forEach { d ->
                 Text(
                     text = d,
@@ -518,8 +580,41 @@ internal fun StatsDaily(monthOffset: Int, onMonthOffsetChange: (Int) -> Unit) {
         // 달력 셀 — 누르면 선택일 변경 (미래 날짜는 비활성, 선택일은 테두리 강조)
         val totalCells = firstDayOfWeek + daysInMonth
         val totalRows = (totalCells + 6) / 7
+        val firstRowMonday = monthCal.timeInMillis - firstDayOfWeek * 24L * 60 * 60 * 1000
+        // 그 달 최대 오버량 — 빨강 진하기 기준. 각 날짜는 "그 주 한도" 기준으로 계산.
+        val maxOverage = (1..daysInMonth).maxOf { day ->
+            val ms = Calendar.getInstance().apply {
+                timeInMillis = monthCal.timeInMillis; set(Calendar.DAY_OF_MONTH, day)
+            }.timeInMillis
+            val lim = weekLimits[mondayOf(ms)]?.first ?: currentDailyLimit
+            (countByDate[day] ?: 0) - lim
+        }
         for (rowIdx in 0 until totalRows) {
-            Row(modifier = Modifier.fillMaxWidth()) {
+            val rowMonday = firstRowMonday + rowIdx * 7L * 24 * 60 * 60 * 1000
+            val rowLimit = weekLimits[rowMonday]
+            val rowDailyLimit = rowLimit?.first ?: currentDailyLimit
+            val rowIsFuture = rowMonday > thisMonday
+            Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                // 줄 왼쪽 — 그 주에 적용된 일간/시간당 한도
+                Box(
+                    modifier = Modifier.weight(limitColWeight).padding(2.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    if (!rowIsFuture && rowLimit != null) {
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            Text(
+                                text = if (rowLimit.first > 0) "일 ${rowLimit.first}" else "일 -",
+                                fontSize = 10.sp, lineHeight = 12.sp,
+                                fontWeight = FontWeight.SemiBold, color = Color(0xFF555555)
+                            )
+                            Text(
+                                text = if (rowLimit.second > 0) "시 ${rowLimit.second}" else "시 -",
+                                fontSize = 10.sp, lineHeight = 12.sp,
+                                fontWeight = FontWeight.SemiBold, color = Color(0xFF555555)
+                            )
+                        }
+                    }
+                }
                 for (col in 0 until 7) {
                     val cellIdx = rowIdx * 7 + col
                     val dayNum = cellIdx - firstDayOfWeek + 1
@@ -531,11 +626,11 @@ internal fun StatsDaily(monthOffset: Int, onMonthOffsetChange: (Int) -> Unit) {
                         val isFuture = cellMs > todayMidnight
                         val isSelected = cellMs == selectedDayMs
                         val count = countByDate[dayNum] ?: 0
-                        // 그 달 최대 오버량 — 빨강 진하기 기준
-                        val maxOverage = (countByDate.values.maxOrNull() ?: 0) - currentDailyLimit
+                        // 셀 색 — 그 주에 적용됐던 한도 기준 (지금 한도가 아니라). 한도가 낮았던 주에 넘긴 날이
+                        // 지금 한도로는 안 넘긴 것처럼 초록으로 보이던 문제 수정.
                         val (bgRaw, isDarkBg) =
                             if (isFuture) Color(0xFFFAFAFA) to false
-                            else goalColor(count, currentDailyLimit, maxCount, maxOverage)
+                            else goalColor(count, rowDailyLimit, maxCount, maxOverage)
                         var cellMod = Modifier
                             .weight(1f)
                             .aspectRatio(1f)
