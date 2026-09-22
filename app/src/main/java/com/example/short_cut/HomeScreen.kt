@@ -184,8 +184,27 @@ internal fun HomeTabContent() {
         while (true) {
             val now = System.currentTimeMillis()
             val scrollCounts = com.example.short_cut.db.ScrollCountRepository.get(context)
-            todayCount = scrollCounts.dailyCount(startOfDayMs())
-            lastHourCount = scrollCounts.hourlyCount(now)
+            // 오늘 카운트 — 로컬 Room(이 기기) 과 서비스가 공개한 계정 전체 기준 값 중 큰 쪽.
+            // (서비스 값은 서버 합계 = 다른 기기 포함. 로컬이 더 크면 아직 서버에 안 올라간 스크롤이 있는 것)
+            val dayStart = startOfDayMs()
+            val prefsToday = context.getSharedPreferences("short_cut_prefs", Context.MODE_PRIVATE)
+            val synced = if (prefsToday.getLong(ShortCutAccessibilityService.PK_SYNCED_DAILY_DAY, -1L) == dayStart)
+                prefsToday.getInt(ShortCutAccessibilityService.PK_SYNCED_DAILY_COUNT, 0) else 0
+            val localToday = scrollCounts.dailyCount(dayStart)
+            val localHour = scrollCounts.hourlyCount(now)
+            // 먼저 로컬 값으로 즉시 표시 → 서버 응답이 오면 계정 전체 기준으로 갱신
+            todayCount = maxOf(localToday, synced)
+            lastHourCount = localHour
+            // 홈 탭이 떠 있는 동안 30초마다 GET /sync — 다른 기기 최근 1시간은 서버만 알고 있어서 직접 물어본다.
+            // (접근성 서비스는 쇼츠를 보는 동안만 /sync 하므로 홈 탭에서는 여기서 갱신)
+            if (userId != null) {
+                val res = authedRequest("GET", "/sync?deviceId=${DeviceId.get(context)}")
+                res.json?.let { j ->
+                    val dailyTotal = j.optInt("dailyTotal", -1)
+                    if (dailyTotal >= 0) todayCount = maxOf(todayCount, dailyTotal)
+                    lastHourCount = localHour + j.optInt("otherDevicesLastHour", 0).coerceAtLeast(0)
+                }
+            }
             if (userId != null) {
                 // 만료된 pending 먼저 promote 해서 오늘 적용되는 값으로 정렬
                 // [변경됨] promoteExpiredPending → promoteAndSyncLimit:

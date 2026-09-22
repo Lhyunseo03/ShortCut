@@ -56,6 +56,12 @@ class ShortCutAccessibilityService : AccessibilityService() {
         const val PK_TODAY_START = "todayStartMs"              // 마지막으로 처리한 "오늘 0시" — 날짜 롤오버 감지용
         const val PK_PENDING_USERLOGS = "pendingUserLogs"      // 서버 전송 대기/실패한 userlog 큐 (JSON 배열 [{ts,count}])
         const val PK_PENDING_VIOLATIONS = "pendingViolations"  // 서버 전송 대기/실패한 violation 큐 (JSON 배열)
+        // 서비스가 들고 있는 "계정 전체 기준" 오늘 카운트(서버 합계 반영) — 홈 탭이 로컬 Room 값과 비교해 큰 쪽을 표시
+        const val PK_SYNCED_DAILY_COUNT = "syncedDailyCount"
+        const val PK_SYNCED_DAILY_DAY = "syncedDailyDay"          // 위 값이 어느 날(0시 ms)의 것인지
+
+        // 쇼츠 보는 동안 /sync 호출 주기 (API 스펙 §3)
+        const val SYNC_INTERVAL_MS = 60 * 1000L
 
         // 실행 중인 서비스 인스턴스 — FCM 서비스(같은 프로세스)가 FLUSH 수신 시 즉시 업로드를 요청하는 데 사용.
         // onServiceConnected 에서 설정, onDestroy 에서 해제.
@@ -96,6 +102,24 @@ class ShortCutAccessibilityService : AccessibilityService() {
 
     // 마지막으로 처리한 "오늘 0시" — 자정 롤오버 감지에 사용
     private var todayStartMs = 0L
+
+    // ── 다중 기기 동기화 (GET /sync) ─────────────────────────
+    // 다른 기기들이 최근 1시간 동안 스크롤한 횟수 — 마지막 /sync 응답값. 시간당 한도 검사 때 로컬 카운트에 더한다.
+    // (로컬 Room 에는 이 기기 스크롤만 있으므로, 이 값을 더해야 계정 전체 기준으로 한도가 걸린다)
+    @Volatile private var otherDevicesLastHour = 0
+    // 이 기기가 마지막으로 POST /milestone 한 값 — /sync 로 받은 서버 milestone 이 이 값보다 크면 다른 기기가 더 나간 것
+    private var uploadedHourlyMilestone = -1
+    private var uploadedDailyMilestone = -1
+    // 동시에 두 /sync 가 겹쳐 서로 값을 엎지 않게 — 한 번에 하나만
+    private val isSyncing = java.util.concurrent.atomic.AtomicBoolean(false)
+    // 쇼츠 보는 동안 1분마다 /sync — 쇼츠에서 나가면 다음 주기에 스스로 멈춘다
+    private val syncTimerRunnable = object : Runnable {
+        override fun run() {
+            if (!detectors.any { it.inShortsMode }) return
+            serviceScope.launch { syncFromServer("1분 주기") }
+            mainHandler.postDelayed(this, SYNC_INTERVAL_MS)
+        }
+    }
 
     // ── 앱별 쇼츠 검출기 ──────────────────────────────────────
     // 각 detector 가 자기 앱의 진입/이탈/스크롤 상태를 따로 관리. 메인 서비스는 outcome 만 받아 처리.
@@ -293,6 +317,7 @@ class ShortCutAccessibilityService : AccessibilityService() {
         if (serverTotal > dailyCount) {
             Log.d(TAG, "당일 카운트 서버 시드 — local=$dailyCount → server=$serverTotal")
             dailyCount = serverTotal
+            publishDailyCount()
         }
     }
 
@@ -433,6 +458,14 @@ class ShortCutAccessibilityService : AccessibilityService() {
         // (1대뿐이면 건드리지 않음 — 진입할 때마다 5분 타이머가 리셋되면 안 되므로)
         if (outcome.entered && isMultiDevice()) scheduleBatchTimer()
 
+        // 쇼츠 진입 → 미전송분 올리고 /sync 로 계정 전체 카운트를 받아 적용 (D4). 이후 보는 동안 1분마다 반복.
+        // (/sync 를 부르면 서버가 다른 기기에 FLUSH 를 보내고, 그 기기 업로드 후 COUNT_UPDATED 가 이쪽으로 온다)
+        if (outcome.entered) {
+            serviceScope.launch { syncFromServer("쇼츠 진입") }
+            mainHandler.removeCallbacks(syncTimerRunnable)
+            mainHandler.postDelayed(syncTimerRunnable, SYNC_INTERVAL_MS)
+        }
+
         // 미응답 popup 복원 — 다음 두 경우에 즉시 다시 띄운다.
         //  1) detector 가 진입(entered)을 보고했을 때 (YT/IG: 창 전환으로 진입 감지, 앱 강제종료 후 재진입 등)
         //  2) [신규] 타겟 앱으로 창이 전환됐을 때 (WINDOW_STATE_CHANGED).
@@ -491,6 +524,7 @@ class ShortCutAccessibilityService : AccessibilityService() {
             scrollCounts.recordScroll(appPkg, now)
 
             dailyCount++
+            publishDailyCount()
 
             // 배치 카운터 증가 — BATCH_SIZE(10개) 쌓이면 즉시 서버 전송.
             // 배치의 첫 스크롤 시각(now)을 timestamp 로 보냄 → 서버가 실제 스크롤 시각 기준으로 집계.
@@ -512,10 +546,11 @@ class ShortCutAccessibilityService : AccessibilityService() {
             if (reachedBatch) flushBatch()
 
             // 최근 1시간 스크롤 횟수 조회 (슬라이딩 윈도우)
-            val hourlyCount = scrollCounts.hourlyCount(now)
+            // 로컬(이 기기) + 다른 기기 최근 1시간(마지막 /sync 값) = 계정 전체 기준 시간당 카운트
+            val hourlyCount = scrollCounts.hourlyCount(now) + otherDevicesLastHour
             lastHourlyCount = hourlyCount
 
-            Log.d(TAG, "스크롤 카운트 — hourly: $hourlyCount/$hourlyLimit, daily: $dailyCount/$dailyLimit")
+            Log.d(TAG, "스크롤 카운트 — hourly: $hourlyCount/$hourlyLimit (다른 기기 $otherDevicesLastHour), daily: $dailyCount/$dailyLimit")
 
             // 한도 검사 — 스크롤 직후. (3주차: 서버 /sync 값을 반영한 직후에도 같은 함수를 호출)
             checkLimits(hourlyCount, dailyCount)
@@ -537,6 +572,7 @@ class ShortCutAccessibilityService : AccessibilityService() {
             if (hourlyNow < hourlyLimit) {
                 hourlyMilestone = -1
                 savePersistedState()
+                postMilestone()   // 슬라이딩 윈도우로 한도 아래로 내려감 → 서버도 -1 로 (스펙: 리셋 허용)
             } else if (hourlyNow < hourlyMilestone) {
                 val stepLevel = hourlyLimit + ((hourlyNow - hourlyLimit) / HOURLY_STEP) * HOURLY_STEP
                 if (stepLevel < hourlyMilestone) {
@@ -553,6 +589,7 @@ class ShortCutAccessibilityService : AccessibilityService() {
             val overage = hourlyTrigger - hourlyLimit
             setPendingPopup("hourly", overage)
             withContext(Dispatchers.Main) { showLimitPopup("hourly", overage) }
+            postMilestone()   // 다른 기기가 같은 단계 팝업을 건너뛰게 (D6)
             return true
         }
 
@@ -563,9 +600,36 @@ class ShortCutAccessibilityService : AccessibilityService() {
             val overage = dailyTrigger - dailyLimit
             setPendingPopup("daily", overage)
             withContext(Dispatchers.Main) { showLimitPopup("daily", overage) }
+            postMilestone()   // 다른 기기가 같은 단계 팝업을 건너뛰게 (D6)
             return true
         }
         return false
+    }
+
+    // ── 개입 상태 업로드 (스펙 §4) — 다른 기기가 /sync 로 받아 같은 팝업 생략 · 같은 시각까지 차단 ──
+    // 실패해도 재시도하지 않음: 다음 팝업/Stop 때 다시 올라가고, 그 사이엔 로컬 동작에 영향 없음.
+    private fun postMilestone() {
+        val h = hourlyMilestone
+        val d = dailyMilestone
+        uploadedHourlyMilestone = h
+        uploadedDailyMilestone = d
+        serviceScope.launch {
+            val body = org.json.JSONObject()
+                .put("deviceId", com.example.short_cut.DeviceId.get(this@ShortCutAccessibilityService))
+                .put("hourly", h).put("daily", d)
+            val res = com.example.short_cut.authedRequest("POST", "/milestone", body)
+            Log.d(TAG, "POST /milestone hourly=$h daily=$d → ${res.code}")
+        }
+    }
+
+    private fun postBlock(blockUntil: Long) {
+        serviceScope.launch {
+            val body = org.json.JSONObject()
+                .put("deviceId", com.example.short_cut.DeviceId.get(this@ShortCutAccessibilityService))
+                .put("blockUntil", blockUntil)
+            val res = com.example.short_cut.authedRequest("POST", "/block", body)
+            Log.d(TAG, "POST /block until=$blockUntil → ${res.code}")
+        }
     }
 
     // 이번에 팝업을 띄워야 하는 milestone 값. 아직 아니면 null. (hourly/daily 공통 — 비교는 전부 ≥)
@@ -1132,11 +1196,12 @@ class ShortCutAccessibilityService : AccessibilityService() {
     // popup view 를 list 에 등록 + WindowManager 에 추가
     private fun addPopupView(view: View, params: WindowManager.LayoutParams) {
         try {
-            // [변경됨] 전체화면 차단막(scrim) 제거 — 팝업이 떠 있어도 홈으로 나갔다가 다시 돌아올 수 있게 한다.
-            //   팝업 창은 FLAG_NOT_TOUCH_MODAL 이라 카드 밖 터치는 뒤(유튜브/시스템 네비)로 통과하고
-            //   팝업 버튼만 동작한다. 다른 앱/홈으로 나가면 popup 은 숨겨지지만 pending 상태는 유지되어
-            //   타겟 앱에 재진입할 때 다시 복원된다.
-            removeScrim()
+            // [B2] 팝업 뒤에 차단막을 먼저 깐다 — 팝업 창은 FLAG_NOT_TOUCH_MODAL 이라 카드 밖 터치가 뒤(쇼츠)로
+            //   통과해 팝업이 떠 있는데도 스크롤이 됐다. 차단막이 카드 밖 터치를 전부 흡수한다.
+            //   차단막은 시스템 바(내비게이션 바) 영역은 덮지 않으므로 홈/뒤로/최근 앱은 그대로 동작하고,
+            //   나가면 popup 은 숨겨지되 pending 상태는 유지되어 타겟 앱 재진입 시 복원된다(기존 동작).
+            //   같은 타입 창은 나중에 추가한 것이 위에 오므로 팝업보다 먼저 추가해야 팝업이 가려지지 않는다.
+            ensureScrim()
             windowManager?.addView(view, params)
             popupViews.add(view)
             isPopupShowing = true
@@ -1160,7 +1225,12 @@ class ShortCutAccessibilityService : AccessibilityService() {
             // NOT_FOCUSABLE 만 — 키(뒤로가기) 포커스는 안 가져가되 터치는 받도록(NOT_TOUCHABLE 미설정)
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
             PixelFormat.TRANSLUCENT
-        )
+        ).apply {
+            // 상태 바 · 내비게이션 바 안쪽으로만 — 3버튼 내비의 홈/뒤로 버튼은 차단막 밖이라 눌린다.
+            // (제스처 내비의 홈 스와이프는 시스템이 먼저 가로채므로 어차피 막히지 않음)
+            fitInsetsTypes = android.view.WindowInsets.Type.systemBars()
+            fitInsetsSides = android.view.WindowInsets.Side.all()
+        }
         try {
             windowManager?.addView(scrim, params)
             scrimView = scrim
@@ -1187,6 +1257,7 @@ class ShortCutAccessibilityService : AccessibilityService() {
         val now = System.currentTimeMillis()
         stopUntilMs = now + STOP_BLOCK_MS
         savePersistedState()
+        postBlock(stopUntilMs)   // 다른 기기도 같은 시각까지 차단 (D6)
         sendViolation(type, lastHourlyCount, dailyCount, "stop")
         clearPendingPopup()
         dismissAllPopups()
@@ -1217,6 +1288,15 @@ class ShortCutAccessibilityService : AccessibilityService() {
             .putInt(PK_HOURLY_MILESTONE, hourlyMilestone)
             .putLong(PK_STOP_UNTIL, stopUntilMs)
             .putLong(PK_TODAY_START, todayStartMs)
+            .apply()
+        publishDailyCount()
+    }
+
+    // 오늘 카운트(서버 합계 반영본)를 prefs 에 공개 — 홈 탭 표시용. 스크롤 · 서버 시드 · /sync 때마다 호출.
+    private fun publishDailyCount() {
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+            .putInt(PK_SYNCED_DAILY_COUNT, dailyCount)
+            .putLong(PK_SYNCED_DAILY_DAY, todayStartMs)
             .apply()
     }
 
@@ -1638,6 +1718,12 @@ class ShortCutAccessibilityService : AccessibilityService() {
     // 현재 배치를 pending 큐에 영속화(즉시, 동기)하고 전송을 트리거.
     // 큐에 넣은 뒤에만 카운터를 비우므로, 전송 코루틴이 끝나기 전에 프로세스가 죽어도 유실되지 않음.
     private fun flushBatch() {
+        persistBatchToQueue()
+        serviceScope.launch { sendPendingUserLogs() }
+    }
+
+    // 현재 배치를 pending 큐로 옮기기만 (전송은 호출부가)
+    private fun persistBatchToQueue() {
         synchronized(pendingLock) {
             if (batchScrollCount > 0) {
                 appendPendingLocked(batchFirstScrollMs, batchScrollCount, batchAppPkg)
@@ -1646,7 +1732,110 @@ class ShortCutAccessibilityService : AccessibilityService() {
                 batchAppPkg = ""
             }
         }
-        serviceScope.launch { sendPendingUserLogs() }
+    }
+
+    // 아직 서버에 안 올라간 오늘 스크롤 수 — 큐(전송 실패분) + 현재 배치. /sync 의 dailyTotal 에 더해 준다.
+    private fun unsentTodayCount(): Int = synchronized(pendingLock) {
+        readPendingLocked().filter { it.ts >= todayStartMs }.sumOf { it.count } + batchScrollCount
+    }
+
+    // ── 다중 기기 동기화 ─────────────────────────────────────
+    // 1) 미전송분 업로드 → 2) GET /sync → 3) 일간 = 서버 합계(+아직 안 올라간 분), 시간당 = 로컬 + 다른 기기 1시간
+    //  → 4) 지금 쇼츠를 보는 중이면 한도 검사(≥). 여러 단계를 건너뛰어도 팝업은 1번(checkLimits 가 처리).
+    // blockUntil / lastShownMilestone 은 서버가 값을 주면 받아서 적용 (3주차까지는 null / -1).
+    private suspend fun syncFromServer(reason: String) {
+        if (!isSyncing.compareAndSet(false, true)) return
+        try {
+            val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
+            val userId = prefs.getString("userId", "unknown") ?: "unknown"
+            if (userId == "unknown") return
+            val now = System.currentTimeMillis()
+            handleDayRolloverIfNeeded(now, userId)
+
+            // 1) 미전송분 먼저 — 서버 합계에 이 기기 분이 빠진 채로 읽지 않게
+            persistBatchToQueue()
+            sendPendingUserLogs()
+
+            // 2) GET /sync
+            val deviceId = com.example.short_cut.DeviceId.get(this)
+            val res = com.example.short_cut.authedRequest("GET", "/sync?deviceId=$deviceId")
+            val json = res.json
+            if (!res.ok || json == null) {
+                Log.w(TAG, "/sync 실패 ($reason) — code=${res.code}")
+                return
+            }
+
+            // 3) 적용
+            val serverDate = json.optString("date")
+            val localDate = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US).apply {
+                timeZone = java.util.TimeZone.getTimeZone("Asia/Seoul")
+            }.format(java.util.Date(todayStartMs))
+            if (serverDate.isNotEmpty() && serverDate != localDate) {
+                // 자정 직후 서버/앱 날짜가 엇갈린 순간 — 어제 합계로 오늘을 덮으면 안 되므로 이번 응답은 버림
+                Log.w(TAG, "/sync 날짜 불일치 (서버 $serverDate / 앱 $localDate) — 이번 응답 무시")
+                return
+            }
+            val dailyTotal = json.optInt("dailyTotal", -1)
+            if (dailyTotal >= 0) {
+                // 서버 합계 + 방금 전송에 실패해 아직 서버에 없는 분. 서버 값이 기준이라 로컬이 더 커도 덮어쓴다.
+                dailyCount = dailyTotal + unsentTodayCount()
+            }
+            otherDevicesLastHour = json.optInt("otherDevicesLastHour", 0).coerceAtLeast(0)
+            val deviceCount = json.optInt("deviceCount", -1)
+            if (deviceCount >= 1) prefs.edit().putInt(com.example.short_cut.PK_DEVICE_COUNT, deviceCount).apply()
+
+            // 다른 기기의 Stop 차단 — 남은 시간만큼 이 기기도 차단 (D6)
+            val blockUntil = if (json.isNull("blockUntil")) 0L else json.optLong("blockUntil", 0L)
+            if (blockUntil > now && blockUntil > stopUntilMs) {
+                stopUntilMs = blockUntil
+                Log.d(TAG, "/sync blockUntil 적용 — ${(blockUntil - now) / 1000}초 남음")
+                // 다른 기기에서 그만보기를 눌렀다 = 그 팝업에 답한 것 → 이 기기에 남은 같은 팝업은 닫는다
+                if (pendingPopupType != null) {
+                    Log.d(TAG, "다른 기기 Stop → 이 기기 미응답 팝업 정리")
+                    clearPendingPopup()
+                    withContext(Dispatchers.Main) { dismissAllPopups() }
+                }
+            }
+            // 다른 기기에서 이미 보여 준 팝업 단계 — 로컬보다 크면 올려서 같은 팝업 생략 (D6)
+            json.optJSONObject("lastShownMilestone")?.let { m ->
+                val h = m.optInt("hourly", -1)
+                val d = m.optInt("daily", -1)
+                if (h > hourlyMilestone) hourlyMilestone = h
+                if (d > dailyMilestone) dailyMilestone = d
+                // 이 기기에 미응답 팝업이 있는데 다른 기기가 그보다 더 나간 단계까지 갔으면(내가 올린 값보다 큼)
+                // 이 팝업은 이미 지나간 단계 → 닫는다. 같은 값이면 누가 먼저 띄웠는지 알 수 없어 그대로 둔다.
+                val pType = pendingPopupType
+                if (pType != null) {
+                    val pendingValue = pendingPopupOverage + (if (pType == "hourly") hourlyLimit else dailyLimit)
+                    val serverValue = if (pType == "hourly") h else d
+                    val mine = if (pType == "hourly") uploadedHourlyMilestone else uploadedDailyMilestone
+                    if (serverValue > pendingValue && serverValue > mine) {
+                        Log.d(TAG, "다른 기기가 $pType $serverValue 단계까지 진행 → 이 기기 미응답 팝업($pendingValue) 정리")
+                        clearPendingPopup()
+                        withContext(Dispatchers.Main) { dismissAllPopups() }
+                    }
+                }
+            }
+            savePersistedState()
+
+            val hourlyCount = scrollCounts.hourlyCount(now) + otherDevicesLastHour
+            lastHourlyCount = hourlyCount
+            Log.d(TAG, "/sync 적용 ($reason) — daily=$dailyCount, hourly=$hourlyCount (다른 기기 $otherDevicesLastHour), 기기 ${deviceCount}대")
+
+            // 4) 한도 검사 — 쇼츠를 보는 중일 때만 (홈 화면 위에 팝업이 뜨면 안 되므로. 아니면 다음 스크롤 때 검사됨)
+            if (detectors.any { it.inShortsMode } && now >= stopUntilMs) {
+                checkLimits(hourlyCount, dailyCount)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "/sync 처리 실패 ($reason) — ${e.message}")
+        } finally {
+            isSyncing.set(false)
+        }
+    }
+
+    // FCM COUNT_UPDATED 수신 시 ShortCutMessagingService 가 호출 — 서버 합계가 바뀌었으니 다시 받아 적용
+    fun syncFromRemote() {
+        serviceScope.launch { syncFromServer("FCM COUNT_UPDATED") }
     }
 
     // 즉시 업로드 트리거(쇼츠 이탈 · 앱 전환 · Stop · 화면 꺼짐)용 — 아직 큐에 안 들어간 스크롤이 있을 때만 flush.
@@ -1688,6 +1877,7 @@ class ShortCutAccessibilityService : AccessibilityService() {
         dismissAllPopups()
         try { unregisterReceiver(screenStateReceiver) } catch (_: Exception) {}
         batchHandler.removeCallbacks(batchTimerRunnable)
+        mainHandler.removeCallbacks(syncTimerRunnable)
         flushBatch()
         super.onDestroy()
     }

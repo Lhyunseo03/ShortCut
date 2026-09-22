@@ -8,7 +8,7 @@ import kotlinx.coroutines.launch
 
 // 서버 → 앱 FCM data message 수신 (API 스펙 §0). notification 없는 무음 메시지이며 data["type"] 으로 분기한다.
 //  - FLUSH         : 다른 기기가 /sync 를 불렀다 → 미전송 스크롤을 즉시 POST /userlogs
-//  - COUNT_UPDATED : 서버 합계가 바뀌었다 → GET /sync 재호출 (3주차에 구현)
+//  - COUNT_UPDATED : 서버 합계가 바뀌었다 → GET /sync 재호출해 카운트 재적용
 class ShortCutMessagingService : FirebaseMessagingService() {
 
     companion object {
@@ -39,7 +39,9 @@ class ShortCutMessagingService : FirebaseMessagingService() {
                 else service.flushFromRemote()
             }
             "COUNT_UPDATED" -> {
-                // TODO(3주차): GET /sync 재호출 후 카운트 재적용
+                val service = ShortCutAccessibilityService.instance
+                if (service == null) Log.d(TAG, "COUNT_UPDATED 무시 — 접근성 서비스 미실행")
+                else service.syncFromRemote()
             }
             else -> Log.w(TAG, "알 수 없는 FCM type: $type")
         }

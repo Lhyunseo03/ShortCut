@@ -6,7 +6,7 @@ import org.json.JSONObject
 // 그룹 API — 앱이 가정한 JSON 계약 (서버 미구현 상태에서 작성. 서버와 다르면 이 파일의 파서만 고치면 됨)
 //
 //  GET    /groups                      → { "maxGroups": 5, "groups": [ GroupSummary ] }
-//  POST   /groups                      ← { name, description, goal: { daily, hourly }, voteThreshold }
+//  POST   /groups                      ← { name, description, goal: { dailyLimit, hourlyLimit }, voteThreshold }
 //                                      → { "groupId": "..." }
 //  GET    /groups/{gid}                → GroupSummary + { "members": [ Member ] }
 //  GET    /groups/{gid}/status         → { "members": [ { userId, todayCount, lastHourCount, lastSeenAt, lastScrollAt } ] }
@@ -15,7 +15,7 @@ import org.json.JSONObject
 //  POST   /groups/join                 ← { code }  → { "groupId": "..." }
 //  DELETE /groups/{gid}/members/me     → { "status": "ok" }
 //
-//  GroupSummary = { groupId, name, description, goal: { daily, hourly }, voteThreshold(60~100),
+//  GroupSummary = { groupId, name, description, goal: { dailyLimit, hourlyLimit }, voteThreshold(60~100),
 //                   memberCount, maxMembers(기본 10), myTodayCount(GET /groups 에서만) }
 //  Member       = { userId, nickname, todayCount, lastHourCount, lastSeenAt(ms|null), lastScrollAt(ms|null) }
 //
@@ -26,7 +26,7 @@ internal const val MAX_GROUPS_DEFAULT = 5
 internal const val MAX_MEMBERS_DEFAULT = 10
 internal val VOTE_THRESHOLDS = listOf(60, 70, 80, 90, 100)
 
-// 초대 링크를 여는 랜딩 페이지 주소. TODO: 랜딩 페이지(GitHub Pages 등) 배포 후 실제 주소로 교체.
+// 초대 랜딩 페이지 — 5주차에 서버가 /invite/{코드} 로 띄울 예정. 그때 "$SERVER_BASE_URL/invite" 로 바꾸면 됨.
 // 비어 있으면 공유 문구에 링크 없이 코드만 넣는다.
 internal const val INVITE_LANDING_URL = ""
 
@@ -70,8 +70,8 @@ private fun parseSummary(o: JSONObject): GroupSummary {
         groupId = o.optString("groupId"),
         name = o.optString("name"),
         description = o.optString("description"),
-        dailyLimit = goal?.optInt("daily", 0) ?: 0,
-        hourlyLimit = goal?.optInt("hourly", 0) ?: 0,
+        dailyLimit = goal?.optInt("dailyLimit", 0) ?: 0,
+        hourlyLimit = goal?.optInt("hourlyLimit", 0) ?: 0,
         voteThreshold = o.optInt("voteThreshold", 0),
         memberCount = o.optInt("memberCount", 0),
         maxMembers = o.optInt("maxMembers", MAX_MEMBERS_DEFAULT),
@@ -114,7 +114,7 @@ internal suspend fun createGroup(
     val body = JSONObject()
         .put("name", name)
         .put("description", description)
-        .put("goal", JSONObject().put("daily", dailyLimit).put("hourly", hourlyLimit))
+        .put("goal", JSONObject().put("dailyLimit", dailyLimit).put("hourlyLimit", hourlyLimit))
         .put("voteThreshold", voteThreshold)
     val res = authedRequest("POST", "/groups", body)
     val gid = res.json?.optString("groupId").orEmpty()

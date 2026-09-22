@@ -32,8 +32,8 @@ internal interface DevicesSource {
     suspend fun load(myDeviceId: String): List<DeviceItem>?
 }
 
-// TODO: 서버에 GET /devices 가 배포되면 false 로. 그러면 아래 ServerDevicesSource 가 쓰인다.
-private const val USE_FAKE_DEVICES = true
+// 서버 GET /devices 배포됨(9/22) → 실제 데이터 사용. 서버 없이 화면만 볼 때는 true 로.
+private const val USE_FAKE_DEVICES = false
 
 // 서버가 나오기 전까지 쓰는 가짜 데이터 — 폰(이 기기, 정상) + 태블릿(로그아웃 · 권한 꺼짐)
 internal class FakeDevicesSource : DevicesSource {
