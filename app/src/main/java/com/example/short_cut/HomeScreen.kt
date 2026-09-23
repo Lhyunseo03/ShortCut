@@ -58,6 +58,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.repeatOnLifecycle
 import com.example.short_cut.db.AppCount
 import com.example.short_cut.db.AppDatabase
 import com.example.short_cut.db.HourlyCount
@@ -180,7 +181,12 @@ internal fun HomeTabContent() {
     // 30초 마다 자동 새로고침 — 슬라이딩 윈도우 카운트가 시간 흐름에 따라 자연 감소하는 것이
     // 화면에도 반영되도록. LaunchedEffect(Unit) 은 composable 이 composition 에 들어올 때만 실행되므로
     // while + delay 로 주기적 refresh.
-    LaunchedEffect(Unit) {
+    // [중요] repeatOnLifecycle(STARTED): 앱이 백그라운드로 가면 루프가 멈추고 다시 보이면 재개.
+    //   LaunchedEffect 만으로는 앱을 뒤로 보내도 프로세스가 살아 있는 한 계속 돌아서, 절전 모드에서
+    //   네트워크가 열리는 15분마다 /sync 가 나가고 그때마다 다른 기기에 FLUSH 푸시가 갔다 (밤새 수십 번).
+    val lifecycleOwner = LocalLifecycleOwner.current
+    LaunchedEffect(lifecycleOwner) {
+        lifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
         while (true) {
             val now = System.currentTimeMillis()
             val scrollCounts = com.example.short_cut.db.ScrollCountRepository.get(context)
@@ -216,6 +222,7 @@ internal fun HomeTabContent() {
                 }
             }
             delay(30_000L)
+        }
         }
     }
 

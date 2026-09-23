@@ -158,6 +158,7 @@ class ShortCutAccessibilityService : AccessibilityService() {
             detectors.forEach { if (it.inShortsMode) it.onPackageLeft() }
             // 화면 꺼짐 → 미전송분 즉시 업로드 (다른 기기의 첫 /sync 조회가 바로 정확하도록)
             flushIfUnsent("화면 꺼짐")
+            stopSyncTimer("화면 꺼짐")
         }
     }
 
@@ -431,6 +432,7 @@ class ShortCutAccessibilityService : AccessibilityService() {
                 detectors.forEach { if (it.inShortsMode) it.onPackageLeft() }
                 // 홈/다른 앱 전환 → 미전송분 즉시 업로드
                 flushIfUnsent("다른 앱($pkg) 전환")
+                stopSyncTimer("다른 앱 전환")
             }
             return
         }
@@ -487,6 +489,7 @@ class ShortCutAccessibilityService : AccessibilityService() {
             }
             // 쇼츠 이탈 → 미전송분 즉시 업로드
             flushIfUnsent("쇼츠 이탈")
+            if (!detectors.any { it.inShortsMode }) stopSyncTimer("쇼츠 이탈")
         }
 
         if (outcome.scrolled) {
@@ -1831,6 +1834,13 @@ class ShortCutAccessibilityService : AccessibilityService() {
         } finally {
             isSyncing.set(false)
         }
+    }
+
+    // 1분 /sync 타이머 중지 — 쇼츠를 보지 않는 동안엔 /sync 를 부르지 않는다
+    // (/sync 한 번마다 서버가 다른 기기에 FLUSH 푸시를 보내므로, 안 볼 때 돌면 상대 기기를 계속 깨운다)
+    private fun stopSyncTimer(reason: String) {
+        mainHandler.removeCallbacks(syncTimerRunnable)
+        Log.d(TAG, "/sync 타이머 중지 — $reason")
     }
 
     // FCM COUNT_UPDATED 수신 시 ShortCutMessagingService 가 호출 — 서버 합계가 바뀌었으니 다시 받아 적용
