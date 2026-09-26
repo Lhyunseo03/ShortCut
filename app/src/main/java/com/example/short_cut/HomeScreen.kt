@@ -164,6 +164,14 @@ fun HomeScreen(onAuthChanged: () -> Unit = {}) {
 
 // 홈 탭 — 오늘의 목표(현재 적용 중인 limit) + 오늘의 스크롤 카운트
 // 카운트가 목표를 초과하면 빨간색으로 강조
+// 홈 탭이 마지막으로 보여 준 값 — 탭을 오갈 때 기본값(100/50, 0회)이 잠깐 보이지 않게 프로세스 안에 기억
+private object HomeTabCache {
+    @Volatile var dailyLimit: Int? = null
+    @Volatile var hourlyLimit: Int? = null
+    @Volatile var todayCount = 0
+    @Volatile var lastHourCount = 0
+}
+
 @Composable
 internal fun HomeTabContent() {
     val context = LocalContext.current
@@ -173,10 +181,24 @@ internal fun HomeTabContent() {
             .getString("userId", null)
     }
 
-    var todayCount by remember { mutableStateOf(0) }
-    var lastHourCount by remember { mutableStateOf(0) }
-    var dailyLimit by remember { mutableStateOf(100) }
-    var hourlyLimit by remember { mutableStateOf(50) }
+    var todayCount by remember { mutableStateOf(HomeTabCache.todayCount) }
+    var lastHourCount by remember { mutableStateOf(HomeTabCache.lastHourCount) }
+    // null = 아직 안 읽음 → 숫자 대신 "—" 표시 (기본값 100/50 을 진짜 값처럼 보여 주지 않기 위해)
+    var dailyLimit by remember { mutableStateOf(HomeTabCache.dailyLimit) }
+    var hourlyLimit by remember { mutableStateOf(HomeTabCache.hourlyLimit) }
+
+    // 한도는 로컬 DB 에 있으니 네트워크보다 먼저, 탭이 열리자마자 읽는다.
+    // (전에는 30초 루프 안에서 /sync 응답을 기다린 뒤에 읽어서, 그동안 기본값 100/50 이 보였음)
+    LaunchedEffect(userId) {
+        if (userId == null) return@LaunchedEffect
+        promoteAndSyncLimit(db, userId)
+        db.userLimitDao().getLimit(userId)?.let {
+            dailyLimit = it.dailyLimit
+            hourlyLimit = it.hourlyLimit
+            HomeTabCache.dailyLimit = it.dailyLimit
+            HomeTabCache.hourlyLimit = it.hourlyLimit
+        }
+    }
 
     // 30초 마다 자동 새로고침 — 슬라이딩 윈도우 카운트가 시간 흐름에 따라 자연 감소하는 것이
     // 화면에도 반영되도록. LaunchedEffect(Unit) 은 composable 이 composition 에 들어올 때만 실행되므로
@@ -201,6 +223,8 @@ internal fun HomeTabContent() {
             // 먼저 로컬 값으로 즉시 표시 → 서버 응답이 오면 계정 전체 기준으로 갱신
             todayCount = maxOf(localToday, synced)
             lastHourCount = localHour
+            HomeTabCache.todayCount = todayCount
+            HomeTabCache.lastHourCount = lastHourCount
             // 홈 탭이 떠 있는 동안 30초마다 GET /sync — 다른 기기 최근 1시간은 서버만 알고 있어서 직접 물어본다.
             // (접근성 서비스는 쇼츠를 보는 동안만 /sync 하므로 홈 탭에서는 여기서 갱신)
             if (userId != null) {
@@ -209,6 +233,8 @@ internal fun HomeTabContent() {
                     val dailyTotal = j.optInt("dailyTotal", -1)
                     if (dailyTotal >= 0) todayCount = maxOf(todayCount, dailyTotal)
                     lastHourCount = localHour + j.optInt("otherDevicesLastHour", 0).coerceAtLeast(0)
+                    HomeTabCache.todayCount = todayCount
+                    HomeTabCache.lastHourCount = lastHourCount
                 }
             }
             if (userId != null) {
@@ -219,6 +245,8 @@ internal fun HomeTabContent() {
                 db.userLimitDao().getLimit(userId)?.let {
                     dailyLimit = it.dailyLimit
                     hourlyLimit = it.hourlyLimit
+                    HomeTabCache.dailyLimit = it.dailyLimit
+                    HomeTabCache.hourlyLimit = it.hourlyLimit
                 }
             }
             delay(30_000L)
@@ -243,8 +271,8 @@ internal fun HomeTabContent() {
         Spacer(Modifier.height(8.dp))
 
         SectionTitle("오늘의 목표")
-        InfoRow(label = "Daily 목표", value = "${dailyLimit}회")
-        InfoRow(label = "Hourly 목표", value = "${hourlyLimit}회")
+        InfoRow(label = "Daily 목표", value = dailyLimit?.let { "${it}회" } ?: "—")
+        InfoRow(label = "Hourly 목표", value = hourlyLimit?.let { "${it}회" } ?: "—")
 
         Spacer(Modifier.height(4.dp))
 
@@ -252,12 +280,12 @@ internal fun HomeTabContent() {
         CountRow(
             label = "오늘 Daily Scroll",
             value = todayCount,
-            isExceeded = todayCount > dailyLimit
+            isExceeded = dailyLimit != null && todayCount > dailyLimit!!
         )
         CountRow(
             label = "최근 1시간 Scroll",
             value = lastHourCount,
-            isExceeded = lastHourCount > hourlyLimit
+            isExceeded = hourlyLimit != null && lastHourCount > hourlyLimit!!
         )
 
         Spacer(Modifier.height(8.dp))
