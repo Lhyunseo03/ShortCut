@@ -127,8 +127,15 @@ internal fun StatsTabContent(onApplyAiLimit: (Int, Int) -> Unit = { _, _ -> }) {
     var dailyMonthOffset by remember { mutableStateOf(0) }
     // AI 분석 화면 진입 여부 — 서브탭 옆 작은 "AI분석 →" 버튼으로 토글
     var showAiAnalysis by remember { mutableStateOf(false) }
+    // 주간 리포트 화면 진입 여부 — 알림을 놓쳤거나 지웠어도 여기서 다시 볼 수 있게 (B1)
+    var showWeeklyReport by remember { mutableStateOf(false) }
 
     BackHandler(enabled = showAiAnalysis) { showAiAnalysis = false }
+    BackHandler(enabled = showWeeklyReport) { showWeeklyReport = false }
+    if (showWeeklyReport) {
+        WeeklyReportScreen(onBack = { showWeeklyReport = false })
+        return
+    }
     if (showAiAnalysis) {
         Column(
             modifier = Modifier
@@ -186,6 +193,24 @@ internal fun StatsTabContent(onApplyAiLimit: (Int, Int) -> Unit = { _, _ -> }) {
                 fontSize = 13.sp,
                 fontWeight = FontWeight.SemiBold,
                 color = Color(0xFF1A1A1A)
+            )
+        }
+
+        // 주간 리포트 입구 — 일요일 20시 알림과 같은 화면(지난주 vs 이번주 그래프)
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(bottom = 12.dp),
+            horizontalArrangement = Arrangement.End
+        ) {
+            Text(
+                text = "주간 리포트 →",
+                modifier = Modifier
+                    .clickable { showWeeklyReport = true }
+                    .padding(horizontal = 8.dp, vertical = 4.dp),
+                fontSize = 13.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = Color(0xFF1565C0)
             )
         }
 

@@ -46,6 +46,11 @@ class WeeklyReportWorker(
         private const val TAG = "WeeklyReport"
         private const val CHANNEL_ID = "shortcut_weekly_report"
         private const val NOTIF_ID = 9201
+
+        // 리포트 화면을 열면 알림(과 앱 아이콘 배지)을 지운다 — 알림을 안 누르고 앱 안에서 연 경우 배지가 남던 문제
+        fun cancelNotification(ctx: Context) {
+            NotificationManagerCompat.from(ctx).cancel(NOTIF_ID)
+        }
         private const val SERVER_BASE_URL = "https://short-cut-server-production.up.railway.app"
         private val DATE_FMT get() = SimpleDateFormat("yyyy-MM-dd", Locale.US)
     }

@@ -116,6 +116,11 @@ fun WeeklyReportScreen(onBack: () -> Unit = {}) {
         context.getSharedPreferences("short_cut_prefs", Context.MODE_PRIVATE).getString("userId", null)
     }
     val nowMs = remember { System.currentTimeMillis() }
+
+    // 어떤 경로로 열리든(알림 탭 · 통계 탭 입구) 열리는 순간 알림 제거 → "읽음" 처리
+    LaunchedEffect(Unit) {
+        com.example.short_cut.services.WeeklyReportWorker.cancelNotification(context)
+    }
     val thisMonday = remember { mondayOf(nowMs) }
     val dayFmt = remember { SimpleDateFormat("yyyy-MM-dd", Locale.US) }
     val todayStr = remember { dayFmt.format(java.util.Date(nowMs)) }
