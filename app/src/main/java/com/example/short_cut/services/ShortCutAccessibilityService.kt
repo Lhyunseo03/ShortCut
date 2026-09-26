@@ -575,7 +575,7 @@ class ShortCutAccessibilityService : AccessibilityService() {
             if (hourlyNow < hourlyLimit) {
                 hourlyMilestone = -1
                 savePersistedState()
-                postMilestone()   // 슬라이딩 윈도우로 한도 아래로 내려감 → 서버도 -1 로 (스펙: 리셋 허용)
+                postMilestone(answered = false)   // 슬라이딩 윈도우로 한도 아래로 내려감 → 서버도 -1 로 (스펙: 리셋 허용)
             } else if (hourlyNow < hourlyMilestone) {
                 val stepLevel = hourlyLimit + ((hourlyNow - hourlyLimit) / HOURLY_STEP) * HOURLY_STEP
                 if (stepLevel < hourlyMilestone) {
@@ -592,7 +592,7 @@ class ShortCutAccessibilityService : AccessibilityService() {
             val overage = hourlyTrigger - hourlyLimit
             setPendingPopup("hourly", overage)
             withContext(Dispatchers.Main) { showLimitPopup("hourly", overage) }
-            postMilestone()   // 다른 기기가 같은 단계 팝업을 건너뛰게 (D6)
+            postMilestone(answered = false)   // 다른 기기가 같은 단계 팝업을 건너뛰게 (D6)
             return true
         }
 
@@ -603,7 +603,7 @@ class ShortCutAccessibilityService : AccessibilityService() {
             val overage = dailyTrigger - dailyLimit
             setPendingPopup("daily", overage)
             withContext(Dispatchers.Main) { showLimitPopup("daily", overage) }
-            postMilestone()   // 다른 기기가 같은 단계 팝업을 건너뛰게 (D6)
+            postMilestone(answered = false)   // 다른 기기가 같은 단계 팝업을 건너뛰게 (D6)
             return true
         }
         return false
@@ -611,7 +611,9 @@ class ShortCutAccessibilityService : AccessibilityService() {
 
     // ── 개입 상태 업로드 (스펙 §4) — 다른 기기가 /sync 로 받아 같은 팝업 생략 · 같은 시각까지 차단 ──
     // 실패해도 재시도하지 않음: 다음 팝업/Stop 때 다시 올라가고, 그 사이엔 로컬 동작에 영향 없음.
-    private fun postMilestone() {
+    // answered=false: 팝업을 띄웠다(다른 기기는 같은 단계 팝업 생략). answered=true: 사용자가 답했다(Stop/계속보기)
+    // → 서버가 lastAnsweredMilestone 갱신 + 다른 기기에 COUNT_UPDATED → 그 기기에 남은 같은 팝업이 닫힌다.
+    private fun postMilestone(answered: Boolean) {
         val h = hourlyMilestone
         val d = dailyMilestone
         uploadedHourlyMilestone = h
@@ -620,8 +622,9 @@ class ShortCutAccessibilityService : AccessibilityService() {
             val body = org.json.JSONObject()
                 .put("deviceId", com.example.short_cut.DeviceId.get(this@ShortCutAccessibilityService))
                 .put("hourly", h).put("daily", d)
+                .put("answered", answered)
             val res = com.example.short_cut.authedRequest("POST", "/milestone", body)
-            Log.d(TAG, "POST /milestone hourly=$h daily=$d → ${res.code}")
+            Log.d(TAG, "POST /milestone hourly=$h daily=$d answered=$answered → ${res.code}")
         }
     }
 
@@ -951,6 +954,7 @@ class ShortCutAccessibilityService : AccessibilityService() {
             isPopupShowing = false
             removeScrim()
             sendViolation(type, lastHourlyCount, dailyCount, "ignore")
+            postMilestone(answered = true)
             clearPendingPopup()
             Log.d(TAG, "스택 popup 전부 처리 → ignore 완료")
         } else {
@@ -1261,6 +1265,7 @@ class ShortCutAccessibilityService : AccessibilityService() {
         stopUntilMs = now + STOP_BLOCK_MS
         savePersistedState()
         postBlock(stopUntilMs)   // 다른 기기도 같은 시각까지 차단 (D6)
+        postMilestone(answered = true)
         sendViolation(type, lastHourlyCount, dailyCount, "stop")
         clearPendingPopup()
         dismissAllPopups()
@@ -1277,6 +1282,7 @@ class ShortCutAccessibilityService : AccessibilityService() {
     // 계속보기 (variant 4 제외) — popup 전부 dismiss + violation 전송
     private fun executeIgnore(type: String) {
         sendViolation(type, lastHourlyCount, dailyCount, "ignore")
+        postMilestone(answered = true)   // 다른 기기에 남은 같은 팝업이 닫히게
         clearPendingPopup()
         dismissAllPopups()
         Log.d(TAG, "계속보기 선택 → 다음 milestone 까지 대기")
@@ -1817,6 +1823,18 @@ class ShortCutAccessibilityService : AccessibilityService() {
                         clearPendingPopup()
                         withContext(Dispatchers.Main) { dismissAllPopups() }
                     }
+                }
+            }
+            // 다른 기기에서 사용자가 답한(Stop/계속보기) 단계 — 이 기기에 같은 단계 미응답 팝업이 남아 있으면 닫는다.
+            // /violations 는 보내지 않는다 (실제로 누른 기기만 보내야 통계 ignoreCount 가 두 번 잡히지 않음).
+            json.optJSONObject("lastAnsweredMilestone")?.let { m ->
+                val pType = pendingPopupType ?: return@let
+                val answered = m.optInt(pType, -1)
+                val pendingValue = pendingPopupOverage + (if (pType == "hourly") hourlyLimit else dailyLimit)
+                if (answered >= 0 && answered >= pendingValue) {
+                    Log.d(TAG, "다른 기기가 $pType $answered 단계에 답함 → 이 기기 미응답 팝업($pendingValue) 닫기")
+                    clearPendingPopup()
+                    withContext(Dispatchers.Main) { dismissAllPopups() }
                 }
             }
             savePersistedState()
