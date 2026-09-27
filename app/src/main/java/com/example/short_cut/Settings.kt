@@ -194,6 +194,8 @@ internal fun SettingsRootScreen(
                     prefs.edit().putString("nickname", nicknameDraft.trim()).apply()
                     savedNickname = nicknameDraft.trim()
                     Toast.makeText(context, "닉네임이 저장됐어요", Toast.LENGTH_SHORT).show()
+                    // 서버에도 반영 (그룹 순위표에서 다른 구성원에게 보이는 이름)
+                    appScope.launch { registerDevice(context) }
                 },
                 enabled = nicknameDraft.trim().isNotEmpty() && nicknameDraft.trim() != savedNickname,
                 shape = RoundedCornerShape(10.dp)

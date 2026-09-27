@@ -157,8 +157,8 @@ private fun GroupListScreen(onCreate: () -> Unit, onOpen: (String) -> Unit) {
     LaunchedEffect(reloadKey) {
         loading = true
         error = null
-        // 서버가 myTodayCount 를 안 주면 이 기기의 오늘 카운트로 대체
-        localToday = com.example.short_cut.db.ScrollCountRepository.get(context).dailyCount(startOfDayMs())
+        // 서버가 myTodayCount 를 안 주면 계정 전체 기준 오늘 카운트(홈 탭과 같은 값)로 대체
+        localToday = accountTodayCount(context)
 
         val res = fetchGroups()
         val list = res.value
@@ -289,6 +289,7 @@ private fun GroupCard(group: GroupSummary, myToday: Int, onClick: () -> Unit) {
 // 코드 입력 → GET /invites/{code} 로 그룹 정보 확인 → 참여(POST /groups/join)
 @Composable
 private fun JoinByCodeDialog(onDismiss: () -> Unit, onJoined: (String) -> Unit) {
+    val context = LocalContext.current
     val scope = rememberCoroutineScope()
     var code by remember { mutableStateOf("") }
     var invite by remember { mutableStateOf<InviteInfo?>(null) }
@@ -338,7 +339,7 @@ private fun JoinByCodeDialog(onDismiss: () -> Unit, onJoined: (String) -> Unit) 
                             invite = res.value
                             error = res.error
                         } else {
-                            val res = joinGroup(code)
+                            val res = joinGroup(code, localNickname(context))
                             val gid = res.value
                             if (gid != null) onJoined(gid) else error = res.error
                         }
@@ -441,7 +442,7 @@ private fun GroupCreateScreen(onBack: () -> Unit, onCreated: (String) -> Unit) {
                     busy = true
                     error = null
                     scope.launch {
-                        val res = createGroup(name.trim(), description.trim(), daily, hourly, threshold)
+                        val res = createGroup(name.trim(), description.trim(), daily, hourly, threshold, localNickname(context))
                         val gid = res.value
                         busy = false
                         if (gid != null) {
@@ -470,6 +471,18 @@ private fun GroupDetailScreen(groupId: String, onBack: () -> Unit) {
     var loading by remember { mutableStateOf(true) }
     var error by remember { mutableStateOf<String?>(null) }
     var detail by remember { mutableStateOf<GroupDetail?>(null) }
+    // 내 로컬 카운트 — 서버가 구성원별 카운트를 아직 안 채워 줄 때(랭킹은 서버 3단계) 내 행만이라도 홈 탭과 같게
+    var myLocalToday by remember { mutableIntStateOf(0) }
+    var myLocalHour by remember { mutableIntStateOf(0) }
+    var myLocalLastScroll by remember { mutableStateOf<Long?>(null) }
+    LaunchedEffect(groupId) {
+        val repo = com.example.short_cut.db.ScrollCountRepository.get(context)
+        val now = System.currentTimeMillis()
+        val dayStart = startOfDayMs()
+        myLocalToday = accountTodayCount(context)
+        myLocalHour = repo.hourlyCount(now)
+        myLocalLastScroll = AppDatabase.getDatabase(context).scrollHistoryDao().timestampsInRange(dayStart, now).lastOrNull()
+    }
     var reloadKey by remember { mutableIntStateOf(0) }
     var inviting by remember { mutableStateOf(false) }
     var showLeave by remember { mutableStateOf(false) }
@@ -525,8 +538,17 @@ private fun GroupDetailScreen(groupId: String, onBack: () -> Unit) {
                     HorizontalDivider(color = Color(0xFFEEEEEE))
                     SectionTitle("오늘 순위")
                     // 오늘 스크롤 많은 순
+                    // 내 행은 서버가 이름을 안 줘도 설정의 닉네임으로 보이게
+                    val myId = context.getSharedPreferences("short_cut_prefs", Context.MODE_PRIVATE).getString("userId", null)
+                    val myName = localNickname(context)
                     d.members.sortedByDescending { it.todayCount }.forEachIndexed { i, m ->
-                        MemberRow(rank = i + 1, member = m, group = g)
+                        val shown = if (m.userId == myId) m.copy(
+                            nickname = if (myName.isNotBlank()) myName else m.nickname,
+                            todayCount = maxOf(m.todayCount, myLocalToday),
+                            lastHourCount = maxOf(m.lastHourCount, myLocalHour),
+                            lastScrollAt = m.lastScrollAt ?: myLocalLastScroll
+                        ) else m
+                        MemberRow(rank = i + 1, member = shown, group = g)
                     }
                     Spacer(Modifier.height(4.dp))
                 }

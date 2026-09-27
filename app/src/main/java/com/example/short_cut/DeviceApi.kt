@@ -63,6 +63,27 @@ internal suspend fun authedRequest(method: String, path: String, body: JSONObjec
         }
     }
 
+// 설정 > 닉네임 에 저장된 값. 없으면 구글 계정 이름 → 이메일 앞부분. (그룹 순위표 · AI 분석에 쓰는 이름)
+internal fun localNickname(context: Context): String {
+    val prefs = context.getSharedPreferences("short_cut_prefs", Context.MODE_PRIVATE)
+    val user = FirebaseAuth.getInstance().currentUser
+    return prefs.getString("nickname", null)?.takeIf { it.isNotBlank() }
+        ?: user?.displayName?.takeIf { it.isNotBlank() }
+        ?: user?.email?.substringBefore('@')
+        ?: ""
+}
+
+// 오늘 카운트 — 이 기기 로컬(Room) 과 접근성 서비스가 /sync 로 받아 둔 계정 전체 값 중 큰 쪽.
+// 홈 탭 · 그룹 목록 · 그룹 상세가 같은 숫자를 보여 주도록 한 곳에서 계산한다.
+internal suspend fun accountTodayCount(context: Context): Int {
+    val app = context.applicationContext
+    val dayStart = startOfDayMs()
+    val prefs = app.getSharedPreferences("short_cut_prefs", Context.MODE_PRIVATE)
+    val synced = if (prefs.getLong(com.example.short_cut.services.ShortCutAccessibilityService.PK_SYNCED_DAILY_DAY, -1L) == dayStart)
+        prefs.getInt(com.example.short_cut.services.ShortCutAccessibilityService.PK_SYNCED_DAILY_COUNT, 0) else 0
+    return maxOf(com.example.short_cut.db.ScrollCountRepository.get(app).dailyCount(dayStart), synced)
+}
+
 // ── 기기 등록 (API 스펙 §1) ──────────────────────────────────────────────
 internal const val PK_DEVICE_COUNT = "deviceCount"   // 이 계정의 로그인 상태 기기 수 — 2 이상이면 1분 배치(D2)
 
@@ -87,6 +108,8 @@ internal suspend fun registerDevice(context: Context): Boolean {
         .put("deviceName", Build.MODEL ?: "Android")
         .put("permissionsOk", permissionsOk)
     if (fcmToken != null) body.put("fcmToken", fcmToken)
+    // 닉네임도 함께 — 서버가 users/{uid}.nickname 으로 저장해 그룹 순위표에 쓰도록 (앱 시작 · 닉네임 저장 시 갱신)
+    localNickname(app).takeIf { it.isNotBlank() }?.let { body.put("nickname", it) }
 
     val res = authedRequest("POST", "/devices/register", body)
     if (!res.ok) return false

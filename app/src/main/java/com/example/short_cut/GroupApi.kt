@@ -3,10 +3,11 @@ package com.example.short_cut
 import org.json.JSONObject
 
 // ─────────────────────────────────────────────────────────────────────────
-// 그룹 API — 앱이 가정한 JSON 계약 (서버 미구현 상태에서 작성. 서버와 다르면 이 파일의 파서만 고치면 됨)
+// 그룹 API — 서버 API_SPEC_groups.md 와 맞춘 JSON 계약. (1단계 9/27 배포: POST /groups, GET /groups, GET /groups/{gid})
+// 서버와 다른 부분이 생기면 이 파일의 파서만 고치면 됨.
 //
 //  GET    /groups                      → { "maxGroups": 5, "groups": [ GroupSummary ] }
-//  POST   /groups                      ← { name, description, goal: { dailyLimit, hourlyLimit }, voteThreshold }
+//  POST   /groups                      ← { name, description, goal: { dailyLimit, hourlyLimit }, approvalRate }
 //                                      → { "groupId": "..." }
 //  GET    /groups/{gid}                → GroupSummary + { "members": [ Member ] }
 //  GET    /groups/{gid}/status         → { "members": [ { userId, todayCount, lastHourCount, lastSeenAt, lastScrollAt } ] }
@@ -15,7 +16,7 @@ import org.json.JSONObject
 //  POST   /groups/join                 ← { code }  → { "groupId": "..." }
 //  DELETE /groups/{gid}/members/me     → { "status": "ok" }
 //
-//  GroupSummary = { groupId, name, description, goal: { dailyLimit, hourlyLimit }, voteThreshold(60~100),
+//  GroupSummary = { groupId, name, description, goal: { dailyLimit, hourlyLimit }, approvalRate(60~100),
 //                   memberCount, maxMembers(기본 10), myTodayCount(GET /groups 에서만) }
 //  Member       = { userId, nickname, todayCount, lastHourCount, lastSeenAt(ms|null), lastScrollAt(ms|null) }
 //
@@ -58,22 +59,39 @@ internal data class InviteInfo(val code: String, val expiresAt: Long?, val group
 // 성공이면 value, 실패면 사용자에게 보여 줄 error 문구.
 internal data class GroupResult<T>(val value: T?, val error: String?)
 
+// 서버가 이유(error)를 주면 그대로, 아니면 기본 문구 + HTTP 코드 (원인을 화면에서 바로 알 수 있게)
 private fun <T> fail(res: ApiResult, fallback: String): GroupResult<T> =
-    GroupResult(null, res.error ?: if (res.code == 0) "네트워크 연결을 확인해 주세요" else fallback)
+    GroupResult(null, res.error ?: if (res.code == 0) "네트워크 연결을 확인해 주세요" else "$fallback (HTTP ${res.code})")
+
+// 응답에서 그룹 ID 꺼내기 — 서버가 groupId / id / group.groupId / group.id 중 어떤 이름을 쓰든 받는다
+private fun JSONObject.groupIdOrEmpty(): String {
+    optString("groupId").takeIf { it.isNotEmpty() }?.let { return it }
+    optString("id").takeIf { it.isNotEmpty() }?.let { return it }
+    optJSONObject("group")?.let { g ->
+        g.optString("groupId").takeIf { it.isNotEmpty() }?.let { return it }
+        g.optString("id").takeIf { it.isNotEmpty() }?.let { return it }
+    }
+    return ""
+}
 
 private fun JSONObject.optLongOrNull(key: String): Long? =
     if (has(key) && !isNull(key)) optLong(key).takeIf { it > 0 } else null
 
-private fun parseSummary(o: JSONObject): GroupSummary {
-    val goal = o.optJSONObject("goal")
+private fun parseSummary(raw: JSONObject): GroupSummary {
+    // 상세 응답이 { group: {...}, members: [...] } 처럼 감싸져 오면 안쪽을 읽는다
+    val o = raw.optJSONObject("group") ?: raw
+    // 한도: goal { dailyLimit, hourlyLimit } 우선, 없으면 최상위 dailyLimit/hourlyLimit
+    val goal = o.optJSONObject("goal") ?: o.optJSONObject("limits")
     return GroupSummary(
-        groupId = o.optString("groupId"),
+        groupId = o.groupIdOrEmpty(),
         name = o.optString("name"),
         description = o.optString("description"),
-        dailyLimit = goal?.optInt("dailyLimit", 0) ?: 0,
-        hourlyLimit = goal?.optInt("hourlyLimit", 0) ?: 0,
-        voteThreshold = o.optInt("voteThreshold", 0),
-        memberCount = o.optInt("memberCount", 0),
+        dailyLimit = goal?.optInt("dailyLimit", 0)?.takeIf { it > 0 } ?: o.optInt("dailyLimit", 0),
+        hourlyLimit = goal?.optInt("hourlyLimit", 0)?.takeIf { it > 0 } ?: o.optInt("hourlyLimit", 0),
+        // 서버는 approvalRate 로 내려줌. 옛 이름(voteThreshold)도 혹시 몰라 같이 읽음
+        voteThreshold = if (o.has("approvalRate")) o.optInt("approvalRate", 0) else o.optInt("voteThreshold", 0),
+        memberCount = o.optInt("memberCount", 0).takeIf { it > 0 }
+            ?: raw.optJSONArray("members")?.length() ?: o.optJSONArray("memberIds")?.length() ?: 0,
         maxMembers = o.optInt("maxMembers", MAX_MEMBERS_DEFAULT),
         myTodayCount = if (o.has("myTodayCount")) o.optInt("myTodayCount") else null
     )
@@ -85,7 +103,9 @@ private fun parseMembers(o: JSONObject): List<GroupMember> {
         val m = arr.optJSONObject(i) ?: return@mapNotNull null
         GroupMember(
             userId = m.optString("userId"),
-            nickname = m.optString("nickname").ifBlank { "이름 없음" },
+            // 서버가 nickname / name / displayName 중 무엇으로 주든 받는다
+            nickname = m.optString("nickname").ifBlank { m.optString("name") }.ifBlank { m.optString("displayName") }
+                .ifBlank { "이름 없음" },
             todayCount = m.optInt("todayCount", 0),
             lastHourCount = m.optInt("lastHourCount", 0),
             lastSeenAt = m.optLongOrNull("lastSeenAt"),
@@ -96,9 +116,6 @@ private fun parseMembers(o: JSONObject): List<GroupMember> {
 
 internal suspend fun fetchGroups(): GroupResult<GroupList> {
     val res = authedRequest("GET", "/groups")
-    // 404 = 서버에 그룹 API 가 아직 배포되지 않음 → 오류 대신 "가입한 그룹 없음"으로 취급.
-    // TODO: 서버에 GET /groups 가 배포되면 이 분기 삭제 (그때의 404 는 진짜 오류).
-    if (res.code == 404) return GroupResult(GroupList(emptyList(), MAX_GROUPS_DEFAULT), null)
     val json = res.json
     if (!res.ok || json == null) return fail(res, "그룹 목록을 불러오지 못했어요")
     val arr = json.optJSONArray("groups")
@@ -109,16 +126,20 @@ internal suspend fun fetchGroups(): GroupResult<GroupList> {
 
 // 성공 시 새 그룹의 groupId.
 internal suspend fun createGroup(
-    name: String, description: String, dailyLimit: Int, hourlyLimit: Int, voteThreshold: Int
+    name: String, description: String, dailyLimit: Int, hourlyLimit: Int, voteThreshold: Int,
+    nickname: String = ""
 ): GroupResult<String> {
     val body = JSONObject()
         .put("name", name)
+        .put("nickname", nickname)   // 만든 사람의 그룹 표시 이름 (설정 > 닉네임)
         .put("description", description)
         .put("goal", JSONObject().put("dailyLimit", dailyLimit).put("hourlyLimit", hourlyLimit))
-        .put("voteThreshold", voteThreshold)
+        .put("approvalRate", voteThreshold)   // 서버 칸 이름은 approvalRate (1~100 정수)
     val res = authedRequest("POST", "/groups", body)
-    val gid = res.json?.optString("groupId").orEmpty()
-    return if (res.ok && gid.isNotEmpty()) GroupResult(gid, null) else fail(res, "그룹을 만들지 못했어요")
+    val gid = res.json?.groupIdOrEmpty().orEmpty()
+    if (res.ok && gid.isEmpty()) android.util.Log.w("GroupApi", "POST /groups 성공인데 groupId 없음 — 응답: ${res.json}")
+    return if (res.ok && gid.isNotEmpty()) GroupResult(gid, null)
+           else fail(res, if (res.ok) "응답에 그룹 ID가 없어요" else "그룹을 만들지 못했어요")
 }
 
 internal suspend fun fetchGroupDetail(groupId: String): GroupResult<GroupDetail> {
@@ -150,9 +171,9 @@ internal suspend fun fetchInvite(code: String): GroupResult<InviteInfo> {
 }
 
 // 성공 시 가입한 그룹의 groupId.
-internal suspend fun joinGroup(code: String): GroupResult<String> {
-    val res = authedRequest("POST", "/groups/join", JSONObject().put("code", code))
-    val gid = res.json?.optString("groupId").orEmpty()
+internal suspend fun joinGroup(code: String, nickname: String = ""): GroupResult<String> {
+    val res = authedRequest("POST", "/groups/join", JSONObject().put("code", code).put("nickname", nickname))
+    val gid = res.json?.groupIdOrEmpty().orEmpty()
     return if (res.ok && gid.isNotEmpty()) GroupResult(gid, null) else fail(res, "그룹에 참여하지 못했어요")
 }
 
