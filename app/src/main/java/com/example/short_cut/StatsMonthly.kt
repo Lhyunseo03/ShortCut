@@ -188,7 +188,8 @@ internal fun MonthInlineDetail(monthOffset: Int) {
     }
     // 도넛 데이터 — 서버 byPlatform 있으면 우선, 없으면 로컬 Room
     // 도넛 — 로컬 우선(달력/일별 막대와 일치). 로컬 비어있을 때만 서버 byPlatform 폴백.
-    val donutCounts = if (appCounts.values.sum() > 0) appCounts else summary?.byPlatform ?: emptyMap()
+    // 서버 byPlatform(모든 기기 합) 이 로컬(이 기기) 이상이면 서버, 아니면 로컬
+    val donutCounts = summary?.byPlatform?.takeIf { it.values.sum() >= appCounts.values.sum() } ?: appCounts
 
     Surface(
         modifier = Modifier.fillMaxWidth().padding(top = 4.dp, bottom = 16.dp),

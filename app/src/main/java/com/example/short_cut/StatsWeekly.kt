@@ -137,6 +137,12 @@ internal fun StatsWeekly() {
             userId?.let { StatsCache.get<Map<String, Int>>("weekly:$it:$displayYear") } ?: emptyMap()
         )
     }
+    // 날짜별 서버 앱별 집계 (도넛용, 모든 기기 합). yyyy-MM-dd → {youtube, instagram, tiktok}
+    var dayPlatforms by remember(yearOffset) {
+        mutableStateOf<Map<String, Map<String, Int>>>(
+            userId?.let { StatsCache.get<Map<String, Map<String, Int>>>("weeklyPlatform:$it:$displayYear") } ?: emptyMap()
+        )
+    }
     var loading by remember(yearOffset) { mutableStateOf(dayTotals.isEmpty()) }
     // 서버 보강(미싱 날짜 /daily) 진행 중 표시 — 로컬은 즉시 떠도 서버 fetch 동안 스피너 유지
     var refreshing by remember(yearOffset) { mutableStateOf(false) }
@@ -168,10 +174,13 @@ internal fun StatsWeekly() {
             // 2단계: 서버(모든 기기 합) 로 보강 — 날짜별로 로컬/서버 중 큰 쪽
             if (days.isNotEmpty()) {
                 refreshing = true
-                val server = fetchDailyTotalsForDays(userId, days)
-                val result = days.associateWith { d -> maxOf(local[d] ?: 0, server[d] ?: 0) }
+                val server = fetchDailyStatsForDays(userId, days)
+                val result = days.associateWith { d -> maxOf(local[d] ?: 0, server[d]?.totalScroll ?: 0) }
                 dayTotals = result
                 StatsCache.put("weekly:$userId:$displayYear", result)
+                val platforms = server.mapNotNull { (d, st) -> st.byPlatform?.let { d to it } }.toMap()
+                dayPlatforms = platforms
+                StatsCache.put("weeklyPlatform:$userId:$displayYear", platforms)
                 refreshing = false
             } else {
                 StatsCache.put("weekly:$userId:$displayYear", dayTotals)
@@ -321,13 +330,20 @@ internal fun StatsWeekly() {
                     .let { dayFmt.format(it.time) }
             } else null
 
-            // 선택 주의 앱별 카운트 — 로컬 Room (7일 범위)
+            // 선택 주의 앱별 카운트 — 서버 일별 byPlatform 합(모든 기기) 이 로컬(이 기기) 이상이면 서버, 아니면 로컬
             var weekAppCounts by remember(selectedWeek) { mutableStateOf<Map<String, Int>>(emptyMap()) }
-            LaunchedEffect(selectedWeek) {
+            LaunchedEffect(selectedWeek, dayPlatforms) {
                 val weekEnd = selectedWeek + 7L * 24L * 60L * 60L * 1000L
-                weekAppCounts = db.scrollHistoryDao()
+                val localApp = db.scrollHistoryDao()
                     .countByAppForRange(selectedWeek, weekEnd)
                     .associate { it.appPkg to it.count }
+                val cal = Calendar.getInstance()
+                val serverApp = mutableMapOf<String, Int>()
+                for (i in 0 until 7) {
+                    cal.timeInMillis = selectedWeek; cal.add(Calendar.DAY_OF_YEAR, i)
+                    dayPlatforms[dayFmt.format(cal.time)]?.forEach { (k, v) -> serverApp[k] = (serverApp[k] ?: 0) + v }
+                }
+                weekAppCounts = if (serverApp.values.sum() >= localApp.values.sum()) serverApp else localApp
             }
 
             Text(

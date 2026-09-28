@@ -237,6 +237,7 @@ internal suspend fun fetchLimitsFromServer(userId: String): Pair<Int, Int>? {
 
 internal suspend fun fetchDailyStats(userId: String, date: String): DailyStatsRemote? {
     val json = authedGetJson("$SERVER_BASE_URL/stats/$userId/daily?date=$date") ?: return null
+    Log.d("StatsApi", "daily $date ← total=${json.optInt("totalScroll", -1)} byPlatform=${json.optJSONObject("byPlatform")}")
     val hourly = IntArray(24)
     json.optJSONArray("hourlyGraph")?.let { arr ->
         for (i in 0 until arr.length()) {

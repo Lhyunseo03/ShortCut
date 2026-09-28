@@ -472,10 +472,12 @@ internal fun StatsDaily(monthOffset: Int, onMonthOffsetChange: (Int) -> Unit) {
             dayCounts = dayCounts + (selectedDateStr to dayTotal)
             userId?.let { StatsCache.put("monthDays:$it:$monthKey", dayCounts) }
         }
-        // 도넛은 항상 로컬 DB 기반
-        dayAppCounts = db.scrollHistoryDao()
+        // 앱별 도넛 — 서버 byPlatform(모든 기기 합) 이 로컬(이 기기) 이상이면 서버, 아니면 로컬
+        val localApp = db.scrollHistoryDao()
             .countByAppForRange(selectedDayMs, endOfDay)
             .associate { it.appPkg to it.count }
+        val serverApp = remote?.byPlatform
+        dayAppCounts = if (serverApp != null && serverApp.values.sum() >= localApp.values.sum()) serverApp else localApp
         // milestone 시각 — 로컬 timestamps 로 정확히 계산 (분 단위까지)
         // [중요] "그날 실제로 팝업을 트리거한 한도값" 을 써야 한다:
         //   - 오늘: 로컬 current(=오늘 실제로 적용 중인 값). 서버 limits/{userId} 는
@@ -487,7 +489,19 @@ internal fun StatsDaily(monthOffset: Int, onMonthOffsetChange: (Int) -> Unit) {
                    else (remote?.dailyLimit?.takeIf { it > 0 } ?: currentDailyLimit)
         val hLim = if (selectedIsToday) currentHourlyLimit
                    else (remote?.hourlyLimit ?: currentHourlyLimit)
-        if (dLim > 0 || hLim > 0) {
+        // 팝업 시각 · 횟수 — 서버 violations(그만보기/계속보기 기록, 모든 기기) 가 있으면 그것을 쓴다.
+        //   로컬 timestamps 로 흉내 내는 방식은 이 기기 스크롤만 알아서 다중 기기에서는 시각도 횟수도 어긋난다.
+        //   서버 기록은 "답한 시각" 이라 팝업이 뜬 순간과 몇 초~분 차이가 날 수 있고, 답하지 않고 다른 기기에서
+        //   닫힌 팝업은 안 잡힌다. 서버 기록이 없을 때(오프라인 · 옛 데이터)만 로컬 흉내로 폴백.
+        val serverViolations = remote?.violations?.takeIf { source == "server" }
+        if (serverViolations != null) {
+            val hourlyTimes = serverViolations.filter { it.limitType == "hourly" }.map { it.timestamp }.sorted()
+            val dailyTimes = serverViolations.filter { it.limitType == "daily" }.map { it.timestamp }.sorted()
+            hourlyExceedTime = hourlyTimes.firstOrNull()
+            hourlyExtraPopupTimes = hourlyTimes.drop(1)
+            dailyExceedTime = dailyTimes.firstOrNull()
+            dailyExtraPopupTimes = dailyTimes.drop(1)
+        } else if (dLim > 0 || hLim > 0) {
             val m = computeMilestones(db, selectedDayMs, endOfDay, dLim, hLim)
             dailyExceedTime = m.dailyExceed
             dailyExtraPopupTimes = m.dailyExtraPopups
@@ -765,12 +779,7 @@ internal fun StatsDaily(monthOffset: Int, onMonthOffsetChange: (Int) -> Unit) {
             modifier = Modifier.padding(start = 8.dp, bottom = 6.dp)
         )
         Box(modifier = Modifier.padding(horizontal = 8.dp)) {
-            // 로컬 우선 — 7일치 한도 안의 날짜는 로컬이 정확(달력/진행률과 일치).
-            // 로컬에 데이터 없는 8일 이전 날짜만 서버 byPlatform 폴백.
-            AppShareDonut(
-                if (dayAppCounts.values.sum() > 0) dayAppCounts
-                else serverStats?.byPlatform ?: emptyMap()
-            )
+            AppShareDonut(dayAppCounts)
         }
 
         // Canvas 차트 영역 — 누적 라인 + 그날 한도 점선
