@@ -62,6 +62,8 @@ class ShortCutAccessibilityService : AccessibilityService() {
 
         // 쇼츠 보는 동안 /sync 호출 주기 (API 스펙 §3)
         const val SYNC_INTERVAL_MS = 60 * 1000L
+        // 자정 롤오버 때 어제 통계를 굳히기 전에 다른 기기의 업로드를 기다리는 시간
+        const val FINALIZE_DELAY_MS = 90 * 1000L
 
         // 실행 중인 서비스 인스턴스 — FCM 서비스(같은 프로세스)가 FLUSH 수신 시 즉시 업로드를 요청하는 데 사용.
         // onServiceConnected 에서 설정, onDestroy 에서 해제.
@@ -412,7 +414,14 @@ class ShortCutAccessibilityService : AccessibilityService() {
         }.format(java.util.Date(todayStartMs))
         val snapHourly = hourlyLimit
         val snapDaily  = dailyLimit
-        serviceScope.launch { finalizeStats(userId, yesterdayDate, snapHourly, snapDaily) }
+        // [다중 기기] 어제 통계는 서버가 finalize 때 한 번 굳히고 다시 계산하지 않는다.
+        //   다른 기기가 아직 안 올린 어제 스크롤이 있으면 영영 빠지므로, 먼저 /sync 를 불러 다른 기기에 FLUSH 를 보내고
+        //   업로드될 시간을 준 뒤 finalize 한다. (서버가 늦게 온 로그로 캐시를 다시 계산하게 되면 이 대기는 없애도 됨)
+        serviceScope.launch {
+            syncFromServer("자정 롤오버 — 다른 기기 FLUSH")
+            kotlinx.coroutines.delay(FINALIZE_DELAY_MS)
+            finalizeStats(userId, yesterdayDate, snapHourly, snapDaily)
+        }
 
         // 날짜가 바뀌기 전에 이전 날 배치를 먼저 flush — batchFirstScrollMs(이전 날 시각)로 전송돼
         // 어제 스크롤이 어제 날짜로 집계됨
