@@ -76,6 +76,22 @@ internal object HistoryRestore {
             if (n <= 0) continue
             val hourStart = dayStart + hour * HOUR_MS
             if (hourStart > now) continue
+            // 최근 1시간은 복원하지 않는다 — 재설치로 deviceId 가 새로 생겨 서버는 그 전 스크롤을 전부 "다른 기기" 로 보고
+            // /sync 의 otherDevicesLastHour 에 담아 준다. 여기서도 넣으면 시간당 카운트가 두 배로 잡혀 팝업이 일찍 뜬다.
+            if (hourStart + HOUR_MS > now - HOUR_MS) {
+                val cutoff = now - HOUR_MS
+                if (hourStart >= cutoff) continue
+                // 시간대가 경계에 걸치면 cutoff 이전 비율만큼만 복원
+                val keep = ((cutoff - hourStart).toDouble() / HOUR_MS * n).toInt()
+                if (keep <= 0) continue
+                for (k in 0 until keep) {
+                    val ts = hourStart + ((cutoff - hourStart) * (2L * k + 1L)) / (2L * keep)
+                    val platform = remaining.filterValues { it > 0 }.maxByOrNull { it.value }?.key
+                    if (platform != null) remaining[platform] = remaining.getValue(platform) - 1
+                    out += ScrollHistory(appPkg = PLATFORM_PKG[platform] ?: "unknown", timestamp = ts)
+                }
+                continue
+            }
             // 지금 진행 중인 시간대는 "현재 시각"까지만 — 미래 시각의 기록이 생기면 카운트 조회에서 빠진다
             val span = minOf(HOUR_MS, now - hourStart).coerceAtLeast(1L)
             for (k in 0 until n) {

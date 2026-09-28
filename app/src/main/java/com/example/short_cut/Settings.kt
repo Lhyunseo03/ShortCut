@@ -346,10 +346,21 @@ internal fun SettingsAccountScreen(onBack: () -> Unit, onAuthChanged: () -> Unit
             text = { Text("로그아웃 하시겠습니까?") },
             confirmButton = {
                 TextButton(onClick = {
+                    // 서버에 로그아웃 알림 (스펙 §5) — 토큰이 살아 있는 signOut 전에. 이 기기가 FCM 대상 · deviceCount 에서 빠진다.
+                    // 안 하면 다른 계정으로 로그인해도 이전 계정의 푸시가 이 기기로 계속 온다.
+                    val deviceId = DeviceId.get(context)
+                    appScope.launch {
+                        authedRequest("POST", "/logout", org.json.JSONObject().put("deviceId", deviceId))
+                        // 계정별 로컬 데이터 정리 — 다음 계정에 섞이지 않게
+                        db.groupLimitDao().deleteAll()
+                        com.example.short_cut.db.ScrollCountRepository.get(context).deleteAll()
+                    }
                     auth.signOut()
-                    prefs.edit().remove("userId").apply()
-                    // 그룹 한도 캐시는 계정별 데이터 — 다른 계정으로 로그인했을 때 남아 있지 않게 비움
-                    appScope.launch { db.groupLimitDao().deleteAll() }
+                    prefs.edit()
+                        .remove("userId")
+                        .remove("nickname")      // 닉네임은 계정별 — 남기면 다음 계정의 닉네임으로 서버에 올라감
+                        .remove(PK_DEVICE_COUNT)
+                        .apply()
                     showLogoutConfirm = false
                     onAuthChanged()
                 }) { Text("예") }

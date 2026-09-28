@@ -217,6 +217,45 @@ class ShortCutAccessibilityService : AccessibilityService() {
         scheduleBatchTimer()
     }
 
+    // 로그인 계정이 바뀌었으면(로그아웃 후 다른 계정 로그인) 이전 계정의 흔적을 전부 지운다.
+    // 서비스 시작 때만이 아니라 스크롤 · /sync 때도 확인 — 서비스가 계속 떠 있는 채로 계정만 바뀌는 경우가 있어서.
+    // 안 지우면 이전 계정 스크롤이 새 계정 통계(로컬)에 섞이고, 카운트 · 팝업 단계 · 차단이 새 계정에 이어진다.
+    private suspend fun resetIfUserChanged(userId: String) {
+        val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
+        val lastUserId = prefs.getString("lastUserId", "") ?: ""
+        if (userId == lastUserId) return
+        scrollCounts.deleteAll()
+        prefs.edit()
+            .putString("lastUserId", userId)
+            .remove(PK_DAILY_MILESTONE)
+            .remove(PK_HOURLY_MILESTONE)
+            .remove(PK_PENDING_TYPE)
+            .remove(PK_PENDING_OVERAGE)
+            .remove(PK_STOP_UNTIL)
+            .remove(PK_SYNCED_DAILY_COUNT)
+            .remove(PK_SYNCED_DAILY_DAY)
+            .remove(PK_PENDING_USERLOGS)      // 이전 계정의 미전송분은 새 계정 토큰으로 올라가면 안 됨
+            .remove(PK_PENDING_VIOLATIONS)
+            .remove(com.example.short_cut.PK_DEVICE_COUNT)
+            .apply()
+        synchronized(pendingLock) { batchScrollCount = 0; batchFirstScrollMs = 0L; batchAppPkg = "" }
+        dailyCount = 0
+        dailyMilestone = -1
+        hourlyMilestone = -1
+        uploadedHourlyMilestone = -1
+        uploadedDailyMilestone = -1
+        stopUntilMs = 0L
+        otherDevicesLastHour = 0
+        pendingPopupType = null
+        pendingPopupOverage = 0
+        withContext(Dispatchers.Main) { dismissAllPopups() }
+        // 새 계정의 한도 로드
+        if (userId != "unknown") {
+            userLimitDao.getLimit(userId)?.let { hourlyLimit = it.hourlyLimit; dailyLimit = it.dailyLimit }
+        }
+        Log.d(TAG, "userId 변경 감지 → 상태 초기화 ($lastUserId → $userId)")
+    }
+
     // 서비스 시작 시 Room DB / SharedPreferences 에서 상태 복원
     private suspend fun initializeOnStart() {
         val now = System.currentTimeMillis()
@@ -233,20 +272,7 @@ class ShortCutAccessibilityService : AccessibilityService() {
 
         // userId 변경 감지 → 다른 유저 데이터 흔적 제거
         val userId = prefs.getString("userId", "unknown") ?: "unknown"
-        val lastUserId = prefs.getString("lastUserId", "") ?: ""
-        if (userId != lastUserId) {
-            scrollCounts.deleteOlderThan(now + 1L) // 전체 삭제
-            prefs.edit()
-                .putString("lastUserId", userId)
-                .remove(PK_DAILY_MILESTONE)
-                .remove(PK_HOURLY_MILESTONE)
-                .remove(PK_PENDING_TYPE)
-                .remove(PK_PENDING_OVERAGE)
-                .remove(PK_STOP_UNTIL)
-                .apply()
-            dailyCount = 0
-            Log.d(TAG, "userId 변경 감지 → 상태 초기화 ($lastUserId → $userId)")
-        }
+        resetIfUserChanged(userId)
 
         // pending limit 변경 예약이 만료됐으면 promote
         // [변경됨] promoteExpiredPending → promoteAndSyncLimit:
@@ -519,6 +545,7 @@ class ShortCutAccessibilityService : AccessibilityService() {
         serviceScope.launch {
             val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
             val userId = prefs.getString("userId", "unknown") ?: "unknown"
+            resetIfUserChanged(userId)
 
             // 자정 롤오버 처리 (limit/카운트/마일스톤 재로드)
             handleDayRolloverIfNeeded(now, userId)
@@ -637,6 +664,10 @@ class ShortCutAccessibilityService : AccessibilityService() {
             Log.d(TAG, "POST /block until=$blockUntil → ${res.code}")
         }
     }
+
+    // 카운트가 지금 도달해 있는 단계 (limit, limit+step, ...). 한도 미만이면 -1.
+    private fun stageOf(count: Int, limit: Int, step: Int): Int =
+        if (limit <= 0 || count < limit) -1 else limit + ((count - limit) / step) * step
 
     // 이번에 팝업을 띄워야 하는 milestone 값. 아직 아니면 null. (hourly/daily 공통 — 비교는 전부 ≥)
     //  - milestone = -1 (오늘/이번 윈도우 첫 팝업, 또는 서비스 재시작 · 슬라이딩 윈도우 리셋 직후):
@@ -1758,6 +1789,7 @@ class ShortCutAccessibilityService : AccessibilityService() {
             val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
             val userId = prefs.getString("userId", "unknown") ?: "unknown"
             if (userId == "unknown") return
+            resetIfUserChanged(userId)
             val now = System.currentTimeMillis()
             handleDayRolloverIfNeeded(now, userId)
 
@@ -1790,6 +1822,10 @@ class ShortCutAccessibilityService : AccessibilityService() {
                 dailyCount = dailyTotal + unsentTodayCount()
             }
             otherDevicesLastHour = json.optInt("otherDevicesLastHour", 0).coerceAtLeast(0)
+            // 지금 카운트로 도달 가능한 단계 — 서버의 milestone 값이 이보다 높으면 낡은 값(다른 시간대 창 · 어제)이다
+            val hourlyNowCombined = scrollCounts.hourlyCount(now) + otherDevicesLastHour
+            val hourlyStageNow = stageOf(hourlyNowCombined, hourlyLimit, HOURLY_STEP)
+            val dailyStageNow = stageOf(dailyCount, dailyLimit, DAILY_STEP)
             val deviceCount = json.optInt("deviceCount", -1)
             if (deviceCount >= 1) prefs.edit().putInt(com.example.short_cut.PK_DEVICE_COUNT, deviceCount).apply()
 
@@ -1807,8 +1843,12 @@ class ShortCutAccessibilityService : AccessibilityService() {
             }
             // 다른 기기에서 이미 보여 준 팝업 단계 — 로컬보다 크면 올려서 같은 팝업 생략 (D6)
             json.optJSONObject("lastShownMilestone")?.let { m ->
-                val h = m.optInt("hourly", -1)
-                val d = m.optInt("daily", -1)
+                // [중요] 서버 값이 현재 카운트로 도달 가능한 단계보다 높으면 무시한다.
+                //   시간당 창은 기기마다 다르게 흐른다. 아침에 B 가 60 단계를 띄운 값이 서버에 남아 있는데
+                //   오후에 A 의 카운트가 25 라면, 60 을 받으면 A 는 "다음 팝업 70" 이 돼 30·40 에서 안 뜨고,
+                //   1분마다 다시 60 으로 올라가 끝까지 안 뜬다 (실기기에서 재현됨). 낡은 값은 버리고 현재 단계까지만 받는다.
+                val h = m.optInt("hourly", -1).let { if (it > hourlyStageNow) -1 else it }
+                val d = m.optInt("daily", -1).let { if (it > dailyStageNow) -1 else it }
                 if (h > hourlyMilestone) hourlyMilestone = h
                 if (d > dailyMilestone) dailyMilestone = d
                 // 이 기기에 미응답 팝업이 있는데 다른 기기가 그보다 더 나간 단계까지 갔으면(내가 올린 값보다 큼)
@@ -1829,7 +1869,9 @@ class ShortCutAccessibilityService : AccessibilityService() {
             // /violations 는 보내지 않는다 (실제로 누른 기기만 보내야 통계 ignoreCount 가 두 번 잡히지 않음).
             json.optJSONObject("lastAnsweredMilestone")?.let { m ->
                 val pType = pendingPopupType ?: return@let
-                val answered = m.optInt(pType, -1)
+                // 같은 이유로 낡은 값(현재 도달 가능 단계보다 높음)은 무시 — 아침에 답한 60 이 오후의 20 팝업을 닫으면 안 됨
+                val stageNow = if (pType == "hourly") hourlyStageNow else dailyStageNow
+                val answered = m.optInt(pType, -1).let { if (it > stageNow) -1 else it }
                 val pendingValue = pendingPopupOverage + (if (pType == "hourly") hourlyLimit else dailyLimit)
                 if (answered >= 0 && answered >= pendingValue) {
                     Log.d(TAG, "다른 기기가 $pType $answered 단계에 답함 → 이 기기 미응답 팝업($pendingValue) 닫기")
