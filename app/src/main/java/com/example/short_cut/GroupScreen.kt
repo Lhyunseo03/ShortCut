@@ -367,7 +367,9 @@ private fun GroupCreateScreen(onBack: () -> Unit, onCreated: (String) -> Unit) {
     var busy by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
 
-    val canSubmit = !busy && name.isNotBlank()
+    // 서버 규칙(스펙 §2): hourlyLimit 은 dailyLimit 보다 클 수 없음 — 서버 400 대신 앱에서 먼저 막는다
+    val hourlyTooHigh = hourly > daily
+    val canSubmit = !busy && name.isNotBlank() && !hourlyTooHigh
 
     Column(modifier = Modifier.fillMaxSize()) {
         GroupTopBar(title = "그룹 만들기", onBack = onBack)
@@ -404,6 +406,9 @@ private fun GroupCreateScreen(onBack: () -> Unit, onCreated: (String) -> Unit) {
             SectionTitle("초기 한도")
             LimitRow(label = "Daily Limit", value = daily, step = 100, minValue = 100, onChange = { daily = it })
             LimitRow(label = "Hourly Limit", value = hourly, step = 10, minValue = 10, onChange = { hourly = it })
+            if (hourlyTooHigh) {
+                Text("Hourly Limit 은 Daily Limit 보다 클 수 없어요", fontSize = 13.sp, color = OverRed)
+            }
 
             HorizontalDivider(color = Color(0xFFEEEEEE))
 

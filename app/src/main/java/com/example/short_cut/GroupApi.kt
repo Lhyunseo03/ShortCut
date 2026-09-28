@@ -11,7 +11,7 @@ import org.json.JSONObject
 //                                      → { "groupId": "..." }
 //  GET    /groups/{gid}                → GroupSummary + { "members": [ Member ] }
 //  GET    /groups/{gid}/status         → { "members": [ { userId, todayCount, lastHourCount, lastSeenAt, lastScrollAt } ] }
-//  POST   /groups/{gid}/invites        → { "code": "ABC123", "expiresAt": ms }
+//  POST   /invites  ← { groupId }      → { "code": "ABC123", "expiresAt": ms }   (2단계, 스펙 §5)
 //  GET    /invites/{code}              → GroupSummary + { "code", "expiresAt" }
 //  POST   /groups/join                 ← { code }  → { "groupId": "..." }
 //  DELETE /groups/{gid}/members/me     → { "status": "ok" }
@@ -29,7 +29,7 @@ internal val VOTE_THRESHOLDS = listOf(60, 70, 80, 90, 100)
 
 // 초대 랜딩 페이지 — 5주차에 서버가 /invite/{코드} 로 띄울 예정. 그때 "$SERVER_BASE_URL/invite" 로 바꾸면 됨.
 // 비어 있으면 공유 문구에 링크 없이 코드만 넣는다.
-internal const val INVITE_LANDING_URL = ""
+internal const val INVITE_LANDING_URL = ""   // 2단계 배포 후 "$SERVER_BASE_URL/invite" 로
 
 internal data class GroupSummary(
     val groupId: String,
@@ -158,7 +158,8 @@ internal suspend fun fetchGroupStatus(groupId: String): List<GroupMember>? {
 
 // 성공 시 6자리 초대 코드.
 internal suspend fun createInvite(groupId: String): GroupResult<String> {
-    val res = authedRequest("POST", "/groups/$groupId/invites")
+    // 스펙 §5: POST /invites (그룹은 body 의 groupId 로). 2단계 배포 전까지는 404.
+    val res = authedRequest("POST", "/invites", JSONObject().put("groupId", groupId))
     val code = res.json?.optString("code").orEmpty()
     return if (res.ok && code.isNotEmpty()) GroupResult(code, null) else fail(res, "초대 코드를 만들지 못했어요")
 }
