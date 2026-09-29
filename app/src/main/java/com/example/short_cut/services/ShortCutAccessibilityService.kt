@@ -112,6 +112,9 @@ class ShortCutAccessibilityService : AccessibilityService() {
     // 이 기기가 마지막으로 POST /milestone 한 값 — /sync 로 받은 서버 milestone 이 이 값보다 크면 다른 기기가 더 나간 것
     private var uploadedHourlyMilestone = -1
     private var uploadedDailyMilestone = -1
+    // 다른 기기가 최근 1시간 안에 띄운 시간당 단계 — 슬라이딩 윈도우로 카운트가 잠깐 내려갔다 올라와도
+    // 이 단계 아래로 milestone 을 낮추지 않는다 (같은 팝업이 두 기기에 한 번씩 뜨는 것 방지)
+    private var remoteHourlyFloor = -1
     // 동시에 두 /sync 가 겹쳐 서로 값을 엎지 않게 — 한 번에 하나만
     private val isSyncing = java.util.concurrent.atomic.AtomicBoolean(false)
     // 쇼츠 보는 동안 1분마다 /sync — 쇼츠에서 나가면 다음 주기에 스스로 멈춘다
@@ -610,10 +613,13 @@ class ShortCutAccessibilityService : AccessibilityService() {
         if (hourlyMilestone >= 0) {
             if (hourlyNow < hourlyLimit) {
                 hourlyMilestone = -1
+                remoteHourlyFloor = -1
                 savePersistedState()
                 postMilestone(answered = false)   // 슬라이딩 윈도우로 한도 아래로 내려감 → 서버도 -1 로 (스펙: 리셋 허용)
             } else if (hourlyNow < hourlyMilestone) {
-                val stepLevel = hourlyLimit + ((hourlyNow - hourlyLimit) / HOURLY_STEP) * HOURLY_STEP
+                // 다른 기기가 이미 띄운 단계(remoteHourlyFloor) 아래로는 내리지 않는다 — 기기를 옮기는 사이 창이 조금 흘러
+                // 카운트가 40→35 로 내려갔다 40 이 되면, 같은 40 팝업이 이 기기에서 또 뜨던 문제
+                val stepLevel = maxOf(hourlyLimit + ((hourlyNow - hourlyLimit) / HOURLY_STEP) * HOURLY_STEP, remoteHourlyFloor)
                 if (stepLevel < hourlyMilestone) {
                     hourlyMilestone = stepLevel
                     savePersistedState()
@@ -672,6 +678,18 @@ class ShortCutAccessibilityService : AccessibilityService() {
             val res = com.example.short_cut.authedRequest("POST", "/block", body)
             Log.d(TAG, "POST /block until=$blockUntil → ${res.code}")
         }
+    }
+
+    // 서버가 준 milestone 값을 받아도 되는지.
+    //  - 서버가 기록 시각(at)을 주면: 시간당은 최근 1시간 안, 일간은 오늘 것만 받는다 (정확).
+    //  - 시각이 없으면: 현재 카운트로 도달 가능한 단계까지만 받는다 (그보다 높으면 낡은 값으로 본다).
+    //    한계: 기기를 옮기는 사이 창이 흘러 40→35 가 되면 방금 띄운 40 도 버려져 같은 팝업이 한 번 더 뜰 수 있다.
+    //    반대로 느슨하게 하면(2단계 위까지 허용) 한 시간 전의 60 을 받아 50 팝업이 아예 안 뜨는데(실기기 재현),
+    //    "안 뜨는 것" 보다 "한 번 더 뜨는 것" 이 낫다. 정확한 판단은 서버가 시각(At)을 주면 된다.
+    private fun acceptRemoteMilestone(value: Int, at: Long, stageNow: Int, limit: Int, step: Int, freshMs: Long, now: Long): Int {
+        if (value < 0) return -1
+        if (at > 0) return if (now - at <= freshMs) value else -1
+        return if (value <= stageNow) value else -1
     }
 
     // 카운트가 지금 도달해 있는 단계 (limit, limit+step, ...). 한도 미만이면 -1.
@@ -1856,10 +1874,17 @@ class ShortCutAccessibilityService : AccessibilityService() {
                 //   시간당 창은 기기마다 다르게 흐른다. 아침에 B 가 60 단계를 띄운 값이 서버에 남아 있는데
                 //   오후에 A 의 카운트가 25 라면, 60 을 받으면 A 는 "다음 팝업 70" 이 돼 30·40 에서 안 뜨고,
                 //   1분마다 다시 60 으로 올라가 끝까지 안 뜬다 (실기기에서 재현됨). 낡은 값은 버리고 현재 단계까지만 받는다.
-                val h = m.optInt("hourly", -1).let { if (it > hourlyStageNow) -1 else it }
-                val d = m.optInt("daily", -1).let { if (it > dailyStageNow) -1 else it }
+                val at = json.optJSONObject("lastShownMilestoneAt")   // 서버가 주면 사용 (요청해 둠), 없으면 null
+                val h = acceptRemoteMilestone(m.optInt("hourly", -1), at?.optLong("hourly", 0L) ?: 0L,
+                    hourlyStageNow, hourlyLimit, HOURLY_STEP, 60 * 60 * 1000L, now)
+                val d = acceptRemoteMilestone(m.optInt("daily", -1), at?.optLong("daily", 0L) ?: 0L,
+                    dailyStageNow, dailyLimit, DAILY_STEP, now - todayStartMs, now)
+                Log.d(TAG, "/sync milestone — 서버 shown hourly=${m.optInt("hourly", -1)} daily=${m.optInt("daily", -1)}, " +
+                    "현재 단계 hourly=$hourlyStageNow daily=$dailyStageNow → 적용 hourly=$h daily=$d (로컬 $hourlyMilestone/$dailyMilestone)")
                 if (h > hourlyMilestone) hourlyMilestone = h
                 if (d > dailyMilestone) dailyMilestone = d
+                // 다른 기기가 띄운 단계(내가 올린 값보다 큼)면 그 아래로는 재경고하지 않는다
+                remoteHourlyFloor = if (h > uploadedHourlyMilestone) h else -1
                 // 이 기기에 미응답 팝업이 있는데 다른 기기가 그보다 더 나간 단계까지 갔으면(내가 올린 값보다 큼)
                 // 이 팝업은 이미 지나간 단계 → 닫는다. 같은 값이면 누가 먼저 띄웠는지 알 수 없어 그대로 둔다.
                 val pType = pendingPopupType
@@ -1880,7 +1905,11 @@ class ShortCutAccessibilityService : AccessibilityService() {
                 val pType = pendingPopupType ?: return@let
                 // 같은 이유로 낡은 값(현재 도달 가능 단계보다 높음)은 무시 — 아침에 답한 60 이 오후의 20 팝업을 닫으면 안 됨
                 val stageNow = if (pType == "hourly") hourlyStageNow else dailyStageNow
-                val answered = m.optInt(pType, -1).let { if (it > stageNow) -1 else it }
+                val at = json.optJSONObject("lastAnsweredMilestoneAt")?.optLong(pType, 0L) ?: 0L
+                val answered = if (pType == "hourly")
+                    acceptRemoteMilestone(m.optInt(pType, -1), at, stageNow, hourlyLimit, HOURLY_STEP, 60 * 60 * 1000L, now)
+                else
+                    acceptRemoteMilestone(m.optInt(pType, -1), at, stageNow, dailyLimit, DAILY_STEP, now - todayStartMs, now)
                 val pendingValue = pendingPopupOverage + (if (pType == "hourly") hourlyLimit else dailyLimit)
                 if (answered >= 0 && answered >= pendingValue) {
                     Log.d(TAG, "다른 기기가 $pType $answered 단계에 답함 → 이 기기 미응답 팝업($pendingValue) 닫기")
