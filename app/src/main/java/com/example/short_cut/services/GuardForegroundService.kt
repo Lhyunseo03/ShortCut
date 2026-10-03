@@ -1,5 +1,6 @@
 package com.example.short_cut.services
 
+import kotlinx.coroutines.launch
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -27,6 +28,7 @@ class GuardForegroundService : Service() {
         private const val CHANNEL_ID = "shortcut_guard"
         private const val NOTIF_ID = 9101
         private const val POLL_INTERVAL_MS = 2000L
+        private const val HEARTBEAT_INTERVAL_MS = 10 * 60 * 1000L   // API 스펙 §5 — 기기별 10분마다
         private val TARGET_PACKAGES = setOf(
             "com.google.android.youtube",
             "com.instagram.android",
@@ -46,6 +48,24 @@ class GuardForegroundService : Service() {
         override fun run() {
             try { pollAndGuard() } catch (e: Exception) { Log.e(TAG, "poll 실패 — ${e.message}") }
             handler.postDelayed(this, POLL_INTERVAL_MS)
+        }
+    }
+
+    // 생존 신호 — 서버 devices/{id}.lastSeenAt 과 permissionsOk 갱신 (설정 > Devices · 그룹 구성원 상세에 표시)
+    private val heartbeatRunnable = object : Runnable {
+        override fun run() {
+            val app = applicationContext
+            com.example.short_cut.appScope.launch {
+                val ok = com.example.short_cut.isAccessibilityServiceEnabled(app) &&
+                    com.example.short_cut.hasUsageStatsPermission(app) &&
+                    com.example.short_cut.hasOverlayPermission(app)
+                val body = org.json.JSONObject()
+                    .put("deviceId", com.example.short_cut.DeviceId.get(app))
+                    .put("permissionsOk", ok)
+                val res = com.example.short_cut.authedRequest("POST", "/heartbeat", body)   // 미로그인이면 요청 없이 code 0
+                Log.d(TAG, "heartbeat permissionsOk=$ok → ${res.code}")
+            }
+            handler.postDelayed(this, HEARTBEAT_INTERVAL_MS)
         }
     }
 
@@ -70,6 +90,7 @@ class GuardForegroundService : Service() {
             return
         }
         handler.post(pollRunnable)
+        handler.post(heartbeatRunnable)
         Log.d(TAG, "Guard 서비스 시작")
     }
 

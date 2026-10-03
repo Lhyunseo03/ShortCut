@@ -111,8 +111,14 @@ private fun DeviceCard(device: DeviceItem) {
             // 마지막 접속 — 로그아웃한 기기는 로그아웃 시각을 대신 보여 준다
             val loggedOutAt = device.loggedOutAt
             Text(
-                text = if (loggedOutAt != null) "로그아웃 ${formatDateTime(loggedOutAt)}"
-                       else "마지막 접속 ${formatAgo(device.lastSeenAt)}",
+                // 서버의 lastSeenAt 은 앱 시작 · 10분 주기 heartbeat 때만 갱신돼 최대 10분 늦다.
+                // 이 기기는 지금 보고 있으니 "지금 사용 중", 다른 기기는 11분 안이면 "접속 중" 으로 표시.
+                text = when {
+                    loggedOutAt != null -> "로그아웃 ${formatDateTime(loggedOutAt)}"
+                    device.isThisDevice -> "지금 사용 중"
+                    device.lastSeenAt != null && System.currentTimeMillis() - device.lastSeenAt < 11 * 60_000L -> "접속 중"
+                    else -> "마지막 접속 ${formatAgo(device.lastSeenAt)}"
+                },
                 fontSize = 14.sp,
                 color = Color(0xFF888888)
             )

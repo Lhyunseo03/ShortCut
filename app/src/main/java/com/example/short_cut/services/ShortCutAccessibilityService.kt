@@ -115,6 +115,9 @@ class ShortCutAccessibilityService : AccessibilityService() {
     // 다른 기기가 최근 1시간 안에 띄운 시간당 단계 — 슬라이딩 윈도우로 카운트가 잠깐 내려갔다 올라와도
     // 이 단계 아래로 milestone 을 낮추지 않는다 (같은 팝업이 두 기기에 한 번씩 뜨는 것 방지)
     private var remoteHourlyFloor = -1
+    // 이 기기에서 사용자가 마지막으로 답한(Stop/계속보기) 단계 — 방금 답한 팝업이 /sync 응답 지연으로 다시 뜨지 않게
+    private var localAnsweredHourly = -1
+    private var localAnsweredDaily = -1
     // 동시에 두 /sync 가 겹쳐 서로 값을 엎지 않게 — 한 번에 하나만
     private val isSyncing = java.util.concurrent.atomic.AtomicBoolean(false)
     // 쇼츠 보는 동안 1분마다 /sync — 쇼츠에서 나가면 다음 주기에 스스로 멈춘다
@@ -432,6 +435,7 @@ class ShortCutAccessibilityService : AccessibilityService() {
         todayStartMs = startToday
         dailyCount = scrollCounts.dailyCount(startToday)
         dailyMilestone = -1
+        localAnsweredDaily = -1
 
         // pending limit 변경이 있었다면 새 날짜에 맞춰 적용
         // [변경됨] promoteExpiredPending → promoteAndSyncLimit:
@@ -614,6 +618,7 @@ class ShortCutAccessibilityService : AccessibilityService() {
             if (hourlyNow < hourlyLimit) {
                 hourlyMilestone = -1
                 remoteHourlyFloor = -1
+                localAnsweredHourly = -1
                 savePersistedState()
                 postMilestone(answered = false)   // 슬라이딩 윈도우로 한도 아래로 내려감 → 서버도 -1 로 (스펙: 리셋 허용)
             } else if (hourlyNow < hourlyMilestone) {
@@ -658,6 +663,7 @@ class ShortCutAccessibilityService : AccessibilityService() {
     private fun postMilestone(answered: Boolean) {
         val h = hourlyMilestone
         val d = dailyMilestone
+        if (answered) { localAnsweredHourly = h; localAnsweredDaily = d }
         uploadedHourlyMilestone = h
         uploadedDailyMilestone = d
         serviceScope.launch {
@@ -1915,6 +1921,34 @@ class ShortCutAccessibilityService : AccessibilityService() {
                     Log.d(TAG, "다른 기기가 $pType $answered 단계에 답함 → 이 기기 미응답 팝업($pendingValue) 닫기")
                     clearPendingPopup()
                     withContext(Dispatchers.Main) { dismissAllPopups() }
+                }
+            }
+            // [팝업 따라가기] 다른 기기에 떠 있는데 아직 아무도 답하지 않은 팝업(shown > answered)은 이 기기에서도 띄운다.
+            //   안 그러면 팝업을 그대로 둔 채 기기만 바꿔서 다음 단계까지 계속 볼 수 있다 (통합 테스트 6번에서 확인).
+            //   어느 한쪽에서 답하면 answered 가 올라가 다른 쪽 팝업은 위 규칙으로 닫힌다. violation 은 답한 기기만 보낸다.
+            if (pendingPopupType == null) {
+                val shown = json.optJSONObject("lastShownMilestone")
+                val ans = json.optJSONObject("lastAnsweredMilestone")
+                val atS = json.optJSONObject("lastShownMilestoneAt")
+                val sh = acceptRemoteMilestone(shown?.optInt("hourly", -1) ?: -1, atS?.optLong("hourly", 0L) ?: 0L,
+                    hourlyStageNow, hourlyLimit, HOURLY_STEP, 60 * 60 * 1000L, now)
+                val sd = acceptRemoteMilestone(shown?.optInt("daily", -1) ?: -1, atS?.optLong("daily", 0L) ?: 0L,
+                    dailyStageNow, dailyLimit, DAILY_STEP, now - todayStartMs, now)
+                val ah = ans?.optInt("hourly", -1) ?: -1
+                val ad = ans?.optInt("daily", -1) ?: -1
+                val follow: Pair<String, Int>? = when {
+                    sh >= hourlyLimit && sh > ah && sh > localAnsweredHourly -> "hourly" to (sh - hourlyLimit)
+                    sd >= dailyLimit && sd > ad && sd > localAnsweredDaily -> "daily" to (sd - dailyLimit)
+                    else -> null
+                }
+                if (follow != null) {
+                    val (fType, fOverage) = follow
+                    Log.d(TAG, "다른 기기의 미응답 $fType 팝업(초과 $fOverage) → 이 기기에도 표시")
+                    setPendingPopup(fType, fOverage)
+                    // 쇼츠를 보는 중이면 바로, 아니면 다음에 쇼츠에 들어올 때 복원된다
+                    if (detectors.any { it.inShortsMode } && now >= stopUntilMs) {
+                        withContext(Dispatchers.Main) { if (popupViews.isEmpty()) showLimitPopup(fType, fOverage) }
+                    }
                 }
             }
             savePersistedState()
