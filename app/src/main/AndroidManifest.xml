@@ -45,6 +45,13 @@
 
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+            <!-- 초대 링크 딥링크: shortcut://join?code=ABC123 — 초대 랜딩 페이지의 "앱에서 열기" 가 이 주소를 연다 -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="shortcut" android:host="join" />
+            </intent-filter>
         </activity>
 
         <service

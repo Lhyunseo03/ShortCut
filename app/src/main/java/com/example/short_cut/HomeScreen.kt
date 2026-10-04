@@ -102,6 +102,9 @@ enum class HomeTab(val label: String) {
 @Composable
 fun HomeScreen(onAuthChanged: () -> Unit = {}) {
     var selectedTab by remember { mutableStateOf(HomeTab.HOME) }
+    // 초대 링크로 앱이 열렸으면 그룹 탭으로 이동 (참여 창은 그룹 목록 화면이 연다)
+    val pendingInvite = PendingInvite.code.value
+    LaunchedEffect(pendingInvite) { if (pendingInvite != null) selectedTab = HomeTab.GROUP }
     // AI 분석 → "적용하기" 로 넘어온 추천 한도 (daily, hourly). 설정 탭이 받아 한도 화면에 자동 입력.
     var limitPrefill by remember { mutableStateOf<Pair<Int, Int>?>(null) }
 

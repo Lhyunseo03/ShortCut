@@ -120,6 +120,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         openWeeklyReport.value = intent?.getBooleanExtra(EXTRA_OPEN_WEEKLY_REPORT, false) == true
+        handleInviteLink(intent)
         // 주간 리포트 알림용 권한 (Android 13+). 이미 있거나 하위 버전이면 그냥 패스.
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
             androidx.core.content.ContextCompat.checkSelfPermission(
@@ -141,6 +142,15 @@ class MainActivity : ComponentActivity() {
         setIntent(intent)
         if (intent.getBooleanExtra(EXTRA_OPEN_WEEKLY_REPORT, false)) {
             openWeeklyReport.value = true
+        }
+        handleInviteLink(intent)
+    }
+
+    // 초대 딥링크 shortcut://join?code=ABC123 → 코드를 보관해 두면 홈 화면이 그룹 탭의 참여 창을 연다
+    private fun handleInviteLink(intent: Intent?) {
+        val data = intent?.data ?: return
+        if (intent.action == Intent.ACTION_VIEW && data.scheme == "shortcut" && data.host == "join") {
+            PendingInvite.offer(data.getQueryParameter("code"))
         }
     }
 }

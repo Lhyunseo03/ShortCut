@@ -74,6 +74,18 @@ private val OkGreen = Color(0xFF2E7D32)
 private val OkGreenBg = Color(0xFFE8F5E9)
 private val CardBg = Color(0xFFF7F7F7)
 
+// 초대 딥링크(shortcut://join?code=...)로 받은 코드. MainActivity 가 넣고, 그룹 목록 화면이 꺼내 "코드로 참여" 창을 연다.
+// 로그인 · 권한 설정을 거치는 동안에도 남아 있도록 화면 상태가 아니라 프로세스 단위로 둔다.
+internal object PendingInvite {
+    val code = mutableStateOf<String?>(null)
+
+    // 영문/숫자 6자리만 받는다 (하이픈 · 소문자가 섞여 와도 정리)
+    fun offer(raw: String?) {
+        val c = raw.orEmpty().uppercase().filter { it.isLetterOrDigit() }.take(6)
+        if (c.length == 6) code.value = c
+    }
+}
+
 private sealed interface GroupNav {
     data object List : GroupNav
     data object Create : GroupNav
@@ -83,6 +95,9 @@ private sealed interface GroupNav {
 @Composable
 internal fun GroupTabContent() {
     var nav by remember { mutableStateOf<GroupNav>(GroupNav.List) }
+    // 초대 링크로 들어왔으면 목록 화면으로 (거기서 참여 창이 열린다)
+    val pendingInvite = PendingInvite.code.value
+    LaunchedEffect(pendingInvite) { if (pendingInvite != null) nav = GroupNav.List }
 
     // 하위 화면에서 시스템 뒤로가기 → 목록으로
     BackHandler(enabled = nav != GroupNav.List) { nav = GroupNav.List }
@@ -153,6 +168,16 @@ private fun GroupListScreen(onCreate: () -> Unit, onOpen: (String) -> Unit) {
     var localToday by remember { mutableIntStateOf(0) }
     var reloadKey by remember { mutableIntStateOf(0) }
     var showJoin by remember { mutableStateOf(false) }
+    // 초대 링크로 받은 코드 — 있으면 참여 창을 그 코드로 바로 연다
+    var joinInitialCode by remember { mutableStateOf("") }
+    val pendingInviteCode = PendingInvite.code.value
+    LaunchedEffect(pendingInviteCode) {
+        if (pendingInviteCode != null) {
+            joinInitialCode = pendingInviteCode
+            showJoin = true
+            PendingInvite.code.value = null   // 한 번만 소비
+        }
+    }
 
     LaunchedEffect(reloadKey) {
         loading = true
@@ -234,7 +259,8 @@ private fun GroupListScreen(onCreate: () -> Unit, onOpen: (String) -> Unit) {
 
     if (showJoin) {
         JoinByCodeDialog(
-            onDismiss = { showJoin = false },
+            initialCode = joinInitialCode,
+            onDismiss = { showJoin = false; joinInitialCode = "" },
             onJoined = { gid ->
                 showJoin = false
                 onOpen(gid)
@@ -288,13 +314,24 @@ private fun GroupCard(group: GroupSummary, myToday: Int, onClick: () -> Unit) {
 
 // 코드 입력 → GET /invites/{code} 로 그룹 정보 확인 → 참여(POST /groups/join)
 @Composable
-private fun JoinByCodeDialog(onDismiss: () -> Unit, onJoined: (String) -> Unit) {
+private fun JoinByCodeDialog(initialCode: String = "", onDismiss: () -> Unit, onJoined: (String) -> Unit) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    var code by remember { mutableStateOf("") }
+    var code by remember { mutableStateOf(initialCode) }
     var invite by remember { mutableStateOf<InviteInfo?>(null) }
     var busy by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
+
+    // 초대 링크로 들어온 경우 — 코드가 이미 있으니 그룹 미리보기까지 바로 불러온다
+    LaunchedEffect(initialCode) {
+        if (initialCode.length == 6) {
+            busy = true
+            val res = fetchInvite(initialCode)
+            invite = res.value
+            error = res.error
+            busy = false
+        }
+    }
 
     AlertDialog(
         onDismissRequest = { if (!busy) onDismiss() },
