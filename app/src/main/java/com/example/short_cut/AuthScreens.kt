@@ -132,6 +132,8 @@ fun LoginScreen(onLoginSuccess: () -> Unit = {}) {
                     // ShortCutAccessibilityService에서 이 값을 읽어 서버 요청에 사용
                     val prefs = context.getSharedPreferences("short_cut_prefs", android.content.Context.MODE_PRIVATE)
                     prefs.edit().putString("userId", userId).apply()
+                    // 접근성 서비스가 이미 떠 있으면 이전 계정의 카운트·팝업 단계를 바로 비우게 알린다
+                    com.example.short_cut.services.ShortCutAccessibilityService.instance?.notifyUserChanged()
 
                     // 서버에 저장된 hourly/daily limit 동기화 — 다른 기기에서 변경한 값이 있다면 가져옴
                     // appScope(앱 수명) 에서 실행 — onLoginSuccess() 로 화면이 곧바로 전환돼도

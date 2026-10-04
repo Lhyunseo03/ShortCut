@@ -191,7 +191,7 @@ internal fun SettingsRootScreen(
             )
             Button(
                 onClick = {
-                    prefs.edit().putString("nickname", nicknameDraft.trim()).apply()
+                    saveNicknameLocally(context, nicknameDraft.trim())   // 로컬 저장 + 서버 업로드 대기 표시
                     savedNickname = nicknameDraft.trim()
                     Toast.makeText(context, "닉네임이 저장됐어요", Toast.LENGTH_SHORT).show()
                     // 서버에도 반영 (그룹 순위표에서 다른 구성원에게 보이는 이름)
@@ -210,6 +210,13 @@ internal fun SettingsRootScreen(
             val res = authedRequest("GET", "/sync?deviceId=${DeviceId.get(context)}")
             res.json?.let { applyServerAppMode(context, it) }
             appMode = prefs.getString("appMode", "normal") ?: "normal"
+            // 다른 기기에서 바꾼 닉네임 반영 — 사용자가 지금 입력을 고치는 중이 아닐 때만 입력칸을 바꾼다
+            val changed = res.json?.let { applyServerNickname(context, it) } == true
+            if (changed && nicknameDraft == savedNickname) {
+                val n = prefs.getString("nickname", null) ?: savedNickname
+                nicknameDraft = n
+                savedNickname = n
+            }
         }
         SectionTitle("모드")
         Row(
@@ -355,21 +362,22 @@ internal fun SettingsAccountScreen(onBack: () -> Unit, onAuthChanged: () -> Unit
                 TextButton(onClick = {
                     // 서버에 로그아웃 알림 (스펙 §5) — 토큰이 살아 있는 signOut 전에. 이 기기가 FCM 대상 · deviceCount 에서 빠진다.
                     // 안 하면 다른 계정으로 로그인해도 이전 계정의 푸시가 이 기기로 계속 온다.
+                    // [순서 중요] ① 서버 알림(토큰 필요) → ② 로컬 정리 → ③ signOut.
+                    //   전에는 ①을 띄워 놓고 바로 signOut 해서 토큰이 먼저 사라져 /logout 이 안 나갈 수 있었고,
+                    //   "오늘 카운트" 공개값을 안 지워서 다음 계정의 홈·그룹 화면에 이전 계정 숫자가 보였다.
                     val deviceId = DeviceId.get(context)
-                    appScope.launch {
-                        authedRequest("POST", "/logout", org.json.JSONObject().put("deviceId", deviceId))
-                        // 계정별 로컬 데이터 정리 — 다음 계정에 섞이지 않게
-                        db.groupLimitDao().deleteAll()
-                        com.example.short_cut.db.ScrollCountRepository.get(context).deleteAll()
-                    }
-                    auth.signOut()
-                    prefs.edit()
-                        .remove("userId")
-                        .remove("nickname")      // 닉네임은 계정별 — 남기면 다음 계정의 닉네임으로 서버에 올라감
-                        .remove(PK_DEVICE_COUNT)
-                        .apply()
                     showLogoutConfirm = false
-                    onAuthChanged()
+                    appScope.launch {
+                        // 서버가 잠들어 있어도 로그아웃이 오래 걸리지 않게 최대 5초만 기다린다
+                        kotlinx.coroutines.withTimeoutOrNull(5_000L) {
+                            authedRequest("POST", "/logout", org.json.JSONObject().put("deviceId", deviceId))
+                        }
+                        clearAccountLocalState(context)
+                        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
+                            auth.signOut()
+                            onAuthChanged()
+                        }
+                    }
                 }) { Text("예") }
             },
             confirmButton = {
@@ -403,9 +411,11 @@ internal fun SettingsAccountScreen(onBack: () -> Unit, onAuthChanged: () -> Unit
                             if (ok) {
                                 com.example.short_cut.db.ScrollCountRepository.get(context).deleteAll()
                                 db.groupLimitDao().deleteAll()
+                                HomeTabCache.reset()
                                 // deviceId 는 계정과 무관하게 기기에 유지(API 스펙 §0) — prefs 전체 삭제 후 다시 써 둔다.
                                 val deviceId = DeviceId.get(context)
                                 prefs.edit().clear().putString("deviceId", deviceId).apply()
+                                com.example.short_cut.services.ShortCutAccessibilityService.instance?.notifyUserChanged()
                                 try { auth.signOut() } catch (_: Exception) {}
                                 Toast.makeText(context, "탈퇴 완료", Toast.LENGTH_SHORT).show()
                                 showDeleteConfirm = false

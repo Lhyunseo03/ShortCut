@@ -168,11 +168,16 @@ fun HomeScreen(onAuthChanged: () -> Unit = {}) {
 // 홈 탭 — 오늘의 목표(현재 적용 중인 limit) + 오늘의 스크롤 카운트
 // 카운트가 목표를 초과하면 빨간색으로 강조
 // 홈 탭이 마지막으로 보여 준 값 — 탭을 오갈 때 기본값(100/50, 0회)이 잠깐 보이지 않게 프로세스 안에 기억
-private object HomeTabCache {
+internal object HomeTabCache {
+    @Volatile var userId: String? = null     // 이 값들이 어느 계정의 것인지 — 계정이 바뀌면 버린다
     @Volatile var dailyLimit: Int? = null
     @Volatile var hourlyLimit: Int? = null
     @Volatile var todayCount = 0
     @Volatile var lastHourCount = 0
+
+    fun reset() {
+        userId = null; dailyLimit = null; hourlyLimit = null; todayCount = 0; lastHourCount = 0
+    }
 }
 
 @Composable
@@ -184,6 +189,11 @@ internal fun HomeTabContent() {
             .getString("userId", null)
     }
 
+    // 다른 계정의 값이 남아 있으면 버린다 (로그아웃 후 다른 계정으로 로그인했을 때 이전 계정 숫자가 보이던 문제)
+    if (HomeTabCache.userId != userId) {
+        HomeTabCache.reset()
+        HomeTabCache.userId = userId
+    }
     var todayCount by remember { mutableStateOf(HomeTabCache.todayCount) }
     var lastHourCount by remember { mutableStateOf(HomeTabCache.lastHourCount) }
     // null = 아직 안 읽음 → 숫자 대신 "—" 표시 (기본값 100/50 을 진짜 값처럼 보여 주지 않기 위해)
@@ -234,6 +244,7 @@ internal fun HomeTabContent() {
                 val res = authedRequest("GET", "/sync?deviceId=${DeviceId.get(context)}")
                 res.json?.let { j ->
                     applyServerAppMode(context, j)   // 다른 기기에서 바꾼 모드 반영
+                    applyServerNickname(context, j)  // 다른 기기에서 바꾼 닉네임 반영
                     val dailyTotal = j.optInt("dailyTotal", -1)
                     if (dailyTotal >= 0) todayCount = maxOf(todayCount, dailyTotal)
                     lastHourCount = localHour + j.optInt("otherDevicesLastHour", 0).coerceAtLeast(0)

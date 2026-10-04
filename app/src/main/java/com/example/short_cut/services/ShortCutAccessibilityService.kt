@@ -1888,6 +1888,7 @@ class ShortCutAccessibilityService : AccessibilityService() {
             if (deviceCount >= 1) prefs.edit().putInt(com.example.short_cut.PK_DEVICE_COUNT, deviceCount).apply()
             // 다른 기기에서 바꾼 모드(일반/하드) 반영 — 다음 팝업부터 그 모드로 뜬다
             com.example.short_cut.applyServerAppMode(this, json)
+            com.example.short_cut.applyServerNickname(this, json)
 
             // 다른 기기의 Stop 차단 — 남은 시간만큼 이 기기도 차단 (D6)
             val blockUntil = if (json.isNull("blockUntil")) 0L else json.optLong("blockUntil", 0L)
@@ -2015,6 +2016,14 @@ class ShortCutAccessibilityService : AccessibilityService() {
     private fun stopSyncTimer(reason: String) {
         mainHandler.removeCallbacks(syncTimerRunnable)
         Log.d(TAG, "/sync 타이머 중지 — $reason")
+    }
+
+    // 로그인/로그아웃 직후 앱이 호출 — 다음 스크롤을 기다리지 않고 이전 계정의 상태를 바로 비운다
+    fun notifyUserChanged() {
+        serviceScope.launch {
+            val userId = getSharedPreferences(PREFS, MODE_PRIVATE).getString("userId", "unknown") ?: "unknown"
+            resetIfUserChanged(userId)
+        }
     }
 
     // FCM COUNT_UPDATED 수신 시 ShortCutMessagingService 가 호출 — 서버 합계가 바뀌었으니 다시 받아 적용

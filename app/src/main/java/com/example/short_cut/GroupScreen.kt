@@ -380,9 +380,17 @@ private fun JoinByCodeDialog(initialCode: String = "", onDismiss: () -> Unit, on
                             invite = res.value
                             error = res.error
                         } else {
-                            val res = joinGroup(code, localNickname(context))
-                            val gid = res.value
-                            if (gid != null) onJoined(gid) else error = res.error
+                            val res = joinGroup(code, explicitNickname(context))   // 직접 정한 닉네임만 (없으면 서버가 기존 값/구글 이름 사용)
+                            val joined = res.value
+                            if (joined != null) {
+                                // 이미 멤버면 그 그룹 화면으로 보내되, 새로 가입한 게 아니라는 걸 알려 준다
+                                Toast.makeText(
+                                    context,
+                                    if (joined.alreadyMember) "이미 참여 중인 그룹이에요" else "그룹에 참여했어요",
+                                    Toast.LENGTH_SHORT
+                                ).show()
+                                onJoined(joined.groupId)
+                            } else error = res.error
                         }
                         busy = false
                     }
@@ -488,7 +496,7 @@ private fun GroupCreateScreen(onBack: () -> Unit, onCreated: (String) -> Unit) {
                     busy = true
                     error = null
                     scope.launch {
-                        val res = createGroup(name.trim(), description.trim(), daily, hourly, threshold, localNickname(context))
+                        val res = createGroup(name.trim(), description.trim(), daily, hourly, threshold, explicitNickname(context))
                         val gid = res.value
                         busy = false
                         if (gid != null) {

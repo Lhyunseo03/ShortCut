@@ -176,11 +176,14 @@ internal suspend fun fetchInvite(code: String): GroupResult<InviteInfo> {
     return GroupResult(InviteInfo(code, json.optLongOrNull("expiresAt"), g, full), null)
 }
 
-// 성공 시 가입한 그룹의 groupId.
-internal suspend fun joinGroup(code: String, nickname: String = ""): GroupResult<String> {
+// 가입 결과 — alreadyMember: 서버가 200(이미 멤버)을 준 경우. 새로 가입하면 201.
+internal data class JoinOutcome(val groupId: String, val alreadyMember: Boolean)
+
+internal suspend fun joinGroup(code: String, nickname: String = ""): GroupResult<JoinOutcome> {
     val res = authedRequest("POST", "/groups/join", JSONObject().put("code", code).put("nickname", nickname))
     val gid = res.json?.groupIdOrEmpty().orEmpty()
-    return if (res.ok && gid.isNotEmpty()) GroupResult(gid, null) else fail(res, "그룹에 참여하지 못했어요")
+    return if (res.ok && gid.isNotEmpty()) GroupResult(JoinOutcome(gid, alreadyMember = res.code == 200), null)
+           else fail(res, "그룹에 참여하지 못했어요")
 }
 
 internal suspend fun leaveGroup(groupId: String): GroupResult<Unit> {

@@ -84,6 +84,27 @@ internal suspend fun accountTodayCount(context: Context): Int {
     return maxOf(com.example.short_cut.db.ScrollCountRepository.get(app).dailyCount(dayStart), synced)
 }
 
+// ── 계정별 로컬 상태 정리 (로그아웃 · 계정 탈퇴) ──────────────────────────
+// 다음에 로그인하는 계정에 이전 계정의 카운트 · 기록 · 닉네임이 섞이지 않게 전부 비운다.
+// deviceId 는 기기에 붙은 값이라 남긴다.
+internal suspend fun clearAccountLocalState(context: Context) {
+    val app = context.applicationContext
+    app.getSharedPreferences("short_cut_prefs", Context.MODE_PRIVATE).edit()
+        .remove("userId")
+        .remove("nickname")
+        .remove(PK_NICKNAME_DIRTY)
+        .remove(PK_DEVICE_COUNT)
+        // 접근성 서비스가 공개해 둔 "오늘 카운트" — 홈 탭 · 그룹 화면이 읽는 값이라 꼭 지워야 한다
+        .remove(com.example.short_cut.services.ShortCutAccessibilityService.PK_SYNCED_DAILY_COUNT)
+        .remove(com.example.short_cut.services.ShortCutAccessibilityService.PK_SYNCED_DAILY_DAY)
+        .apply()
+    com.example.short_cut.db.AppDatabase.getDatabase(app).groupLimitDao().deleteAll()
+    com.example.short_cut.db.ScrollCountRepository.get(app).deleteAll()
+    HomeTabCache.reset()
+    // 접근성 서비스가 메모리에 들고 있는 카운트 · 팝업 단계 · 차단도 바로 초기화
+    com.example.short_cut.services.ShortCutAccessibilityService.instance?.notifyUserChanged()
+}
+
 // ── 모드(일반/하드) 동기화 ───────────────────────────────────────────────
 // 계정 단위 설정 — 한 기기에서 바꾸면 다른 기기도 따라간다.
 //   보내기: POST /mode { deviceId, mode: "normal" | "hard" }   → 서버가 users/{uid}.appMode 저장 + 다른 기기에 COUNT_UPDATED
@@ -116,6 +137,36 @@ internal fun applyServerAppMode(context: Context, syncJson: JSONObject): Boolean
     return true
 }
 
+// ── 닉네임 동기화 ────────────────────────────────────────────────────────
+// 닉네임은 계정 단위 값이라 서버(users/{uid}.nickname)가 기준이다.
+//  - 서버로 보내는 건 "이 기기에서 사용자가 방금 바꿨을 때"뿐 (dirty 표시).
+//    전에는 앱을 켤 때마다 이 기기의 값(없으면 구글 이름)을 보내서, 다른 기기에서 바꾼 닉네임을 도로 덮어썼다.
+//  - 서버가 register / sync 응답에 nickname 을 주면 그 값을 로컬에 반영한다 (서버가 아직 안 주면 아무 일도 없음).
+private const val PK_NICKNAME = "nickname"
+private const val PK_NICKNAME_DIRTY = "nicknameDirty"
+
+// 설정에서 닉네임을 저장할 때 호출 — 로컬 저장 + "서버에 올려야 함" 표시
+internal fun saveNicknameLocally(context: Context, nickname: String) {
+    context.applicationContext.getSharedPreferences("short_cut_prefs", Context.MODE_PRIVATE).edit()
+        .putString(PK_NICKNAME, nickname).putBoolean(PK_NICKNAME_DIRTY, true).apply()
+}
+
+// 서버에 보낼 닉네임 — 사용자가 직접 정한 값만. 없으면 빈 문자열(서버는 빈 값을 무시하고 기존 값을 유지한다)
+internal fun explicitNickname(context: Context): String =
+    context.applicationContext.getSharedPreferences("short_cut_prefs", Context.MODE_PRIVATE)
+        .getString(PK_NICKNAME, null)?.takeIf { it.isNotBlank() } ?: ""
+
+// 서버 응답의 nickname 을 로컬에 반영. 바뀌었으면 true. 이 기기에서 바꾼 값이 아직 안 올라갔으면(dirty) 건드리지 않는다.
+internal fun applyServerNickname(context: Context, json: JSONObject): Boolean {
+    val name = json.optString("nickname").takeIf { it.isNotBlank() } ?: return false
+    val prefs = context.applicationContext.getSharedPreferences("short_cut_prefs", Context.MODE_PRIVATE)
+    if (prefs.getBoolean(PK_NICKNAME_DIRTY, false)) return false
+    if (prefs.getString(PK_NICKNAME, null) == name) return false
+    prefs.edit().putString(PK_NICKNAME, name).apply()
+    Log.d("DeviceApi", "서버 닉네임 반영 → $name")
+    return true
+}
+
 // ── 기기 등록 (API 스펙 §1) ──────────────────────────────────────────────
 internal const val PK_DEVICE_COUNT = "deviceCount"   // 이 계정의 로그인 상태 기기 수 — 2 이상이면 1분 배치(D2)
 
@@ -140,14 +191,19 @@ internal suspend fun registerDevice(context: Context): Boolean {
         .put("deviceName", Build.MODEL ?: "Android")
         .put("permissionsOk", permissionsOk)
     if (fcmToken != null) body.put("fcmToken", fcmToken)
-    // 닉네임도 함께 — 서버가 users/{uid}.nickname 으로 저장해 그룹 순위표에 쓰도록 (앱 시작 · 닉네임 저장 시 갱신)
-    localNickname(app).takeIf { it.isNotBlank() }?.let { body.put("nickname", it) }
+    // 닉네임은 이 기기에서 방금 바꿨을 때만 보낸다 (매번 보내면 다른 기기에서 바꾼 값을 덮어씀)
+    val regPrefs = app.getSharedPreferences("short_cut_prefs", Context.MODE_PRIVATE)
+    val nicknameDirty = regPrefs.getBoolean(PK_NICKNAME_DIRTY, false)
+    if (nicknameDirty) explicitNickname(app).takeIf { it.isNotBlank() }?.let { body.put("nickname", it) }
 
     val res = authedRequest("POST", "/devices/register", body)
     if (!res.ok) return false
+    if (nicknameDirty) regPrefs.edit().putBoolean(PK_NICKNAME_DIRTY, false).apply()   // 올라갔음
+    res.json?.let { applyServerNickname(app, it) }   // 서버가 닉네임을 돌려주면 반영
     val count = res.json?.optInt("deviceCount", 1) ?: 1
     app.getSharedPreferences("short_cut_prefs", Context.MODE_PRIVATE)
         .edit().putInt(PK_DEVICE_COUNT, count).apply()
-    Log.d("DeviceApi", "기기 등록 완료 — deviceCount=$count, fcmToken=${fcmToken != null}")
+    Log.d("DeviceApi", "기기 등록 완료 — deviceCount=$count, fcmToken=${fcmToken != null}, " +
+        "닉네임 전송=${if (body.has("nickname")) body.optString("nickname") else "안 보냄"}")
     return true
 }
