@@ -84,6 +84,38 @@ internal suspend fun accountTodayCount(context: Context): Int {
     return maxOf(com.example.short_cut.db.ScrollCountRepository.get(app).dailyCount(dayStart), synced)
 }
 
+// ── 모드(일반/하드) 동기화 ───────────────────────────────────────────────
+// 계정 단위 설정 — 한 기기에서 바꾸면 다른 기기도 따라간다.
+//   보내기: POST /mode { deviceId, mode: "normal" | "hard" }   → 서버가 users/{uid}.appMode 저장 + 다른 기기에 COUNT_UPDATED
+//   받기  : GET /sync 응답의 appMode
+// (서버에 아직 없으면 POST 는 404, /sync 에는 appMode 가 없어 아무 일도 일어나지 않는다 — 기기별 설정으로 동작)
+internal const val PK_APP_MODE = "appMode"
+private const val PK_APP_MODE_CHANGED_AT = "appModeChangedAt"
+
+// 이 기기에서 모드를 바꿨을 때: 로컬 저장 + 서버 업로드
+internal suspend fun setAppMode(context: Context, mode: String) {
+    val app = context.applicationContext
+    app.getSharedPreferences("short_cut_prefs", Context.MODE_PRIVATE).edit()
+        .putString(PK_APP_MODE, mode)
+        .putLong(PK_APP_MODE_CHANGED_AT, System.currentTimeMillis())
+        .apply()
+    val res = authedRequest("POST", "/mode", JSONObject().put("deviceId", DeviceId.get(app)).put("mode", mode))
+    Log.d("DeviceApi", "POST /mode $mode → ${res.code}")
+}
+
+// /sync 응답의 appMode 를 로컬에 반영. 바뀌었으면 true.
+// 방금 이 기기에서 바꾼 직후(15초)에는 무시 — 업로드가 서버에 닿기 전의 옛 값으로 되돌아가지 않게.
+internal fun applyServerAppMode(context: Context, syncJson: JSONObject): Boolean {
+    val mode = syncJson.optString("appMode")
+    if (mode != "normal" && mode != "hard") return false
+    val prefs = context.applicationContext.getSharedPreferences("short_cut_prefs", Context.MODE_PRIVATE)
+    if (System.currentTimeMillis() - prefs.getLong(PK_APP_MODE_CHANGED_AT, 0L) < 15_000L) return false
+    if (prefs.getString(PK_APP_MODE, "normal") == mode) return false
+    prefs.edit().putString(PK_APP_MODE, mode).apply()
+    Log.d("DeviceApi", "다른 기기에서 모드 변경 → $mode 적용")
+    return true
+}
+
 // ── 기기 등록 (API 스펙 §1) ──────────────────────────────────────────────
 internal const val PK_DEVICE_COUNT = "deviceCount"   // 이 계정의 로그인 상태 기기 수 — 2 이상이면 1분 배치(D2)
 

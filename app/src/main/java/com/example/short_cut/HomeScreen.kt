@@ -230,6 +230,7 @@ internal fun HomeTabContent() {
             if (userId != null) {
                 val res = authedRequest("GET", "/sync?deviceId=${DeviceId.get(context)}")
                 res.json?.let { j ->
+                    applyServerAppMode(context, j)   // 다른 기기에서 바꾼 모드 반영
                     val dailyTotal = j.optInt("dailyTotal", -1)
                     if (dailyTotal >= 0) todayCount = maxOf(todayCount, dailyTotal)
                     lastHourCount = localHour + j.optInt("otherDevicesLastHour", 0).coerceAtLeast(0)

@@ -1413,6 +1413,7 @@ class ShortCutAccessibilityService : AccessibilityService() {
     private fun sendViolation(limitType: String, hourlyScrollCount: Int, dailyScrollCount: Int, action: String) {
         val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
         val userId = prefs.getString("userId", "unknown") ?: "unknown"
+        if (userId == "unknown") return   // 미로그인이면 기록을 만들지 않음
         val v = PendingViolation(
             id = java.util.UUID.randomUUID().toString(),
             userId = userId,
@@ -1566,6 +1567,7 @@ class ShortCutAccessibilityService : AccessibilityService() {
     // 과거 통계가 현재 한도로 덮이지 않게 확정 저장(POST /stats/:userId/daily/finalize).
     // 실패는 치명적 X (서버가 재계산 가능) — 토큰 없거나 네트워크 안 되면 그냥 로그만 남기고 종료.
     private suspend fun finalizeStats(userId: String, date: String, hourlyLimitSnap: Int, dailyLimitSnap: Int) {
+        if (userId == "unknown") return   // 미로그인 — 서버가 403 으로 거절하고, 예전엔 unknown 이라는 빈 문서가 생겼음
         try {
             val token = getFirebaseToken() ?: run {
                 Log.e(TAG, "finalize 전송 실패 — 토큰 없음 (date=$date)")
@@ -1623,6 +1625,7 @@ class ShortCutAccessibilityService : AccessibilityService() {
 
     // POST /limits/:userId — 승격된 "현재 적용 한도"를 서버에 반영 (finalizeStats 와 동일 패턴)
     private suspend fun pushLimitToServer(userId: String, hourlyLimitSnap: Int, dailyLimitSnap: Int) {
+        if (userId == "unknown") return   // 미로그인이면 전송하지 않음
         try {
             val token = getFirebaseToken() ?: run {
                 Log.e(TAG, "limit 동기화 실패 — 토큰 없음")
@@ -1861,6 +1864,8 @@ class ShortCutAccessibilityService : AccessibilityService() {
             val dailyStageNow = stageOf(dailyCount, dailyLimit, DAILY_STEP)
             val deviceCount = json.optInt("deviceCount", -1)
             if (deviceCount >= 1) prefs.edit().putInt(com.example.short_cut.PK_DEVICE_COUNT, deviceCount).apply()
+            // 다른 기기에서 바꾼 모드(일반/하드) 반영 — 다음 팝업부터 그 모드로 뜬다
+            com.example.short_cut.applyServerAppMode(this, json)
 
             // 다른 기기의 Stop 차단 — 남은 시간만큼 이 기기도 차단 (D6)
             val blockUntil = if (json.isNull("blockUntil")) 0L else json.optLong("blockUntil", 0L)

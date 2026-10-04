@@ -205,6 +205,12 @@ internal fun SettingsRootScreen(
         }
 
         // ── 모드 선택 ──────────────────────────
+        // 다른 기기에서 바꾼 모드를 설정 화면을 열 때 반영
+        LaunchedEffect(Unit) {
+            val res = authedRequest("GET", "/sync?deviceId=${DeviceId.get(context)}")
+            res.json?.let { applyServerAppMode(context, it) }
+            appMode = prefs.getString("appMode", "normal") ?: "normal"
+        }
         SectionTitle("모드")
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -216,7 +222,7 @@ internal fun SettingsRootScreen(
                 modifier = Modifier.weight(1f),
                 onClick = {
                     appMode = "normal"
-                    prefs.edit().putString("appMode", "normal").apply()
+                    appScope.launch { setAppMode(context, "normal") }   // 로컬 저장 + 다른 기기에도 반영
                 }
             )
             ModeChip(
@@ -225,7 +231,7 @@ internal fun SettingsRootScreen(
                 modifier = Modifier.weight(1f),
                 onClick = {
                     appMode = "hard"
-                    prefs.edit().putString("appMode", "hard").apply()
+                    appScope.launch { setAppMode(context, "hard") }   // 로컬 저장 + 다른 기기에도 반영
                     Toast.makeText(context, "하드 모드 — Hourly 초과 시 까다로운 팝업이 뜹니다", Toast.LENGTH_SHORT).show()
                 }
             )
@@ -344,7 +350,8 @@ internal fun SettingsAccountScreen(onBack: () -> Unit, onAuthChanged: () -> Unit
             onDismissRequest = { showLogoutConfirm = false },
             title = { Text("로그아웃") },
             text = { Text("로그아웃 하시겠습니까?") },
-            confirmButton = {
+            // 버튼 순서: 예(왼쪽) / 아니요(오른쪽) — AlertDialog 는 dismissButton 을 왼쪽에 그리므로 긍정 버튼을 그 자리에 둔다
+            dismissButton = {
                 TextButton(onClick = {
                     // 서버에 로그아웃 알림 (스펙 §5) — 토큰이 살아 있는 signOut 전에. 이 기기가 FCM 대상 · deviceCount 에서 빠진다.
                     // 안 하면 다른 계정으로 로그인해도 이전 계정의 푸시가 이 기기로 계속 온다.
@@ -365,7 +372,7 @@ internal fun SettingsAccountScreen(onBack: () -> Unit, onAuthChanged: () -> Unit
                     onAuthChanged()
                 }) { Text("예") }
             },
-            dismissButton = {
+            confirmButton = {
                 TextButton(onClick = { showLogoutConfirm = false }) { Text("아니요") }
             }
         )
@@ -379,7 +386,8 @@ internal fun SettingsAccountScreen(onBack: () -> Unit, onAuthChanged: () -> Unit
             onDismissRequest = { if (!isDeleting) showDeleteConfirm = false },
             title = { Text("탈퇴하기") },
             text = { Text("탈퇴하면 계정과 모든 데이터(서버·로컬)가 삭제됩니다.\n정말 진행하시겠습니까?") },
-            confirmButton = {
+            // 버튼 순서: 예(왼쪽) / 아니요(오른쪽) — AlertDialog 는 dismissButton 을 왼쪽에 그리므로 긍정 버튼을 그 자리에 둔다
+            dismissButton = {
                 TextButton(
                     enabled = !isDeleting,
                     onClick = {
@@ -411,7 +419,7 @@ internal fun SettingsAccountScreen(onBack: () -> Unit, onAuthChanged: () -> Unit
                     }
                 ) { Text(if (isDeleting) "처리 중..." else "예") }
             },
-            dismissButton = {
+            confirmButton = {
                 TextButton(
                     enabled = !isDeleting,
                     onClick = { showDeleteConfirm = false }
@@ -613,8 +621,12 @@ internal fun SettingsLimitScreen(
         AlertDialog(
             onDismissRequest = { showConfirm = false },
             title = { Text("Limit 변경") },
-            text = { Text("다음 주 월요일부터 한 주 동안 적용됩니다. 바꾸시겠습니까?") },
-            confirmButton = {
+            text = {
+                Text("Daily ${draftDaily}회, Hourly ${draftHourly}회로 변경하시겠습니까?\n다음 주 월요일부터 한 주 동안 적용됩니다.")
+            },
+            // 버튼 순서: 예(왼쪽) / 아니요(오른쪽). AlertDialog 는 dismissButton 을 왼쪽, confirmButton 을 오른쪽에 그리므로
+            // "예" 를 dismissButton 자리에, "아니요" 를 confirmButton 자리에 둔다.
+            dismissButton = {
                 TextButton(onClick = {
                     if (userId == null) {
                         showConfirm = false
@@ -650,7 +662,7 @@ internal fun SettingsLimitScreen(
                     }
                 }) { Text("예") }
             },
-            dismissButton = {
+            confirmButton = {
                 TextButton(onClick = { showConfirm = false }) { Text("아니요") }
             }
         )
