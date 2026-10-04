@@ -245,6 +245,9 @@ class ShortCutAccessibilityService : AccessibilityService() {
             .remove(PK_PENDING_USERLOGS)      // 이전 계정의 미전송분은 새 계정 토큰으로 올라가면 안 됨
             .remove(PK_PENDING_VIOLATIONS)
             .remove(com.example.short_cut.PK_DEVICE_COUNT)
+            // 이 계정으로 예전에 복원한 적이 있어도 방금 로컬 기록을 지웠으므로 다시 복원할 수 있게 표시를 지운다
+            // (안 지우면 계정을 바꿨다 돌아왔을 때 폰 안 기록이 빈 채로 남는다 — 실기기에서 확인됨)
+            .remove("historyRestored_$userId")
             .apply()
         synchronized(pendingLock) { batchScrollCount = 0; batchFirstScrollMs = 0L; batchAppPkg = "" }
         dailyCount = 0
@@ -262,6 +265,15 @@ class ShortCutAccessibilityService : AccessibilityService() {
             userLimitDao.getLimit(userId)?.let { hourlyLimit = it.hourlyLimit; dailyLimit = it.dailyLimit }
         }
         Log.d(TAG, "userId 변경 감지 → 상태 초기화 ($lastUserId → $userId)")
+        // 새 계정의 최근 7일 기록을 서버에서 다시 채운다 (네트워크라 따로 돌림)
+        if (userId != "unknown") {
+            serviceScope.launch {
+                if (com.example.short_cut.HistoryRestore.restoreIfNeeded(this@ShortCutAccessibilityService, userId)) {
+                    val fromRoom = scrollCounts.dailyCount(todayStartMs)
+                    if (fromRoom > dailyCount) { dailyCount = fromRoom; publishDailyCount() }
+                }
+            }
+        }
     }
 
     // 서비스 시작 시 Room DB / SharedPreferences 에서 상태 복원
