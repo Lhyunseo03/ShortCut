@@ -120,6 +120,10 @@ class ShortCutAccessibilityService : AccessibilityService() {
     private var localAnsweredDaily = -1
     // 동시에 두 /sync 가 겹쳐 서로 값을 엎지 않게 — 한 번에 하나만
     private val isSyncing = java.util.concurrent.atomic.AtomicBoolean(false)
+    // 동기화가 도는 중에 또 요청이 오면 버리지 않고 "끝나면 한 번 더" 로 표시해 둔다.
+    // (그만보기는 /block 과 /milestone 두 요청을 보내고 서버가 각각 푸시를 보낸다. 첫 푸시의 동기화가
+    //  /block 저장 전에 돌고 둘째 푸시가 그 사이 오면, 둘째를 버릴 경우 차단을 1분 뒤에야 받는다)
+    private val syncRequestedAgain = java.util.concurrent.atomic.AtomicBoolean(false)
     // 쇼츠 보는 동안 1분마다 /sync — 쇼츠에서 나가면 다음 주기에 스스로 멈춘다
     private val syncTimerRunnable = object : Runnable {
         override fun run() {
@@ -1756,6 +1760,9 @@ class ShortCutAccessibilityService : AccessibilityService() {
         try {
             val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
             val userId = prefs.getString("userId", "unknown") ?: "unknown"
+            // 미로그인이면 보내지 않는다 — 큐에는 그대로 남아 로그인 후 전송된다
+            // (계정이 바뀐 경우엔 resetIfUserChanged 가 이전 계정의 큐를 비운다)
+            if (userId == "unknown") return
             while (true) {
                 val queue = synchronized(pendingLock) { readPendingLocked() }
                 if (queue.isEmpty()) return
@@ -1832,7 +1839,10 @@ class ShortCutAccessibilityService : AccessibilityService() {
     //  → 4) 지금 쇼츠를 보는 중이면 한도 검사(≥). 여러 단계를 건너뛰어도 팝업은 1번(checkLimits 가 처리).
     // blockUntil / lastShownMilestone 은 서버가 값을 주면 받아서 적용 (3주차까지는 null / -1).
     private suspend fun syncFromServer(reason: String) {
-        if (!isSyncing.compareAndSet(false, true)) return
+        if (!isSyncing.compareAndSet(false, true)) {
+            syncRequestedAgain.set(true)
+            return
+        }
         try {
             val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
             val userId = prefs.getString("userId", "unknown") ?: "unknown"
@@ -1889,6 +1899,17 @@ class ShortCutAccessibilityService : AccessibilityService() {
                     Log.d(TAG, "다른 기기 Stop → 이 기기 미응답 팝업 정리")
                     clearPendingPopup()
                     withContext(Dispatchers.Main) { dismissAllPopups() }
+                }
+                // 지금 쇼츠를 보고 있으면 다음 스크롤을 기다리지 않고 바로 내보낸다 (그만보기를 누른 기기와 같은 동작:
+                // 차단 안내 + 인스타는 BACK 으로 릴스만 닫고, 그 외는 HOME)
+                if (detectors.any { it.inShortsMode }) {
+                    val remainingSec = ((blockUntil - now) / 1000).toInt() + 1
+                    val isInstagram = detectors.any { it.packageName == "com.instagram.android" && it.inShortsMode }
+                    withContext(Dispatchers.Main) {
+                        showBlockPopup(remainingSec)
+                        performGlobalAction(if (isInstagram) GLOBAL_ACTION_BACK else GLOBAL_ACTION_HOME)
+                    }
+                    Log.d(TAG, "다른 기기 Stop → 시청 중인 이 기기도 즉시 내보냄")
                 }
             }
             // 다른 기기에서 이미 보여 준 팝업 단계 — 로컬보다 크면 올려서 같은 팝업 생략 (D6)
@@ -1982,6 +2003,10 @@ class ShortCutAccessibilityService : AccessibilityService() {
             Log.e(TAG, "/sync 처리 실패 ($reason) — ${e.message}")
         } finally {
             isSyncing.set(false)
+            // 도는 중에 들어온 요청이 있었으면 최신 상태로 한 번 더
+            if (syncRequestedAgain.getAndSet(false)) {
+                serviceScope.launch { syncFromServer("재요청") }
+            }
         }
     }
 
