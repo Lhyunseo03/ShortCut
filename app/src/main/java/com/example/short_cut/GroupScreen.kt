@@ -320,16 +320,20 @@ private fun JoinByCodeDialog(onDismiss: () -> Unit, onJoined: (String) -> Unit) 
                     if (info.group.description.isNotBlank()) {
                         Text(info.group.description, fontSize = 14.sp, color = SubInk)
                     }
-                    InfoRow("한도", "일 ${info.group.dailyLimit} / 시 ${info.group.hourlyLimit}")
-                    InfoRow("찬성률", "${info.group.voteThreshold}%")
+                    // 미리보기 응답에 한도·찬성률이 없으면(0) 그 줄은 숨긴다
+                    if (info.group.dailyLimit > 0) {
+                        InfoRow("한도", "일 ${info.group.dailyLimit} / 시 ${info.group.hourlyLimit}")
+                    }
+                    if (info.group.voteThreshold > 0) InfoRow("찬성률", "${info.group.voteThreshold}%")
                     InfoRow("인원", "${info.group.memberCount}/${info.group.maxMembers}")
+                    if (info.isFull) Text("정원이 찼어요", fontSize = 13.sp, color = OverRed)
                 }
                 error?.let { Text(it, fontSize = 13.sp, color = OverRed) }
             }
         },
         confirmButton = {
             TextButton(
-                enabled = !busy && code.length == 6,
+                enabled = !busy && code.length == 6 && invite?.isFull != true,
                 onClick = {
                     busy = true
                     error = null
@@ -596,7 +600,8 @@ private fun GroupDetailScreen(groupId: String, onBack: () -> Unit) {
             onDismissRequest = { if (!leaving) showLeave = false },
             title = { Text("그룹에서 탈퇴할까요?", fontWeight = FontWeight.Bold) },
             text = { Text("탈퇴하면 다시 초대를 받아야 들어올 수 있어요. 마지막 구성원이 탈퇴하면 그룹이 사라져요.") },
-            confirmButton = {
+            // 버튼 순서: 예(왼쪽) / 아니요(오른쪽) — AlertDialog 는 dismissButton 을 왼쪽에 그리므로 긍정 버튼을 그 자리에 둔다
+            dismissButton = {
                 TextButton(
                     enabled = !leaving,
                     onClick = {
@@ -611,7 +616,7 @@ private fun GroupDetailScreen(groupId: String, onBack: () -> Unit) {
                     }
                 ) { Text(if (leaving) "탈퇴 중…" else "탈퇴", color = OverRed) }
             },
-            dismissButton = { TextButton(enabled = !leaving, onClick = { showLeave = false }) { Text("취소") } }
+            confirmButton = { TextButton(enabled = !leaving, onClick = { showLeave = false }) { Text("취소") } }
         )
     }
 }
@@ -679,7 +684,7 @@ private fun agoText(ms: Long?): String {
 
 // 안드로이드 공유 시트로 초대 문구 보내기. 랜딩 주소가 아직 없으면 코드만 넣는다.
 private fun shareInvite(context: Context, groupName: String, code: String) {
-    val link = if (INVITE_LANDING_URL.isNotBlank()) "\n$INVITE_LANDING_URL/join?code=$code" else ""
+    val link = if (INVITE_LANDING_URL.isNotBlank()) "\n$INVITE_LANDING_URL/$code" else ""
     val text = "Short-Cut 그룹 '$groupName'에 초대해요.\n초대 코드: $code (24시간 동안 유효)$link"
     val send = Intent(Intent.ACTION_SEND).apply {
         type = "text/plain"

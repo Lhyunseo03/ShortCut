@@ -29,7 +29,8 @@ internal val VOTE_THRESHOLDS = listOf(60, 70, 80, 90, 100)
 
 // 초대 랜딩 페이지 — 5주차에 서버가 /invite/{코드} 로 띄울 예정. 그때 "$SERVER_BASE_URL/invite" 로 바꾸면 됨.
 // 비어 있으면 공유 문구에 링크 없이 코드만 넣는다.
-internal const val INVITE_LANDING_URL = ""   // 2단계 배포 후 "$SERVER_BASE_URL/invite" 로
+// 초대 랜딩 페이지 — GET /invite/{code} (토큰 없이 열림, 2단계 10/4 배포). 공유 문구에 "$INVITE_LANDING_URL/{code}" 로 넣는다.
+internal const val INVITE_LANDING_URL = "$SERVER_BASE_URL/invite"
 
 internal data class GroupSummary(
     val groupId: String,
@@ -54,7 +55,8 @@ internal data class GroupMember(
 
 internal data class GroupList(val groups: List<GroupSummary>, val maxGroups: Int)
 internal data class GroupDetail(val summary: GroupSummary, val members: List<GroupMember>)
-internal data class InviteInfo(val code: String, val expiresAt: Long?, val group: GroupSummary)
+// isFull: 정원이 찼는지 (GET /invites/{code} 미리보기). 미리보기는 이름·설명·인원만 오고 한도·찬성률은 없을 수 있다.
+internal data class InviteInfo(val code: String, val expiresAt: Long?, val group: GroupSummary, val isFull: Boolean = false)
 
 // 성공이면 value, 실패면 사용자에게 보여 줄 error 문구.
 internal data class GroupResult<T>(val value: T?, val error: String?)
@@ -168,7 +170,10 @@ internal suspend fun fetchInvite(code: String): GroupResult<InviteInfo> {
     val res = authedRequest("GET", "/invites/$code")
     val json = res.json
     if (!res.ok || json == null) return fail(res, "초대 코드를 확인해 주세요")
-    return GroupResult(InviteInfo(code, json.optLongOrNull("expiresAt"), parseSummary(json)), null)
+    val g = parseSummary(json)
+    val full = json.optBoolean("isFull", false) || (json.optJSONObject("group")?.optBoolean("isFull", false) ?: false) ||
+        (g.maxMembers > 0 && g.memberCount >= g.maxMembers)
+    return GroupResult(InviteInfo(code, json.optLongOrNull("expiresAt"), g, full), null)
 }
 
 // 성공 시 가입한 그룹의 groupId.
