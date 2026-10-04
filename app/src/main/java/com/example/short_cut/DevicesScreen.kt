@@ -116,7 +116,10 @@ private fun DeviceCard(device: DeviceItem) {
                 text = when {
                     loggedOutAt != null -> "로그아웃 ${formatDateTime(loggedOutAt)}"
                     device.isThisDevice -> "지금 사용 중"
-                    device.lastSeenAt != null && System.currentTimeMillis() - device.lastSeenAt < 11 * 60_000L -> "접속 중"
+                    // 생존 신호는 앱 화면이 아니라 보호 서비스가 보낸다 — 앱을 닫아도 계속 오므로 "접속 중" 이 아니라
+                    // "보호 중"(= 이 기기에서 Short-Cut 이 동작하고 있음) 으로 표시한다.
+                    device.lastSeenAt != null && System.currentTimeMillis() - device.lastSeenAt < 11 * 60_000L ->
+                        "보호 중 · ${formatAgo(device.lastSeenAt)} 확인"
                     else -> "마지막 접속 ${formatAgo(device.lastSeenAt)}"
                 },
                 fontSize = 14.sp,

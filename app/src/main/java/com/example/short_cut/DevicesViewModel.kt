@@ -95,7 +95,10 @@ internal class DevicesViewModel(app: Application) : AndroidViewModel(app) {
     fun refresh() {
         _state.value = _state.value.copy(loading = true, error = null)
         viewModelScope.launch {
-            val list = source.load(DeviceId.get(getApplication()))
+            val app = getApplication<Application>()
+            val myPermissionsOk = isAccessibilityServiceEnabled(app) && hasUsageStatsPermission(app) && hasOverlayPermission(app)
+            // 이 기기의 권한 상태는 서버 값(최대 10분 늦음) 대신 지금 실제 상태로 표시
+            val list = source.load(DeviceId.get(app))?.map { if (it.isThisDevice) it.copy(permissionsOk = myPermissionsOk) else it }
             _state.value = if (list != null) {
                 // 이 기기를 맨 위에, 나머지는 최근 접속 순
                 DevicesUiState(

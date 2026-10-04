@@ -47,6 +47,7 @@ class GuardForegroundService : Service() {
     private val pollRunnable = object : Runnable {
         override fun run() {
             try { pollAndGuard() } catch (e: Exception) { Log.e(TAG, "poll 실패 — ${e.message}") }
+            try { reportPermissionChangeIfAny() } catch (e: Exception) { Log.e(TAG, "권한 상태 확인 실패 — ${e.message}") }
             handler.postDelayed(this, POLL_INTERVAL_MS)
         }
     }
@@ -54,19 +55,40 @@ class GuardForegroundService : Service() {
     // 생존 신호 — 서버 devices/{id}.lastSeenAt 과 permissionsOk 갱신 (설정 > Devices · 그룹 구성원 상세에 표시)
     private val heartbeatRunnable = object : Runnable {
         override fun run() {
-            val app = applicationContext
-            com.example.short_cut.appScope.launch {
-                val ok = com.example.short_cut.isAccessibilityServiceEnabled(app) &&
-                    com.example.short_cut.hasUsageStatsPermission(app) &&
-                    com.example.short_cut.hasOverlayPermission(app)
-                val body = org.json.JSONObject()
-                    .put("deviceId", com.example.short_cut.DeviceId.get(app))
-                    .put("permissionsOk", ok)
-                val res = com.example.short_cut.authedRequest("POST", "/heartbeat", body)   // 미로그인이면 요청 없이 code 0
-                Log.d(TAG, "heartbeat permissionsOk=$ok → ${res.code}")
-            }
+            sendHeartbeat()
             handler.postDelayed(this, HEARTBEAT_INTERVAL_MS)
         }
+    }
+
+    // 마지막으로 서버에 보낸 권한 상태 (null = 아직 안 보냄)
+    @Volatile private var lastSentPermissionsOk: Boolean? = null
+
+    private fun currentPermissionsOk(): Boolean {
+        val app = applicationContext
+        return com.example.short_cut.isAccessibilityServiceEnabled(app) &&
+            com.example.short_cut.hasUsageStatsPermission(app) &&
+            com.example.short_cut.hasOverlayPermission(app)
+    }
+
+    private fun sendHeartbeat() {
+        val app = applicationContext
+        val ok = currentPermissionsOk()
+        lastSentPermissionsOk = ok
+        com.example.short_cut.appScope.launch {
+            val body = org.json.JSONObject()
+                .put("deviceId", com.example.short_cut.DeviceId.get(app))
+                .put("permissionsOk", ok)
+            val res = com.example.short_cut.authedRequest("POST", "/heartbeat", body)   // 미로그인이면 요청 없이 code 0
+            Log.d(TAG, "heartbeat permissionsOk=$ok → ${res.code}")
+        }
+    }
+
+    // 권한 상태가 바뀌면 10분 주기를 기다리지 않고 바로 알린다.
+    // (서비스가 뜬 직후엔 접근성이 아직 꺼져 있어 false 가 올라가는데, 사용자가 곧 켜도
+    //  다음 heartbeat 까지 Devices 화면에 "권한 꺼짐" 으로 남던 문제)
+    private fun reportPermissionChangeIfAny() {
+        val last = lastSentPermissionsOk ?: return
+        if (currentPermissionsOk() != last) sendHeartbeat()
     }
 
     override fun onCreate() {
