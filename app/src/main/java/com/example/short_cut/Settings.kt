@@ -409,8 +409,7 @@ internal fun SettingsAccountScreen(onBack: () -> Unit, onAuthChanged: () -> Unit
                         scope.launch {
                             val ok = deleteAccountOnServer(user.uid)
                             if (ok) {
-                                com.example.short_cut.db.ScrollCountRepository.get(context).deleteAll()
-                                db.groupLimitDao().deleteAll()
+                                com.example.short_cut.db.AppDatabase.deleteUserDatabase(context, user.uid)   // 이 계정의 로컬 DB 파일 삭제
                                 HomeTabCache.reset()
                                 // deviceId 는 계정과 무관하게 기기에 유지(API 스펙 §0) — prefs 전체 삭제 후 다시 써 둔다.
                                 val deviceId = DeviceId.get(context)

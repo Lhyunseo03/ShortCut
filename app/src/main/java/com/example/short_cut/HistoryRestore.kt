@@ -53,7 +53,7 @@ internal object HistoryRestore {
             return false
         }
 
-        val now = System.currentTimeMillis()
+        val now = TrustedClock.now()
         val rows = ArrayList<ScrollHistory>()
         dayStarts.forEachIndexed { i, dayStart ->
             val stats = byDay[dayKeys[i]] ?: return@forEachIndexed

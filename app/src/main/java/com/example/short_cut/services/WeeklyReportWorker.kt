@@ -47,9 +47,13 @@ class WeeklyReportWorker(
         private const val CHANNEL_ID = "shortcut_weekly_report"
         private const val NOTIF_ID = 9201
 
+        // 홈 화면 편지 아이콘의 빨간 점 — 리포트가 만들어지면 켜고, 리포트 화면을 열면 끈다 (B1)
+        const val PK_UNREAD = "weeklyReportUnread"
+
         // 리포트 화면을 열면 알림(과 앱 아이콘 배지)을 지운다 — 알림을 안 누르고 앱 안에서 연 경우 배지가 남던 문제
         fun cancelNotification(ctx: Context) {
             NotificationManagerCompat.from(ctx).cancel(NOTIF_ID)
+            ctx.getSharedPreferences("short_cut_prefs", Context.MODE_PRIVATE).edit().putBoolean(PK_UNREAD, false).apply()
         }
         private const val SERVER_BASE_URL = "https://short-cut-server-production.up.railway.app"
         private val DATE_FMT get() = SimpleDateFormat("yyyy-MM-dd", Locale.US)
@@ -117,6 +121,7 @@ class WeeklyReportWorker(
         val shortText = "이번 주 ${thisWeekTotal}회 · $trend"
         val bigText = "이번 주 총 ${thisWeekTotal}회 (지난주 ${lastWeekTotal}회)\n$trend\n\n$recLine\n\n탭하면 지난주·이번주 그래프를 볼 수 있어요."
 
+        ctx.getSharedPreferences("short_cut_prefs", Context.MODE_PRIVATE).edit().putBoolean(PK_UNREAD, true).apply()
         notify(ctx, title, shortText, bigText)
     }
 

@@ -75,6 +75,7 @@ class ShortCutAccessibilityService : AccessibilityService() {
     // 스크롤 카운트 읽기/쓰기는 전부 이 저장소를 거친다 (단일 스레드로 직렬화 — 동시 쓰기 경합 방지)
     private lateinit var scrollCounts: com.example.short_cut.db.ScrollCountRepository
     private lateinit var userLimitDao: com.example.short_cut.db.UserLimitDao
+    private lateinit var groupLimitDao: com.example.short_cut.db.GroupLimitDao   // 그룹 한도 캐시 (G2 판정용)
 
     // 코루틴 스코프 — DB 작업은 메인 스레드에서 실행하면 안 되므로 별도 스코프 사용
     // SupervisorJob: 하나의 코루틴이 실패해도 나머지에 영향 없음
@@ -155,6 +156,8 @@ class ShortCutAccessibilityService : AccessibilityService() {
     private var scrimView: View? = null
     // 5분 차단 안내 popup 표시 중 여부 — 쇼츠 이탈(BACK) 로 조기 dismiss 되지 않고 3초 타이머로만 닫히게 구분
     private var blockPopupShowing = false
+    // 로그아웃 안내 팝업을 마지막으로 띄운 시각 — 밀어낸 뒤 바로 다시 들어와도 3초 안에는 또 띄우지 않는다
+    private var loggedOutPopupAtMs = 0L
     private val mainHandler = Handler(Looper.getMainLooper())
 
     // 화면이 꺼지면(전원 버튼 등) 떠 있던 popup 을 내려서 잠금화면 위에 남지 않게 함.
@@ -171,6 +174,14 @@ class ShortCutAccessibilityService : AccessibilityService() {
             // 화면 꺼짐 → 미전송분 즉시 업로드 (다른 기기의 첫 /sync 조회가 바로 정확하도록)
             flushIfUnsent("화면 꺼짐")
             stopSyncTimer("화면 꺼짐")
+        }
+    }
+
+    // 폰 시계가 바뀌었을 때 — 신뢰 시각(TrustedClock)은 서버 기준이라 그대로지만, 로그를 남기고 서버와 한 번 더 맞춘다
+    private val timeChangedReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            Log.w(TAG, "폰 시계 변경 감지 (${intent?.action}) — 신뢰 시각 기준 유지, 폰 시계와 차이 ${com.example.short_cut.TrustedClock.skewMs() / 1000}초")
+            serviceScope.launch { syncFromServer("시계 변경") }
         }
     }
 
@@ -216,7 +227,9 @@ class ShortCutAccessibilityService : AccessibilityService() {
         val db = AppDatabase.getDatabase(this)
         scrollCounts = com.example.short_cut.db.ScrollCountRepository.get(this)
         userLimitDao = db.userLimitDao()
+        groupLimitDao = db.groupLimitDao()
 
+        com.example.short_cut.TrustedClock.init(this)
         serviceScope.launch {
             initializeOnStart()
         }
@@ -225,6 +238,12 @@ class ShortCutAccessibilityService : AccessibilityService() {
 
         // 화면 꺼짐 감지 — ACTION_SCREEN_OFF 는 동적 등록만 가능(매니페스트 불가)
         registerReceiver(screenStateReceiver, IntentFilter(Intent.ACTION_SCREEN_OFF))
+        // 사용자가 설정에서 날짜·시간을 바꾸면 알려 줌 → 서버와 다시 맞춘다 (신뢰 시각은 영향 없지만 로그로 남기고, 아직 못 맞췄으면 지금 맞춤)
+        registerReceiver(timeChangedReceiver, IntentFilter().apply {
+            addAction(Intent.ACTION_TIME_CHANGED)
+            addAction(Intent.ACTION_DATE_CHANGED)
+            addAction(Intent.ACTION_TIMEZONE_CHANGED)
+        })
 
         scheduleBatchTimer()
     }
@@ -236,7 +255,12 @@ class ShortCutAccessibilityService : AccessibilityService() {
         val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
         val lastUserId = prefs.getString("lastUserId", "") ?: ""
         if (userId == lastUserId) return
-        scrollCounts.deleteAll()
+        // 기록은 지우지 않는다 — DB 파일이 계정별이라 이 계정의 파일로 갈아타면 이전 계정 기록은 그 파일에 남고,
+        // 이 계정이 전에 쓰던 기록은 그대로 돌아온다 (계정을 바꿨다 돌아오면 직전 1시간이 빠지던 문제 해결)
+        val db = com.example.short_cut.db.AppDatabase.getDatabase(this)
+        scrollCounts = com.example.short_cut.db.ScrollCountRepository.get(this)
+        userLimitDao = db.userLimitDao()
+        groupLimitDao = db.groupLimitDao()
         prefs.edit()
             .putString("lastUserId", userId)
             .remove(PK_DAILY_MILESTONE)
@@ -282,7 +306,7 @@ class ShortCutAccessibilityService : AccessibilityService() {
 
     // 서비스 시작 시 Room DB / SharedPreferences 에서 상태 복원
     private suspend fun initializeOnStart() {
-        val now = System.currentTimeMillis()
+        val now = com.example.short_cut.TrustedClock.now()
         val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
 
         // 1주일 이상 된 스크롤 기록 삭제
@@ -414,6 +438,7 @@ class ShortCutAccessibilityService : AccessibilityService() {
     // 오늘 자정(00:00:00) 타임스탬프 계산
     private fun getStartOfDayTimestamp(): Long {
         val cal = java.util.Calendar.getInstance()
+        cal.timeInMillis = com.example.short_cut.TrustedClock.now()   // 폰 시계가 아니라 신뢰 시각 기준
         cal.set(java.util.Calendar.HOUR_OF_DAY, 0)
         cal.set(java.util.Calendar.MINUTE, 0)
         cal.set(java.util.Calendar.SECOND, 0)
@@ -452,6 +477,11 @@ class ShortCutAccessibilityService : AccessibilityService() {
         dailyCount = scrollCounts.dailyCount(startToday)
         dailyMilestone = -1
         localAnsweredDaily = -1
+        // 어제 날짜의 그룹 한도 알림 표시 기록 정리 (키가 계속 쌓이지 않게)
+        getSharedPreferences(PREFS, MODE_PRIVATE).let { p ->
+            val stale = p.all.keys.filter { it.startsWith("groupAlert:") }
+            if (stale.isNotEmpty()) p.edit().apply { stale.forEach { remove(it) } }.apply()
+        }
 
         // pending limit 변경이 있었다면 새 날짜에 맞춰 적용
         // [변경됨] promoteExpiredPending → promoteAndSyncLimit:
@@ -466,7 +496,7 @@ class ShortCutAccessibilityService : AccessibilityService() {
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent) {
-        val now = System.currentTimeMillis()
+        val now = com.example.short_cut.TrustedClock.now()
         val pkg = event.packageName?.toString()
 
         // 자기 자신/시스템 이벤트는 무시 — popup 이 띄워지면서 발생하는 이벤트(TYPE_ACCESSIBILITY_OVERLAY 등),
@@ -483,7 +513,8 @@ class ShortCutAccessibilityService : AccessibilityService() {
             if (isTransientEvent) return
             // 지원 안 하는 다른 앱으로 전환된 경우 — popup 만 숨기고 모든 detector 의 모드 리셋
             if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
-                if (popupViews.isNotEmpty()) {
+                // 3초 자동 닫힘 안내 팝업(차단 안내·로그아웃 안내)은 홈으로 밀어낸 직후 런처 창 이벤트로 지워지지 않게 둔다
+                if (popupViews.isNotEmpty() && !blockPopupShowing) {
                     Log.d(TAG, "다른 앱($pkg) 전환 → popup 숨김 (pending 유지)")
                     dismissAllPopups()
                 }
@@ -510,6 +541,21 @@ class ShortCutAccessibilityService : AccessibilityService() {
             }
             if (outcome.entered || outcome.scrolled) {
                 performGlobalAction(GLOBAL_ACTION_BACK)
+            }
+            return
+        }
+
+        // 로그아웃 상태 — 보호는 계속된다 (9주차). 쇼츠/릴스에 들어가거나 넘기면 "로그인하면 볼 수 있어요" 안내 후 밀어낸다.
+        // 카운트·업로드·한도 팝업은 전부 건너뛴다 (미로그인이면 기록을 만들지 않는 기존 규칙 그대로).
+        // 인스타는 릴스 화면만 닫고(BACK) 피드·DM 은 그대로 쓸 수 있게, YT/TikTok 은 HOME.
+        if (detector.inShortsMode && !isLoggedIn()) {
+            if (outcome.entered || outcome.scrolled) {
+                if (now - loggedOutPopupAtMs > 3_000L) {
+                    loggedOutPopupAtMs = now
+                    showLoggedOutPopup()
+                }
+                Log.d(TAG, "로그아웃 상태 쇼츠 진입 (${detector.packageName}) → 밀어냄")
+                performGlobalAction(if (detector.packageName == "com.instagram.android") GLOBAL_ACTION_BACK else GLOBAL_ACTION_HOME)
             }
             return
         }
@@ -559,12 +605,17 @@ class ShortCutAccessibilityService : AccessibilityService() {
     // 동기 경로의 5분 차단(stopUntilMs) 분기를 그대로 적용해야 차단 중 카운트되는 일이 없다.
     // 호출 시점에 detector 가 이미 inShortsMode 여부/지문 변화/debounce 를 모두 통과시킨 상태.
     fun onDeferredScroll(appPkg: String) {
-        val now = System.currentTimeMillis()
+        val now = com.example.short_cut.TrustedClock.now()
         val detector = detectors.firstOrNull { it.packageName == appPkg } ?: return
         if (!detector.inShortsMode) return
         if (now < stopUntilMs) {
             // 차단 기간 중 — 카운트하지 않고 동기 경로처럼 사용자를 밀어냄
             performGlobalAction(GLOBAL_ACTION_BACK)
+            return
+        }
+        if (!isLoggedIn()) {
+            // 로그아웃 상태 — 동기 경로와 같이 카운트하지 않고 밀어냄
+            performGlobalAction(if (appPkg == "com.instagram.android") GLOBAL_ACTION_BACK else GLOBAL_ACTION_HOME)
             return
         }
         countShorts(now, appPkg)
@@ -615,7 +666,65 @@ class ShortCutAccessibilityService : AccessibilityService() {
             Log.d(TAG, "스크롤 카운트 — hourly: $hourlyCount/$hourlyLimit (다른 기기 $otherDevicesLastHour), daily: $dailyCount/$dailyLimit")
 
             // 한도 검사 — 스크롤 직후. (3주차: 서버 /sync 값을 반영한 직후에도 같은 함수를 호출)
-            checkLimits(hourlyCount, dailyCount)
+            val personalPopup = checkLimits(hourlyCount, dailyCount)
+            // 그룹 한도 (G2) — 개인 팝업이 떴으면 이번엔 건너뛴다 (팝업 두 개가 겹치지 않게). 다음 스크롤에서 다시 검사.
+            if (!personalPopup) checkGroupLimits(hourlyCount, dailyCount)
+        }
+    }
+
+    // ── 그룹 한도 확인 팝업 (G2) ─────────────────────────────────────────
+    // 그룹 한도는 차단하지 않는다. 넘는 순간 확인 버튼 하나짜리 팝업으로 알리고 서버에 알림(G8)을 보낸다.
+    // 일간은 그룹당 하루 1번, 시간당은 그룹당 같은 시(hour) 에 1번. 표시 여부는 prefs 키로 기억한다.
+    private suspend fun checkGroupLimits(hourlyNow: Int, dailyNow: Int) {
+        val groups = try { groupLimitDao.getAll() } catch (_: Exception) { return }
+        if (groups.isEmpty()) return
+        val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
+        val kst = java.util.TimeZone.getTimeZone("Asia/Seoul")
+        val dateKey = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US).apply { timeZone = kst }
+            .format(java.util.Date(todayStartMs))
+        val hourKey = java.text.SimpleDateFormat("HH", java.util.Locale.US).apply { timeZone = kst }
+            .format(java.util.Date(com.example.short_cut.TrustedClock.now()))
+        for (g in groups) {
+            // 일간
+            if (g.dailyLimit > 0 && dailyNow >= g.dailyLimit) {
+                val key = "groupAlert:${g.groupId}:$dateKey:daily"
+                if (!prefs.getBoolean(key, false)) {
+                    prefs.edit().putBoolean(key, true).apply()
+                    showGroupAckPopup(g.name, "일간", g.dailyLimit, dailyNow)
+                    serviceScope.launch { com.example.short_cut.postGroupAlert(g.groupId, "daily", dailyNow) }
+                    return   // 한 번에 하나만
+                }
+            }
+            // 시간당
+            if (g.hourlyLimit > 0 && hourlyNow >= g.hourlyLimit) {
+                val key = "groupAlert:${g.groupId}:$dateKey:hourly:$hourKey"
+                if (!prefs.getBoolean(key, false)) {
+                    prefs.edit().putBoolean(key, true).apply()
+                    showGroupAckPopup(g.name, "시간당", g.hourlyLimit, hourlyNow)
+                    serviceScope.launch { com.example.short_cut.postGroupAlert(g.groupId, "hourly", hourlyNow) }
+                    return
+                }
+            }
+        }
+    }
+
+    // 확인 버튼 하나. 차단막 없이 띄워서 뒤 화면 조작은 그대로 되게 한다 ("blocks nothing; it only informs").
+    private suspend fun showGroupAckPopup(groupName: String, kind: String, limit: Int, count: Int) {
+        withContext(Dispatchers.Main) {
+            if (popupViews.isNotEmpty()) return@withContext   // 다른 팝업이 떠 있으면 다음 기회에
+            val view = LayoutInflater.from(this@ShortCutAccessibilityService).inflate(R.layout.overlay_popup, null)
+            view.findViewById<TextView>(R.id.popupTitle).text = "그룹 한도를 넘었어요"
+            view.findViewById<TextView>(R.id.popupMessage).text =
+                "'$groupName' 의 $kind 한도 ${limit}회를 넘었어요 (지금 ${count}회).\n그룹에 알렸어요."
+            view.findViewById<Button>(R.id.btnStop).apply {
+                text = "확인"
+                setOnClickListener { dismissAllPopups() }
+            }
+            // 두 번째 버튼(계속보기) 은 숨긴다 — FrameLayout 으로 감싸져 있어 부모를 숨김
+            val ignore = view.findViewById<Button>(R.id.btnIgnore)
+            (ignore.parent as? View)?.visibility = View.GONE
+            addPopupView(view, standardCenterParams(280), withScrim = false)
+            Log.d(TAG, "그룹 한도 팝업 — $groupName $kind $count/$limit")
         }
     }
 
@@ -785,6 +894,24 @@ class ShortCutAccessibilityService : AccessibilityService() {
                 onIgnoreClick = { executeIgnore(type) }
             )
             addPopupView(view, standardCenterParams(280))
+        }
+    }
+
+    // 로그인 여부 — 로그아웃하면 DeviceApi.clearAccountLocalState 가 prefs 의 userId 를 지운다
+    private fun isLoggedIn(): Boolean =
+        getSharedPreferences(PREFS, MODE_PRIVATE).getString("userId", null) != null
+
+    // 로그아웃 안내 popup — 버튼 없이 3초 후 자동 dismiss (밀어내기는 호출부에서 수행)
+    private fun showLoggedOutPopup() {
+        mainHandler.post {
+            dismissAllPopups()
+            val view = LayoutInflater.from(this).inflate(R.layout.overlay_popup, null)
+            view.findViewById<TextView>(R.id.popupTitle).text = "로그인이 필요해요"
+            view.findViewById<TextView>(R.id.popupMessage).text = "Short-Cut 에 로그인하면 볼 수 있어요"
+            view.findViewById<LinearLayout>(R.id.popupButtonRow).visibility = View.GONE
+            blockPopupShowing = true
+            addPopupView(view, standardCenterParams(280))
+            mainHandler.postDelayed({ dismissAllPopups() }, 3000L)
         }
     }
 
@@ -1281,14 +1408,14 @@ class ShortCutAccessibilityService : AccessibilityService() {
     }
 
     // popup view 를 list 에 등록 + WindowManager 에 추가
-    private fun addPopupView(view: View, params: WindowManager.LayoutParams) {
+    private fun addPopupView(view: View, params: WindowManager.LayoutParams, withScrim: Boolean = true) {
         try {
             // [B2] 팝업 뒤에 차단막을 먼저 깐다 — 팝업 창은 FLAG_NOT_TOUCH_MODAL 이라 카드 밖 터치가 뒤(쇼츠)로
             //   통과해 팝업이 떠 있는데도 스크롤이 됐다. 차단막이 카드 밖 터치를 전부 흡수한다.
             //   차단막은 시스템 바(내비게이션 바) 영역은 덮지 않으므로 홈/뒤로/최근 앱은 그대로 동작하고,
             //   나가면 popup 은 숨겨지되 pending 상태는 유지되어 타겟 앱 재진입 시 복원된다(기존 동작).
             //   같은 타입 창은 나중에 추가한 것이 위에 오므로 팝업보다 먼저 추가해야 팝업이 가려지지 않는다.
-            ensureScrim()
+            if (withScrim) ensureScrim()
             windowManager?.addView(view, params)
             popupViews.add(view)
             isPopupShowing = true
@@ -1341,7 +1468,7 @@ class ShortCutAccessibilityService : AccessibilityService() {
     // YT/TikTok 은 기존대로 HOME (이쪽은 앱 자체가 쇼츠 비중 큼).
     // 5분 차단 기간 중 다시 릴스/쇼츠에 들어가면 onAccessibilityEvent 의 stopUntilMs 분기가 BACK 으로 또 밀어냄.
     private fun executeStop(type: String) {
-        val now = System.currentTimeMillis()
+        val now = com.example.short_cut.TrustedClock.now()
         stopUntilMs = now + STOP_BLOCK_MS
         savePersistedState()
         postBlock(stopUntilMs)   // 다른 기기도 같은 시각까지 차단 (D6)
@@ -1433,7 +1560,7 @@ class ShortCutAccessibilityService : AccessibilityService() {
         val v = PendingViolation(
             id = java.util.UUID.randomUUID().toString(),
             userId = userId,
-            ts = System.currentTimeMillis(),
+            ts = com.example.short_cut.TrustedClock.now(),
             limitType = limitType,
             hourlyScrollCount = hourlyScrollCount,
             dailyScrollCount = dailyScrollCount,
@@ -1622,7 +1749,7 @@ class ShortCutAccessibilityService : AccessibilityService() {
     //   승격 대상(pendingEffectiveAt 도달)이 있으면 승격 후 새 한도를 서버에 push.
     //   없으면 기존과 동일하게 로컬 정렬만 한다.
     private suspend fun promoteAndSyncLimit(userId: String) {
-        val now = System.currentTimeMillis()
+        val now = com.example.short_cut.TrustedClock.now()
         val limit = userLimitDao.getLimit(userId) ?: return
 
         val effectiveAt = limit.pendingEffectiveAt
@@ -1848,7 +1975,7 @@ class ShortCutAccessibilityService : AccessibilityService() {
             val userId = prefs.getString("userId", "unknown") ?: "unknown"
             if (userId == "unknown") return
             resetIfUserChanged(userId)
-            val now = System.currentTimeMillis()
+            val now = com.example.short_cut.TrustedClock.now()
             handleDayRolloverIfNeeded(now, userId)
 
             // 1) 미전송분 먼저 — 서버 합계에 이 기기 분이 빠진 채로 읽지 않게
@@ -1865,6 +1992,7 @@ class ShortCutAccessibilityService : AccessibilityService() {
             }
 
             // 3) 적용
+            com.example.short_cut.TrustedClock.sync(this, json.optLong("serverTime", 0L))
             val serverDate = json.optString("date")
             val localDate = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US).apply {
                 timeZone = java.util.TimeZone.getTimeZone("Asia/Seoul")
@@ -2069,6 +2197,7 @@ class ShortCutAccessibilityService : AccessibilityService() {
         if (instance === this) instance = null
         dismissAllPopups()
         try { unregisterReceiver(screenStateReceiver) } catch (_: Exception) {}
+        try { unregisterReceiver(timeChangedReceiver) } catch (_: Exception) {}
         batchHandler.removeCallbacks(batchTimerRunnable)
         mainHandler.removeCallbacks(syncTimerRunnable)
         flushBatch()

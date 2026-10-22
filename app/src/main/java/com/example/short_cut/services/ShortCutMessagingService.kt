@@ -43,6 +43,9 @@ class ShortCutMessagingService : FirebaseMessagingService() {
                 if (service == null) Log.d(TAG, "COUNT_UPDATED 무시 — 접근성 서비스 미실행")
                 else service.syncFromRemote()
             }
+            // 그룹 알림 (한도 초과 · 넛지 · 제안/결과 · 가입/탈퇴/로그아웃) → 종류별 채널로 알림 표시, 누르면 그 그룹 상세로
+            in com.example.short_cut.GroupNotifications.KNOWN_TYPES ->
+                com.example.short_cut.GroupNotifications.show(applicationContext, type!!, message.data)
             else -> Log.w(TAG, "알 수 없는 FCM type: $type")
         }
     }

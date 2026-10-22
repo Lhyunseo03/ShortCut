@@ -190,3 +190,184 @@ internal suspend fun leaveGroup(groupId: String): GroupResult<Unit> {
     val res = authedRequest("DELETE", "/groups/$groupId/members/me")
     return if (res.ok) GroupResult(Unit, null) else fail(res, "탈퇴하지 못했어요")
 }
+
+
+// ─────────────────────────────────────────────────────────────────────────
+// 7~9주차 — 앱이 가정한 계약 (서버 미구현 10/22 기준. 서버와 맞추면서 파서만 고치면 됨)
+//
+//  POST /groups/{gid}/alerts   ← { type: "daily"|"hourly", count }            → { status: "ok" }
+//       (G2·G8: 그룹 한도 초과 알림. 서버가 나머지 구성원에게 FCM, 같은 날/같은 시(hour)엔 중복 발송 없음)
+//  POST /groups/{gid}/nudge    ← { targetId }                                 → 200 / 429 "잠시 후에 다시"
+//       (G7: 보낸 사람→받는 사람 쌍으로 10분에 1번)
+//  GET  /groups/{gid}/members/{uid}                                           (G5·G6·G11)
+//       → { userId, displayName, todayCount, lastHourCount, todayPopups,
+//           devices: [ { deviceName, lastSeenAt, lastScrollAt, loggedOutAt, permissionsOk, permissionsOffSince } ],
+//           last7Days: [ { date: "yyyy-MM-dd", count } ] }
+//  GET  /groups/{gid}/proposal                                                 (G9: 제안 버튼 상태 + 열린 제안)
+//       → { state: "none"|"open"|"passed"|"used",
+//           proposal: { proposalId, proposedBy, proposedByName, dailyLimit, hourlyLimit, createdAt, closesAt,
+//                       yes, no, electorate, required, myVote: "yes"|"no"|null, canVote } | null,
+//           lockedUntil: ms|null, pendingGoal: { dailyLimit, hourlyLimit } | null }
+//  POST /groups/{gid}/proposals ← { dailyLimit, hourlyLimit }                 → 201 { proposalId } / 409 { error }
+//  POST /proposals/{id}/vote    ← { vote: "yes"|"no" }                        → { status: "ok" } / 409 { error }
+//
+//  FCM data message (서버 → 앱): { type, groupId, groupName, title, body }
+//    type = GROUP_ALERT(한도 초과) | NUDGE | PROPOSAL(제안 등록) | VOTE_RESULT(통과/부결) | LIMIT_APPLIED(월요일 적용)
+//         | MEMBER_JOINED | MEMBER_LEFT | MEMBER_LOGOUT
+// ─────────────────────────────────────────────────────────────────────────
+
+internal data class MemberDevice(
+    val deviceName: String,
+    val lastSeenAt: Long?,
+    val lastScrollAt: Long?,
+    val loggedOutAt: Long?,
+    val permissionsOk: Boolean?,
+    val permissionsOffSince: Long?
+)
+
+internal data class MemberDaily(val date: String, val count: Int)
+
+internal data class MemberDetail(
+    val userId: String,
+    val nickname: String,
+    val todayCount: Int,
+    val lastHourCount: Int,
+    val todayPopups: Int,
+    val devices: List<MemberDevice>,
+    val last7Days: List<MemberDaily>
+)
+
+// 제안 버튼 상태 (스펙 G9 표): NONE=제안 가능, OPEN=진행 중인 투표, PASSED=이번 주 이미 통과, USED=내가 이번 주 제안함
+internal enum class ProposalState { NONE, OPEN, PASSED, USED }
+
+internal data class Proposal(
+    val proposalId: String,
+    val proposedBy: String,
+    val proposedByName: String,
+    val dailyLimit: Int,
+    val hourlyLimit: Int,
+    val createdAt: Long,
+    val closesAt: Long,
+    val yes: Int,
+    val no: Int,
+    val electorate: Int,
+    val required: Int,
+    val myVote: String?,      // "yes" / "no" / null
+    val canVote: Boolean      // 투표권자(제안 시점 구성원)인지
+)
+
+internal data class ProposalStatus(
+    val state: ProposalState,
+    val proposal: Proposal?,
+    val lockedUntil: Long?,
+    val pendingDaily: Int?,
+    val pendingHourly: Int?
+)
+
+// 그룹 한도 초과 알림 (G2·G8). 서버 미구현이면 404 — 실패해도 앱 동작엔 영향 없음.
+internal suspend fun postGroupAlert(groupId: String, type: String, count: Int): Boolean {
+    val res = authedRequest("POST", "/groups/$groupId/alerts", JSONObject().put("type", type).put("count", count))
+    return res.ok
+}
+
+// 넛지 (G7). 429 면 서버가 준 "잠시 후에" 문구를 그대로.
+internal suspend fun sendNudge(groupId: String, targetId: String): GroupResult<Unit> {
+    val res = authedRequest("POST", "/groups/$groupId/nudge", JSONObject().put("targetId", targetId))
+    return if (res.ok) GroupResult(Unit, null) else fail(res, "넛지를 보내지 못했어요")
+}
+
+internal suspend fun fetchMemberDetail(groupId: String, userId: String): GroupResult<MemberDetail> {
+    val res = authedRequest("GET", "/groups/$groupId/members/$userId")
+    val json = res.json
+    if (!res.ok || json == null) return fail(res, "구성원 정보를 불러오지 못했어요")
+    val o = json.optJSONObject("member") ?: json
+    val devices = o.optJSONArray("devices")?.let { arr ->
+        (0 until arr.length()).mapNotNull { i ->
+            val d = arr.optJSONObject(i) ?: return@mapNotNull null
+            MemberDevice(
+                deviceName = d.optString("deviceName").ifBlank { "기기" },
+                lastSeenAt = d.optLongOrNull("lastSeenAt"),
+                lastScrollAt = d.optLongOrNull("lastScrollAt"),
+                loggedOutAt = d.optLongOrNull("loggedOutAt"),
+                permissionsOk = if (d.has("permissionsOk") && !d.isNull("permissionsOk")) d.optBoolean("permissionsOk") else null,
+                permissionsOffSince = d.optLongOrNull("permissionsOffSince")
+            )
+        }
+    } ?: emptyList()
+    val days = o.optJSONArray("last7Days")?.let { arr ->
+        (0 until arr.length()).mapNotNull { i ->
+            val d = arr.optJSONObject(i) ?: return@mapNotNull null
+            MemberDaily(d.optString("date"), d.optInt("count", 0))
+        }
+    } ?: emptyList()
+    return GroupResult(
+        MemberDetail(
+            userId = o.optString("userId", userId),
+            nickname = o.optString("nickname").ifBlank { o.optString("displayName") }.ifBlank { "이름 없음" },
+            todayCount = o.optInt("todayCount", 0),
+            lastHourCount = o.optInt("lastHourCount", 0),
+            todayPopups = o.optInt("todayPopups", 0),
+            devices = devices,
+            last7Days = days
+        ), null
+    )
+}
+
+private fun parseProposal(p: JSONObject?): Proposal? {
+    if (p == null) return null
+    val id = p.optString("proposalId").ifBlank { p.optString("id") }
+    if (id.isBlank()) return null
+    val goal = p.optJSONObject("goal")
+    return Proposal(
+        proposalId = id,
+        proposedBy = p.optString("proposedBy"),
+        proposedByName = p.optString("proposedByName").ifBlank { "구성원" },
+        dailyLimit = goal?.optInt("dailyLimit", 0)?.takeIf { it > 0 } ?: p.optInt("dailyLimit", 0),
+        hourlyLimit = goal?.optInt("hourlyLimit", 0)?.takeIf { it > 0 } ?: p.optInt("hourlyLimit", 0),
+        createdAt = p.optLong("createdAt", 0L),
+        closesAt = p.optLong("closesAt", 0L),
+        yes = p.optInt("yes", 0),
+        no = p.optInt("no", 0),
+        electorate = p.optInt("electorate", 0),
+        required = p.optInt("required", 0),
+        myVote = p.optString("myVote").takeIf { it == "yes" || it == "no" },
+        canVote = p.optBoolean("canVote", true)
+    )
+}
+
+// 제안 버튼 상태 + 열린 제안. 서버 미구현(404)이면 "제안 가능" 으로 보여 주고, 제안 시도 때 서버 문구가 뜬다.
+internal suspend fun fetchProposalStatus(groupId: String): GroupResult<ProposalStatus> {
+    val res = authedRequest("GET", "/groups/$groupId/proposal")
+    if (res.code == 404) return GroupResult(ProposalStatus(ProposalState.NONE, null, null, null, null), null)
+    val json = res.json
+    if (!res.ok || json == null) return fail(res, "투표 상태를 불러오지 못했어요")
+    val state = when (json.optString("state")) {
+        "open" -> ProposalState.OPEN
+        "passed" -> ProposalState.PASSED
+        "used" -> ProposalState.USED
+        else -> ProposalState.NONE
+    }
+    val pending = json.optJSONObject("pendingGoal")
+    return GroupResult(
+        ProposalStatus(
+            state = state,
+            proposal = parseProposal(json.optJSONObject("proposal")),
+            lockedUntil = json.optLongOrNull("lockedUntil"),
+            pendingDaily = pending?.optInt("dailyLimit", 0)?.takeIf { it > 0 },
+            pendingHourly = pending?.optInt("hourlyLimit", 0)?.takeIf { it > 0 }
+        ), null
+    )
+}
+
+internal suspend fun createProposal(groupId: String, dailyLimit: Int, hourlyLimit: Int): GroupResult<String> {
+    val body = JSONObject().put("dailyLimit", dailyLimit).put("hourlyLimit", hourlyLimit)
+        .put("goal", JSONObject().put("dailyLimit", dailyLimit).put("hourlyLimit", hourlyLimit))
+    val res = authedRequest("POST", "/groups/$groupId/proposals", body)
+    val id = res.json?.optString("proposalId").orEmpty().ifBlank { res.json?.optString("id").orEmpty() }
+    return if (res.ok && id.isNotEmpty()) GroupResult(id, null) else fail(res, "제안을 등록하지 못했어요")
+}
+
+internal suspend fun castVote(proposalId: String, yes: Boolean): GroupResult<Unit> {
+    val res = authedRequest("POST", "/proposals/$proposalId/vote", JSONObject().put("vote", if (yes) "yes" else "no"))
+    return if (res.ok) GroupResult(Unit, null) else fail(res, "투표하지 못했어요")
+}

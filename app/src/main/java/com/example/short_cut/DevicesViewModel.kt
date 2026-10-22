@@ -39,7 +39,7 @@ private const val USE_FAKE_DEVICES = false
 internal class FakeDevicesSource : DevicesSource {
     override suspend fun load(myDeviceId: String): List<DeviceItem> {
         delay(300)   // 로딩 상태가 보이도록 서버 호출 흉내
-        val now = System.currentTimeMillis()
+        val now = TrustedClock.now()
         return listOf(
             DeviceItem(
                 deviceId = myDeviceId,
@@ -91,6 +91,20 @@ internal class DevicesViewModel(app: Application) : AndroidViewModel(app) {
     val state: StateFlow<DevicesUiState> = _state.asStateFlow()
 
     init { refresh() }
+
+    // 설정 > Devices 의 삭제 버튼 — 서버 문서 삭제 → FCM 대상 · 기기 수에서 빠진다. 그 기기가 올린 기록은 남는다.
+    // 이 기기는 지울 수 없다 (로그아웃으로 처리).
+    fun remove(deviceId: String, onDone: (String?) -> Unit) {
+        viewModelScope.launch {
+            val res = authedRequest("DELETE", "/devices/$deviceId")
+            if (res.ok) {
+                refresh()
+                onDone(null)
+            } else {
+                onDone(res.error ?: if (res.code == 0) "네트워크 연결을 확인해 주세요" else "기기를 삭제하지 못했어요 (HTTP ${res.code})")
+            }
+        }
+    }
 
     fun refresh() {
         _state.value = _state.value.copy(loading = true, error = null)

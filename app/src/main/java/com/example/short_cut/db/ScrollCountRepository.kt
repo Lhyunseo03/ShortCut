@@ -25,13 +25,18 @@ class ScrollCountRepository private constructor(private val dao: ScrollHistoryDa
         }.asCoroutineDispatcher()
 
         @Volatile private var INSTANCE: ScrollCountRepository? = null
+        @Volatile private var instanceUid: String? = null
 
-        fun get(context: Context): ScrollCountRepository =
-            INSTANCE ?: synchronized(this) {
-                INSTANCE ?: ScrollCountRepository(
-                    AppDatabase.getDatabase(context.applicationContext).scrollHistoryDao()
-                ).also { INSTANCE = it }
+        // 지금 로그인한 계정의 저장소. 계정이 바뀌면 그 계정 DB 로 다시 만든다 (DB 파일이 계정별이라서).
+        fun get(context: Context): ScrollCountRepository {
+            val uid = AppDatabase.currentUserId(context)
+            INSTANCE?.let { if (instanceUid == uid) return it }
+            return synchronized(this) {
+                INSTANCE?.let { if (instanceUid == uid) return it }
+                ScrollCountRepository(AppDatabase.getDatabase(context.applicationContext).scrollHistoryDao())
+                    .also { INSTANCE = it; instanceUid = uid }
             }
+        }
     }
 
     // ── 쓰기 ──────────────────────────────────────────────────────────────

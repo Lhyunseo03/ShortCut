@@ -131,6 +131,7 @@ internal fun mondayOf(timeMs: Long): Long {
 // 오늘 자정 0시 (local) Unix ms. offset=0 이면 오늘, -1=어제, 1=내일.
 internal fun startOfDayMs(offset: Int = 0): Long {
     val cal = Calendar.getInstance().apply {
+        timeInMillis = TrustedClock.now()   // 폰 시계 대신 신뢰 시각
         set(Calendar.HOUR_OF_DAY, 0)
         set(Calendar.MINUTE, 0)
         set(Calendar.SECOND, 0)
@@ -145,6 +146,7 @@ internal fun startOfDayMs(offset: Int = 0): Long {
 // 한 번 승격되면 다음 변경(역시 다음 주 월요일 예약) 전까지 그 값이 한 주 내내 고정된다.
 internal fun startOfNextMondayMs(): Long {
     val cal = Calendar.getInstance().apply {
+        timeInMillis = TrustedClock.now()   // 폰 시계 대신 신뢰 시각
         set(Calendar.HOUR_OF_DAY, 0)
         set(Calendar.MINUTE, 0)
         set(Calendar.SECOND, 0)

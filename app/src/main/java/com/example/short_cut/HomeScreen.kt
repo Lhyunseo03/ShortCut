@@ -36,6 +36,7 @@ import androidx.compose.material.icons.filled.ChevronLeft
 import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.Groups
 import androidx.compose.material.icons.filled.Home
+import androidx.compose.material.icons.filled.MailOutline
 import androidx.compose.material.icons.filled.Remove
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.*
@@ -105,6 +106,8 @@ fun HomeScreen(onAuthChanged: () -> Unit = {}) {
     // 초대 링크로 앱이 열렸으면 그룹 탭으로 이동 (참여 창은 그룹 목록 화면이 연다)
     val pendingInvite = PendingInvite.code.value
     LaunchedEffect(pendingInvite) { if (pendingInvite != null) selectedTab = HomeTab.GROUP }
+    val pendingGroupOpen = PendingGroupOpen.groupId.value
+    LaunchedEffect(pendingGroupOpen) { if (pendingGroupOpen != null) selectedTab = HomeTab.GROUP }
     // AI 분석 → "적용하기" 로 넘어온 추천 한도 (daily, hourly). 설정 탭이 받아 한도 화면에 자동 입력.
     var limitPrefill by remember { mutableStateOf<Pair<Int, Int>?>(null) }
 
@@ -196,6 +199,16 @@ internal fun HomeTabContent() {
     }
     var todayCount by remember { mutableStateOf(HomeTabCache.todayCount) }
     var lastHourCount by remember { mutableStateOf(HomeTabCache.lastHourCount) }
+
+    // 주간 리포트 (B1) — 오른쪽 위 편지 아이콘. 새 리포트가 와 있으면 빨간 점. 열면 점이 사라진다.
+    val prefs = remember { context.getSharedPreferences("short_cut_prefs", Context.MODE_PRIVATE) }
+    var showWeeklyReport by remember { mutableStateOf(false) }
+    var reportUnread by remember { mutableStateOf(prefs.getBoolean(com.example.short_cut.services.WeeklyReportWorker.PK_UNREAD, false)) }
+    BackHandler(enabled = showWeeklyReport) { showWeeklyReport = false }
+    if (showWeeklyReport) {
+        WeeklyReportScreen(onBack = { showWeeklyReport = false })
+        return
+    }
     // null = 아직 안 읽음 → 숫자 대신 "—" 표시 (기본값 100/50 을 진짜 값처럼 보여 주지 않기 위해)
     var dailyLimit by remember { mutableStateOf(HomeTabCache.dailyLimit) }
     var hourlyLimit by remember { mutableStateOf(HomeTabCache.hourlyLimit) }
@@ -223,7 +236,7 @@ internal fun HomeTabContent() {
     LaunchedEffect(lifecycleOwner) {
         lifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
         while (true) {
-            val now = System.currentTimeMillis()
+            val now = TrustedClock.now()
             val scrollCounts = com.example.short_cut.db.ScrollCountRepository.get(context)
             // 오늘 카운트 — 로컬 Room(이 기기) 과 서비스가 공개한 계정 전체 기준 값 중 큰 쪽.
             // (서비스 값은 서버 합계 = 다른 기기 포함. 로컬이 더 크면 아직 서버에 안 올라간 스크롤이 있는 것)
@@ -243,6 +256,7 @@ internal fun HomeTabContent() {
             if (userId != null) {
                 val res = authedRequest("GET", "/sync?deviceId=${DeviceId.get(context)}")
                 res.json?.let { j ->
+                    TrustedClock.sync(context, j.optLong("serverTime", 0L))
                     applyServerAppMode(context, j)   // 다른 기기에서 바꾼 모드 반영
                     applyServerNickname(context, j)  // 다른 기기에서 바꾼 닉네임 반영
                     val dailyTotal = j.optInt("dailyTotal", -1)
@@ -275,13 +289,35 @@ internal fun HomeTabContent() {
             .padding(horizontal = 24.dp, vertical = 24.dp),
         verticalArrangement = Arrangement.spacedBy(20.dp)
     ) {
-        Text(
-            text = "Short-Cut",
-            fontSize = 32.sp,
-            fontWeight = FontWeight.ExtraBold,
-            color = Color(0xFF1A1A1A),
-            modifier = Modifier.align(Alignment.CenterHorizontally)
-        )
+        Box(modifier = Modifier.fillMaxWidth()) {
+            Text(
+                text = "Short-Cut",
+                fontSize = 32.sp,
+                fontWeight = FontWeight.ExtraBold,
+                color = Color(0xFF1A1A1A),
+                modifier = Modifier.align(Alignment.Center)
+            )
+            // 편지 아이콘 — 주간 리포트 입구 (B1). 일요일 저녁에 새 리포트가 오면 빨간 점.
+            IconButton(
+                onClick = {
+                    reportUnread = false
+                    showWeeklyReport = true
+                },
+                modifier = Modifier.align(Alignment.CenterEnd)
+            ) {
+                Box {
+                    Icon(Icons.Filled.MailOutline, contentDescription = "주간 리포트", tint = Color(0xFF1A1A1A))
+                    if (reportUnread) {
+                        Box(
+                            modifier = Modifier
+                                .size(9.dp)
+                                .align(Alignment.TopEnd)
+                                .background(Color(0xFFE53935), CircleShape)
+                        )
+                    }
+                }
+            }
+        }
 
         Spacer(Modifier.height(8.dp))
 

@@ -115,12 +115,15 @@ class MainActivity : ComponentActivity() {
 
     companion object {
         const val EXTRA_OPEN_WEEKLY_REPORT = "open_weekly_report"
+        const val EXTRA_OPEN_GROUP_ID = "open_group_id"   // 그룹 알림을 눌러 진입 — 그 그룹 상세로
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        TrustedClock.init(this)
         openWeeklyReport.value = intent?.getBooleanExtra(EXTRA_OPEN_WEEKLY_REPORT, false) == true
         handleInviteLink(intent)
+        handleGroupOpen(intent)
         // 주간 리포트 알림용 권한 (Android 13+). 이미 있거나 하위 버전이면 그냥 패스.
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
             androidx.core.content.ContextCompat.checkSelfPermission(
@@ -144,6 +147,13 @@ class MainActivity : ComponentActivity() {
             openWeeklyReport.value = true
         }
         handleInviteLink(intent)
+        handleGroupOpen(intent)
+    }
+
+    // 그룹 알림 탭 → 그 그룹 상세로 (홈 화면이 그룹 탭으로 가고, 그룹 탭이 상세를 연다)
+    private fun handleGroupOpen(intent: Intent?) {
+        val gid = intent?.getStringExtra(EXTRA_OPEN_GROUP_ID)?.takeIf { it.isNotBlank() } ?: return
+        PendingGroupOpen.groupId.value = gid
     }
 
     // 초대 딥링크 shortcut://join?code=ABC123 → 코드를 보관해 두면 홈 화면이 그룹 탭의 참여 창을 연다

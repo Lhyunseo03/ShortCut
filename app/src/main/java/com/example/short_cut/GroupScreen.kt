@@ -40,7 +40,15 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import java.text.SimpleDateFormat
+import java.util.Calendar
+import java.util.Date
+import java.util.Locale
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -53,6 +61,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardCapitalization
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -90,6 +99,10 @@ private sealed interface GroupNav {
     data object List : GroupNav
     data object Create : GroupNav
     data class Detail(val groupId: String) : GroupNav
+    data class Member(val group: GroupSummary, val row: GroupMember, val isMe: Boolean) : GroupNav
+    data class MemberStats(val group: GroupSummary, val row: GroupMember, val isMe: Boolean) : GroupNav
+    data class Propose(val group: GroupSummary) : GroupNav
+    data class Vote(val group: GroupSummary) : GroupNav
 }
 
 @Composable
@@ -98,9 +111,23 @@ internal fun GroupTabContent() {
     // 초대 링크로 들어왔으면 목록 화면으로 (거기서 참여 창이 열린다)
     val pendingInvite = PendingInvite.code.value
     LaunchedEffect(pendingInvite) { if (pendingInvite != null) nav = GroupNav.List }
+    // 그룹 알림을 눌러 들어왔으면 그 그룹 상세로
+    val pendingGroup = PendingGroupOpen.groupId.value
+    LaunchedEffect(pendingGroup) {
+        if (pendingGroup != null) { nav = GroupNav.Detail(pendingGroup); PendingGroupOpen.groupId.value = null }
+    }
 
-    // 하위 화면에서 시스템 뒤로가기 → 목록으로
-    BackHandler(enabled = nav != GroupNav.List) { nav = GroupNav.List }
+    // 시스템 뒤로가기: 상세의 하위 화면이면 상세로, 아니면 목록으로
+    fun back() {
+        nav = when (val n = nav) {
+            is GroupNav.Member -> GroupNav.Detail(n.group.groupId)
+            is GroupNav.MemberStats -> GroupNav.Member(n.group, n.row, n.isMe)
+            is GroupNav.Propose -> GroupNav.Detail(n.group.groupId)
+            is GroupNav.Vote -> GroupNav.Detail(n.group.groupId)
+            else -> GroupNav.List
+        }
+    }
+    BackHandler(enabled = nav != GroupNav.List) { back() }
 
     when (val n = nav) {
         GroupNav.List -> GroupListScreen(
@@ -113,8 +140,19 @@ internal fun GroupTabContent() {
         )
         is GroupNav.Detail -> GroupDetailScreen(
             groupId = n.groupId,
-            onBack = { nav = GroupNav.List }
+            onBack = { nav = GroupNav.List },
+            onOpenMember = { g, row, isMe -> nav = GroupNav.Member(g, row, isMe) },
+            onOpenPropose = { g -> nav = GroupNav.Propose(g) },
+            onOpenVote = { g -> nav = GroupNav.Vote(g) }
         )
+        is GroupNav.Member -> MemberDetailScreen(
+            group = n.group, row = n.row, isMe = n.isMe,
+            onBack = { back() },
+            onOpenStats = { nav = GroupNav.MemberStats(n.group, n.row, n.isMe) }
+        )
+        is GroupNav.MemberStats -> MemberStatsScreen(group = n.group, row = n.row, isMe = n.isMe, onBack = { back() })
+        is GroupNav.Propose -> ProposeScreen(group = n.group, onBack = { back() }, onProposed = { nav = GroupNav.Vote(n.group) })
+        is GroupNav.Vote -> VoteScreen(group = n.group, onBack = { back() })
     }
 }
 
@@ -134,12 +172,38 @@ private fun GroupTopBar(title: String, onBack: (() -> Unit)?) {
         }
         Text(
             text = title,
-            fontSize = 22.sp,
+            fontSize = if (title.length > 12) 18.sp else 22.sp,
             fontWeight = FontWeight.ExtraBold,
             color = Ink,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f)
         )
+    }
+}
+
+// 비어 있을 때 — 안내 한 줄 + 보조 설명 한 줄
+@Composable
+private fun EmptyState(title: String, hint: String) {
+    Column(
+        modifier = Modifier.fillMaxWidth().padding(vertical = 48.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Text(text = title, fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = Ink)
+        Spacer(Modifier.height(6.dp))
+        Text(text = hint, fontSize = 13.sp, color = SubInk, textAlign = TextAlign.Center)
+    }
+}
+
+// 로딩 — 스피너 밑에 무엇을 불러오는지
+@Composable
+private fun LoadingState(text: String) {
+    Column(
+        modifier = Modifier.fillMaxWidth().padding(top = 24.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        StatsLoadingSpinner()
+        Text(text = text, fontSize = 13.sp, color = SubInk)
     }
 }
 
@@ -214,14 +278,12 @@ private fun GroupListScreen(onCreate: () -> Unit, onOpen: (String) -> Unit) {
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
             when {
-                loading -> StatsLoadingSpinner()
+                loading -> LoadingState("그룹 목록을 불러오는 중…")
                 error != null -> ErrorWithRetry(error!!) { reloadKey++ }
-                groups.isEmpty() -> Box(
-                    modifier = Modifier.fillMaxWidth().padding(vertical = 48.dp),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Text(text = "가입한 그룹 없음", fontSize = 16.sp, color = SubInk)
-                }
+                groups.isEmpty() -> EmptyState(
+                    title = "아직 참여한 그룹이 없어요",
+                    hint = "아래에서 그룹을 만들거나, 친구에게 받은 초대 코드로 참여해 보세요"
+                )
                 else -> groups.forEach { g ->
                     GroupCard(group = g, myToday = g.myTodayCount ?: localToday, onClick = { onOpen(g.groupId) })
                 }
@@ -518,9 +580,18 @@ private fun GroupCreateScreen(onBack: () -> Unit, onCreated: (String) -> Unit) {
 
 // ── 4. 그룹 상세 ─────────────────────────────────────────────────────────
 @Composable
-private fun GroupDetailScreen(groupId: String, onBack: () -> Unit) {
+private fun GroupDetailScreen(
+    groupId: String,
+    onBack: () -> Unit,
+    onOpenMember: (GroupSummary, GroupMember, Boolean) -> Unit = { _, _, _ -> },
+    onOpenPropose: (GroupSummary) -> Unit = {},
+    onOpenVote: (GroupSummary) -> Unit = {}
+) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
+    // 한도 변경 제안 상태 (G9) — 서버 미구현이면 "제안 가능" 으로 표시
+    var proposalStatus by remember { mutableStateOf<ProposalStatus?>(null) }
+    LaunchedEffect(groupId) { proposalStatus = fetchProposalStatus(groupId).value }
 
     var loading by remember { mutableStateOf(true) }
     var error by remember { mutableStateOf<String?>(null) }
@@ -531,7 +602,7 @@ private fun GroupDetailScreen(groupId: String, onBack: () -> Unit) {
     var myLocalLastScroll by remember { mutableStateOf<Long?>(null) }
     LaunchedEffect(groupId) {
         val repo = com.example.short_cut.db.ScrollCountRepository.get(context)
-        val now = System.currentTimeMillis()
+        val now = TrustedClock.now()
         val dayStart = startOfDayMs()
         myLocalToday = accountTodayCount(context)
         myLocalHour = repo.hourlyCount(now)
@@ -542,26 +613,52 @@ private fun GroupDetailScreen(groupId: String, onBack: () -> Unit) {
     var showLeave by remember { mutableStateOf(false) }
     var leaving by remember { mutableStateOf(false) }
 
+    // 다른 앱(알림·공유 시트)에 갔다가 돌아오면 구성원 목록을 다시 받는다 — 그 사이 누가 탈퇴·가입했을 수 있다.
+    // 첫 진입의 ON_RESUME 은 건너뛴다 (아래 LaunchedEffect 가 이미 받는다).
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner, groupId) {
+        var first = true
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                if (first) first = false else reloadKey++
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
     LaunchedEffect(groupId, reloadKey) {
-        loading = true
+        // 다시 받을 때 이미 보여 주던 내용이 있으면 스피너로 바꾸지 않고 조용히 갱신한다
+        loading = detail == null
         error = null
         val res = fetchGroupDetail(groupId)
-        detail = res.value
+        if (res.value != null) detail = res.value
         error = res.error
         loading = false
         if (res.value == null) return@LaunchedEffect
 
-        // 30초마다 카운트만 새로고침. 화면을 떠나면 LaunchedEffect 가 취소되며 같이 멈춘다.
+        // 30초마다 카운트 새로고침. 구성원 구성(가입·탈퇴)이 바뀌었으면 전체를 다시 받는다.
+        // 화면을 떠나면 LaunchedEffect 가 취소되며 같이 멈춘다.
         while (true) {
             delay(30_000)
-            val fresh = fetchGroupStatus(groupId) ?: continue
-            val byId = fresh.associateBy { it.userId }
-            detail = detail?.let { d ->
-                // status 응답엔 닉네임이 없을 수 있으므로 기존 닉네임 유지
-                d.copy(members = d.members.map { m ->
-                    byId[m.userId]?.copy(nickname = m.nickname) ?: m
-                })
+            val current = detail ?: continue
+            val fresh = fetchGroupStatus(groupId)
+            if (fresh == null) {
+                // /status 가 없거나(서버 6주차 전) 실패 — 전체를 다시 받아 구성원·카운트를 갱신
+                fetchGroupDetail(groupId).value?.let { detail = it }
+                continue
             }
+            val freshIds = fresh.map { it.userId }.toSet()
+            val currentIds = current.members.map { it.userId }.toSet()
+            if (freshIds.isNotEmpty() && freshIds != currentIds) {
+                fetchGroupDetail(groupId).value?.let { detail = it }
+                continue
+            }
+            val byId = fresh.associateBy { it.userId }
+            detail = current.copy(members = current.members.map { m ->
+                // status 응답엔 닉네임이 없을 수 있으므로 기존 닉네임 유지
+                byId[m.userId]?.copy(nickname = m.nickname) ?: m
+            })
         }
     }
 
@@ -578,7 +675,7 @@ private fun GroupDetailScreen(groupId: String, onBack: () -> Unit) {
         ) {
             val d = detail
             when {
-                loading -> StatsLoadingSpinner()
+                loading -> LoadingState("그룹 정보를 불러오는 중…")
                 d == null -> ErrorWithRetry(error ?: "그룹 정보를 불러오지 못했어요") { reloadKey++ }
                 else -> {
                     val g = d.summary
@@ -600,10 +697,30 @@ private fun GroupDetailScreen(groupId: String, onBack: () -> Unit) {
                             nickname = if (myName.isNotBlank()) myName else m.nickname,
                             todayCount = maxOf(m.todayCount, myLocalToday),
                             lastHourCount = maxOf(m.lastHourCount, myLocalHour),
+                            lastSeenAt = TrustedClock.now(),   // 지금 이 화면을 보고 있다
                             lastScrollAt = m.lastScrollAt ?: myLocalLastScroll
-                        ) else m
-                        MemberRow(rank = i + 1, member = shown, group = g)
+                        ) else m.copy(
+                            // 접속이 스크롤보다 오래됐을 수 없다 — 서버가 가입 시각을 주는 동안은 스크롤 시각으로 보정
+                            lastSeenAt = listOfNotNull(m.lastSeenAt, m.lastScrollAt).maxOrNull()
+                        )
+                        val isMe = m.userId == myId
+                        MemberRow(
+                            rank = i + 1, member = shown, group = g,
+                            onClick = { onOpenMember(g, shown, isMe) },
+                            onNudge = if (isMe) null else {
+                                {
+                                    scope.launch {
+                                        val res = sendNudge(g.groupId, m.userId)
+                                        Toast.makeText(context, res.error ?: "${shown.nickname} 님에게 넛지를 보냈어요", Toast.LENGTH_SHORT).show()
+                                    }
+                                }
+                            }
+                        )
                     }
+                    Spacer(Modifier.height(8.dp))
+                    HorizontalDivider(color = Color(0xFFEEEEEE))
+                    // 한도 변경 제안 / 진행 중 투표 (G9)
+                    ProposalButton(status = proposalStatus, onPropose = { onOpenPropose(g) }, onOpenVote = { onOpenVote(g) })
                     Spacer(Modifier.height(4.dp))
                 }
             }
@@ -669,11 +786,17 @@ private fun GroupDetailScreen(groupId: String, onBack: () -> Unit) {
 // 순위표 한 줄 — 배경: 오늘 카운트 ≥ 그룹 일간 한도면 빨강, 아니면 초록.
 // 벨: 최근 1시간 카운트 ≥ 그룹 시간당 한도일 때만 (지금 몰아 보는 중인 사람).
 @Composable
-private fun MemberRow(rank: Int, member: GroupMember, group: GroupSummary) {
+private fun MemberRow(
+    rank: Int,
+    member: GroupMember,
+    group: GroupSummary,
+    onClick: () -> Unit = {},
+    onNudge: (() -> Unit)? = null    // null = 내 행 (넛지 불가)
+) {
     val overDaily = group.dailyLimit > 0 && member.todayCount >= group.dailyLimit
     val overHourly = group.hourlyLimit > 0 && member.lastHourCount >= group.hourlyLimit
     Surface(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier.fillMaxWidth().clickable(onClick = onClick),
         shape = RoundedCornerShape(12.dp),
         color = if (overDaily) OverRedBg else OkGreenBg
     ) {
@@ -692,19 +815,22 @@ private fun MemberRow(rank: Int, member: GroupMember, group: GroupSummary) {
                     overflow = TextOverflow.Ellipsis
                 )
                 Text(
-                    text = "접속 ${agoText(member.lastSeenAt)} · 스크롤 ${agoText(member.lastScrollAt)}",
+                    text = "접속 ${agoText(member.lastSeenAt)} · 마지막 스크롤 ${lastScrollText(member.lastScrollAt)}",
                     fontSize = 12.sp,
                     color = SubInk
                 )
             }
             if (overHourly) {
-                Icon(
-                    Icons.Filled.Notifications,
-                    contentDescription = "시간당 한도 초과 중",
-                    tint = OverRed,
-                    modifier = Modifier.size(22.dp)
-                )
-                Spacer(Modifier.width(8.dp))
+                // 벨 = 지금 몰아 보는 중. 누르면 넛지 (G7). 내 행은 표시만.
+                IconButton(onClick = { onNudge?.invoke() }, enabled = onNudge != null, modifier = Modifier.size(32.dp)) {
+                    Icon(
+                        Icons.Filled.Notifications,
+                        contentDescription = if (onNudge != null) "넛지 보내기" else "시간당 한도 초과 중",
+                        tint = OverRed,
+                        modifier = Modifier.size(22.dp)
+                    )
+                }
+                Spacer(Modifier.width(4.dp))
             }
             Text(
                 text = "${member.todayCount}회",
@@ -716,9 +842,22 @@ private fun MemberRow(rank: Int, member: GroupMember, group: GroupSummary) {
     }
 }
 
+// 마지막 스크롤 시각 — 제안서 형식 "9/11 23:41". 오늘이면 날짜를 빼고 "23:41".
+private val LAST_SCROLL_FMT = SimpleDateFormat("M/d HH:mm", Locale.KOREA)
+private val TIME_ONLY_FMT = SimpleDateFormat("HH:mm", Locale.KOREA)
+private fun lastScrollText(ms: Long?): String {
+    if (ms == null) return "없음"
+    val cal = Calendar.getInstance()
+    cal.timeInMillis = TrustedClock.now()
+    val todayDay = cal.get(Calendar.DAY_OF_YEAR); val todayYear = cal.get(Calendar.YEAR)
+    cal.timeInMillis = ms
+    val sameDay = cal.get(Calendar.DAY_OF_YEAR) == todayDay && cal.get(Calendar.YEAR) == todayYear
+    return (if (sameDay) TIME_ONLY_FMT else LAST_SCROLL_FMT).format(Date(ms))
+}
+
 private fun agoText(ms: Long?): String {
     if (ms == null) return "기록 없음"
-    val diffMin = ((System.currentTimeMillis() - ms) / 60_000L).coerceAtLeast(0)
+    val diffMin = ((TrustedClock.now() - ms) / 60_000L).coerceAtLeast(0)
     return when {
         diffMin < 1 -> "방금"
         diffMin < 60 -> "${diffMin}분 전"

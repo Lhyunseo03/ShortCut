@@ -14,7 +14,14 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
+import androidx.compose.material3.TextButton
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import android.widget.Toast
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
@@ -76,7 +83,26 @@ internal fun SettingsDevicesScreen(onBack: () -> Unit, vm: DevicesViewModel = vi
                 )
                 else -> {
                     SectionTitle("이 계정으로 로그인한 기기 ${state.devices.size}대")
-                    state.devices.forEach { DeviceCard(it) }
+                    val context = LocalContext.current
+                    var pendingRemove by remember { mutableStateOf<DeviceItem?>(null) }
+                    state.devices.forEach { DeviceCard(it, onRemove = if (it.isThisDevice) null else { { pendingRemove = it } }) }
+                    pendingRemove?.let { target ->
+                        AlertDialog(
+                            onDismissRequest = { pendingRemove = null },
+                            title = { Text("이 기기를 삭제할까요?", fontWeight = FontWeight.Bold) },
+                            text = { Text("${target.deviceName} 을(를) 계정의 기기 목록에서 지워요. 그 기기에서 다시 로그인하면 다시 등록돼요. 기록은 남아요.") },
+                            // 버튼 순서: 삭제(왼쪽) / 취소(오른쪽)
+                            dismissButton = {
+                                TextButton(onClick = {
+                                    vm.remove(target.deviceId) { err ->
+                                        Toast.makeText(context, err ?: "기기를 삭제했어요", Toast.LENGTH_SHORT).show()
+                                    }
+                                    pendingRemove = null
+                                }) { Text("삭제", color = Color(0xFFC62828)) }
+                            },
+                            confirmButton = { TextButton(onClick = { pendingRemove = null }) { Text("취소") } }
+                        )
+                    }
                 }
             }
             Spacer(Modifier.height(8.dp))
@@ -85,7 +111,7 @@ internal fun SettingsDevicesScreen(onBack: () -> Unit, vm: DevicesViewModel = vi
 }
 
 @Composable
-private fun DeviceCard(device: DeviceItem) {
+private fun DeviceCard(device: DeviceItem, onRemove: (() -> Unit)? = null) {
     Surface(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(16.dp),
@@ -118,7 +144,7 @@ private fun DeviceCard(device: DeviceItem) {
                     device.isThisDevice -> "지금 사용 중"
                     // 생존 신호는 앱 화면이 아니라 보호 서비스가 보낸다 — 앱을 닫아도 계속 오므로 "접속 중" 이 아니라
                     // "보호 중"(= 이 기기에서 Short-Cut 이 동작하고 있음) 으로 표시한다.
-                    device.lastSeenAt != null && System.currentTimeMillis() - device.lastSeenAt < 11 * 60_000L ->
+                    device.lastSeenAt != null && TrustedClock.now() - device.lastSeenAt < 11 * 60_000L ->
                         "보호 중 · ${formatAgo(device.lastSeenAt)} 확인"
                     else -> "마지막 접속 ${formatAgo(device.lastSeenAt)}"
                 },
@@ -131,6 +157,12 @@ private fun DeviceCard(device: DeviceItem) {
                 Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                     if (loggedOutAt != null) StatusBadge("로그아웃됨", fg = Color(0xFF616161), bg = Color(0xFFE0E0E0))
                     if (!device.permissionsOk) StatusBadge("권한 꺼짐", fg = Color(0xFFC62828), bg = Color(0xFFFFEBEE))
+                }
+            }
+            // 다른 기기만 삭제 가능 (이 기기는 로그아웃으로)
+            if (onRemove != null) {
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                    TextButton(onClick = onRemove) { Text("삭제", color = Color(0xFFC62828), fontSize = 13.sp) }
                 }
             }
         }
@@ -152,7 +184,7 @@ private fun StatusBadge(text: String, fg: Color, bg: Color) {
 
 private fun formatAgo(ms: Long?): String {
     if (ms == null) return "기록 없음"
-    val diffMin = ((System.currentTimeMillis() - ms) / 60_000L).coerceAtLeast(0)
+    val diffMin = ((TrustedClock.now() - ms) / 60_000L).coerceAtLeast(0)
     return when {
         diffMin < 1 -> "방금"
         diffMin < 60 -> "${diffMin}분 전"

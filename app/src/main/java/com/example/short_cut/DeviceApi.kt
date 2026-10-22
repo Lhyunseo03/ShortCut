@@ -98,8 +98,8 @@ internal suspend fun clearAccountLocalState(context: Context) {
         .remove(com.example.short_cut.services.ShortCutAccessibilityService.PK_SYNCED_DAILY_COUNT)
         .remove(com.example.short_cut.services.ShortCutAccessibilityService.PK_SYNCED_DAILY_DAY)
         .apply()
-    com.example.short_cut.db.AppDatabase.getDatabase(app).groupLimitDao().deleteAll()
-    com.example.short_cut.db.ScrollCountRepository.get(app).deleteAll()
+    // 스크롤 기록 · 그룹 한도 캐시는 지우지 않는다 — DB 파일이 계정별이라 다음 계정과 섞이지 않고,
+    // 이 계정으로 돌아오면 그대로 이어 쓴다
     HomeTabCache.reset()
     // 접근성 서비스가 메모리에 들고 있는 카운트 · 팝업 단계 · 차단도 바로 초기화
     com.example.short_cut.services.ShortCutAccessibilityService.instance?.notifyUserChanged()
@@ -198,6 +198,7 @@ internal suspend fun registerDevice(context: Context): Boolean {
 
     val res = authedRequest("POST", "/devices/register", body)
     if (!res.ok) return false
+    res.json?.let { TrustedClock.sync(app, it.optLong("serverTime", 0L)) }   // 앱을 켤 때마다 시계 기준점 갱신
     if (nicknameDirty) regPrefs.edit().putBoolean(PK_NICKNAME_DIRTY, false).apply()   // 올라갔음
     res.json?.let { applyServerNickname(app, it) }   // 서버가 닉네임을 돌려주면 반영
     val count = res.json?.optInt("deviceCount", 1) ?: 1
