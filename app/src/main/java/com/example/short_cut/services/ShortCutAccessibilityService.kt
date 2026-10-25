@@ -230,6 +230,7 @@ class ShortCutAccessibilityService : AccessibilityService() {
         groupLimitDao = db.groupLimitDao()
 
         com.example.short_cut.TrustedClock.init(this)
+        com.example.short_cut.AccountWatch.init(this)
         serviceScope.launch {
             initializeOnStart()
         }
@@ -689,8 +690,9 @@ class ShortCutAccessibilityService : AccessibilityService() {
             if (g.dailyLimit > 0 && dailyNow >= g.dailyLimit) {
                 val key = "groupAlert:${g.groupId}:$dateKey:daily"
                 if (!prefs.getBoolean(key, false)) {
+                    // 띄우지 못했으면(다른 팝업이 떠 있음) 기록하지 않는다 → 다음 스크롤에 다시 시도
+                    if (!showGroupAckPopup(g.name, "일간", g.dailyLimit, dailyNow)) return
                     prefs.edit().putBoolean(key, true).apply()
-                    showGroupAckPopup(g.name, "일간", g.dailyLimit, dailyNow)
                     serviceScope.launch { com.example.short_cut.postGroupAlert(g.groupId, "daily", dailyNow) }
                     return   // 한 번에 하나만
                 }
@@ -699,8 +701,8 @@ class ShortCutAccessibilityService : AccessibilityService() {
             if (g.hourlyLimit > 0 && hourlyNow >= g.hourlyLimit) {
                 val key = "groupAlert:${g.groupId}:$dateKey:hourly:$hourKey"
                 if (!prefs.getBoolean(key, false)) {
+                    if (!showGroupAckPopup(g.name, "시간당", g.hourlyLimit, hourlyNow)) return
                     prefs.edit().putBoolean(key, true).apply()
-                    showGroupAckPopup(g.name, "시간당", g.hourlyLimit, hourlyNow)
                     serviceScope.launch { com.example.short_cut.postGroupAlert(g.groupId, "hourly", hourlyNow) }
                     return
                 }
@@ -709,9 +711,40 @@ class ShortCutAccessibilityService : AccessibilityService() {
     }
 
     // 확인 버튼 하나. 차단막 없이 띄워서 뒤 화면 조작은 그대로 되게 한다 ("blocks nothing; it only informs").
-    private suspend fun showGroupAckPopup(groupName: String, kind: String, limit: Int, count: Int) {
+    // 넛지 수신 (G7) — FCM 서비스가 호출. 차단 안내처럼 화면 가운데에 확인 버튼 하나로 띄운다.
+    // 쇼츠를 보고 있지 않아도(홈 화면 · 다른 앱) 접근성 오버레이라 바로 보인다.
+    // 다른 팝업(개인 한도 · 그룹 한도)이 떠 있으면 겹치지 않게 일반 알림으로 보낸다.
+    fun showNudgePopup(data: Map<String, String>) {
+        mainHandler.post {
+            if (popupViews.isNotEmpty()) {
+                Log.d(TAG, "넛지 팝업 보류 — 다른 팝업 표시 중 → 알림으로")
+                com.example.short_cut.GroupNotifications.show(this, "NUDGE", data)
+                return@post
+            }
+            val groupName = data["groupName"].orEmpty().ifBlank { "그룹" }
+            val title = data["title"].orEmpty().ifBlank { "넛지가 왔어요" }
+            val body = data["body"].orEmpty().ifBlank { "구성원이 넛지를 보냈어요" }
+            val view = LayoutInflater.from(this).inflate(R.layout.overlay_popup, null)
+            view.findViewById<TextView>(R.id.popupTitle).text = title
+            view.findViewById<TextView>(R.id.popupMessage).text = groupName + "\n" + body
+            view.findViewById<Button>(R.id.btnStop).apply {
+                text = "확인"
+                setOnClickListener { dismissAllPopups() }
+            }
+            val ignore = view.findViewById<Button>(R.id.btnIgnore)
+            (ignore.parent as? View)?.visibility = View.GONE
+            addPopupView(view, standardCenterParams(280))
+            Log.d(TAG, "넛지 팝업 — $groupName: $body")
+        }
+    }
+
+    // 띄웠으면 true. 다른 팝업(개인 한도 · 차단 안내)이 떠 있으면 false — 호출부가 다음 스크롤에 다시 시도한다.
+    private suspend fun showGroupAckPopup(groupName: String, kind: String, limit: Int, count: Int): Boolean =
         withContext(Dispatchers.Main) {
-            if (popupViews.isNotEmpty()) return@withContext   // 다른 팝업이 떠 있으면 다음 기회에
+            if (popupViews.isNotEmpty()) {
+                Log.d(TAG, "그룹 한도 팝업 보류 — 다른 팝업 표시 중 ($groupName $kind $count/$limit)")
+                return@withContext false
+            }
             val view = LayoutInflater.from(this@ShortCutAccessibilityService).inflate(R.layout.overlay_popup, null)
             view.findViewById<TextView>(R.id.popupTitle).text = "그룹 한도를 넘었어요"
             view.findViewById<TextView>(R.id.popupMessage).text =
@@ -725,8 +758,8 @@ class ShortCutAccessibilityService : AccessibilityService() {
             (ignore.parent as? View)?.visibility = View.GONE
             addPopupView(view, standardCenterParams(280), withScrim = false)
             Log.d(TAG, "그룹 한도 팝업 — $groupName $kind $count/$limit")
+            true
         }
-    }
 
     // 한도 검사 — 현재 카운트를 한도와 비교(≥)해서 필요하면 팝업을 띄운다. 팝업을 띄웠으면 true.
     // 스크롤할 때마다 호출되고, 카운트가 다른 경로(서버 동기화 등)로 바뀐 직후에도 그대로 호출할 수 있다.
@@ -1749,49 +1782,8 @@ class ShortCutAccessibilityService : AccessibilityService() {
     //   승격 대상(pendingEffectiveAt 도달)이 있으면 승격 후 새 한도를 서버에 push.
     //   없으면 기존과 동일하게 로컬 정렬만 한다.
     private suspend fun promoteAndSyncLimit(userId: String) {
-        val now = com.example.short_cut.TrustedClock.now()
-        val limit = userLimitDao.getLimit(userId) ?: return
-
-        val effectiveAt = limit.pendingEffectiveAt
-        val willPromote = effectiveAt != null && effectiveAt <= now
-        val promotedHourly = limit.pendingHourlyLimit ?: limit.hourlyLimit
-        val promotedDaily  = limit.pendingDailyLimit  ?: limit.dailyLimit
-
-        // 로컬 승격 — 기존 동작 그대로
-        userLimitDao.promoteExpiredPending(now)
-
-        // 승격이 실제로 일어난 경우에만 서버 동기화 (네트워크는 serviceScope 로 분리)
-        if (willPromote) {
-            serviceScope.launch { pushLimitToServer(userId, promotedHourly, promotedDaily) }
-        }
-    }
-
-    // POST /limits/:userId — 승격된 "현재 적용 한도"를 서버에 반영 (finalizeStats 와 동일 패턴)
-    private suspend fun pushLimitToServer(userId: String, hourlyLimitSnap: Int, dailyLimitSnap: Int) {
-        if (userId == "unknown") return   // 미로그인이면 전송하지 않음
-        try {
-            val token = getFirebaseToken() ?: run {
-                Log.e(TAG, "limit 동기화 실패 — 토큰 없음")
-                return
-            }
-            val json = """{"hourlyLimit":$hourlyLimitSnap,"dailyLimit":$dailyLimitSnap}"""
-            val client = okhttp3.OkHttpClient.Builder()
-                .connectTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
-                .readTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
-                .writeTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
-                .build()
-            val body = json.toRequestBody("application/json".toMediaType())
-            val request = okhttp3.Request.Builder()
-                .url("https://short-cut-server-production.up.railway.app/limits/$userId")
-                .addHeader("Authorization", "Bearer $token")
-                .post(body)
-                .build()
-            val response = client.newCall(request).execute()
-            Log.d(TAG, "limit 동기화 전송 완료 — code=${response.code}")
-            response.close()
-        } catch (e: Exception) {
-            Log.e(TAG, "limit 동기화 전송 실패 — ${e.message}")
-        }
+        // 서버에 먼저 물어 승격한 값을 받고, 안 되면 로컬 승격 후 올린다 (LimitSync.kt)
+        com.example.short_cut.promoteAndSyncLimit(this, userLimitDao, userId)
     }
 
     // ── userlog pending 큐 (prefs 영속) ───────────────────────
@@ -2008,6 +2000,11 @@ class ShortCutAccessibilityService : AccessibilityService() {
                 dailyCount = dailyTotal + unsentTodayCount()
             }
             otherDevicesLastHour = json.optInt("otherDevicesLastHour", 0).coerceAtLeast(0)
+            // 다른 기기에서 바꾼 한도·예약 반영 — 단계 계산 전에 먼저 (한도가 바뀌면 단계 기준도 바뀐다)
+            if (com.example.short_cut.applyServerLimits(this, userLimitDao, userId, json.optJSONObject("limits"))) {
+                userLimitDao.getLimit(userId)?.let { hourlyLimit = it.hourlyLimit; dailyLimit = it.dailyLimit }
+                Log.d(TAG, "/sync limits 적용 — hourly=$hourlyLimit daily=$dailyLimit")
+            }
             // 지금 카운트로 도달 가능한 단계 — 서버의 milestone 값이 이보다 높으면 낡은 값(다른 시간대 창 · 어제)이다
             val hourlyNowCombined = scrollCounts.hourlyCount(now) + otherDevicesLastHour
             val hourlyStageNow = stageOf(hourlyNowCombined, hourlyLimit, HOURLY_STEP)

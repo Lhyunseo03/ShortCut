@@ -39,8 +39,12 @@ private val apiClient: OkHttpClient by lazy {
 internal suspend fun authedRequest(method: String, path: String, body: JSONObject? = null): ApiResult =
     withContext(Dispatchers.IO) {
         try {
-            val token = FirebaseAuth.getInstance().currentUser?.getIdToken(false)?.await()?.token
-                ?: return@withContext ApiResult(0, null)
+            val token = try {
+                FirebaseAuth.getInstance().currentUser?.getIdToken(false)?.await()?.token
+            } catch (e: Exception) {
+                AccountWatch.onInvalidUser(e)   // 다른 기기에서 탈퇴한 계정이면 이 기기도 로그아웃
+                throw e
+            } ?: return@withContext ApiResult(0, null)
             val reqBody = (body ?: JSONObject()).toString().toRequestBody("application/json".toMediaType())
             val builder = Request.Builder()
                 .url("$SERVER_BASE_URL$path")
@@ -67,7 +71,7 @@ internal suspend fun authedRequest(method: String, path: String, body: JSONObjec
 internal fun localNickname(context: Context): String {
     val prefs = context.getSharedPreferences("short_cut_prefs", Context.MODE_PRIVATE)
     val user = FirebaseAuth.getInstance().currentUser
-    return prefs.getString("nickname", null)?.takeIf { it.isNotBlank() }
+    return prefs.getString("nickname", null)?.takeIf { it.isNotBlank() && it != "null" }   // "null" = 예전 버그로 저장된 값
         ?: user?.displayName?.takeIf { it.isNotBlank() }
         ?: user?.email?.substringBefore('@')
         ?: ""
@@ -154,11 +158,13 @@ internal fun saveNicknameLocally(context: Context, nickname: String) {
 // 서버에 보낼 닉네임 — 사용자가 직접 정한 값만. 없으면 빈 문자열(서버는 빈 값을 무시하고 기존 값을 유지한다)
 internal fun explicitNickname(context: Context): String =
     context.applicationContext.getSharedPreferences("short_cut_prefs", Context.MODE_PRIVATE)
-        .getString(PK_NICKNAME, null)?.takeIf { it.isNotBlank() } ?: ""
+        .getString(PK_NICKNAME, null)?.takeIf { it.isNotBlank() && it != "null" } ?: ""
 
 // 서버 응답의 nickname 을 로컬에 반영. 바뀌었으면 true. 이 기기에서 바꾼 값이 아직 안 올라갔으면(dirty) 건드리지 않는다.
 internal fun applyServerNickname(context: Context, json: JSONObject): Boolean {
-    val name = json.optString("nickname").takeIf { it.isNotBlank() } ?: return false
+    // 서버는 닉네임이 없으면 null 을 준다. optString 은 그걸 "null" 글자로 바꿔 주므로 먼저 거른다.
+    if (!json.has("nickname") || json.isNull("nickname")) return false
+    val name = json.optString("nickname").takeIf { it.isNotBlank() && it != "null" } ?: return false
     val prefs = context.applicationContext.getSharedPreferences("short_cut_prefs", Context.MODE_PRIVATE)
     if (prefs.getBoolean(PK_NICKNAME_DIRTY, false)) return false
     if (prefs.getString(PK_NICKNAME, null) == name) return false

@@ -38,12 +38,22 @@ class ShortCutMessagingService : FirebaseMessagingService() {
                 if (service == null) Log.d(TAG, "FLUSH 무시 — 접근성 서비스 미실행")
                 else service.flushFromRemote()
             }
+            // 계정이 다른 기기에서 탈퇴됨 (서버에 요청해 둔 푸시) → 이 기기도 바로 로그아웃
+            "ACCOUNT_DELETED" -> com.example.short_cut.appScope.launch {
+                com.example.short_cut.AccountWatch.forceLogout(applicationContext)
+            }
             "COUNT_UPDATED" -> {
                 val service = ShortCutAccessibilityService.instance
                 if (service == null) Log.d(TAG, "COUNT_UPDATED 무시 — 접근성 서비스 미실행")
                 else service.syncFromRemote()
             }
-            // 그룹 알림 (한도 초과 · 넛지 · 제안/결과 · 가입/탈퇴/로그아웃) → 종류별 채널로 알림 표시, 누르면 그 그룹 상세로
+            // 넛지 (G7) → 차단 안내처럼 화면 가운데 팝업. 접근성 서비스가 없으면 일반 알림으로
+            "NUDGE" -> {
+                val service = ShortCutAccessibilityService.instance
+                if (service == null) com.example.short_cut.GroupNotifications.show(applicationContext, type, message.data)
+                else service.showNudgePopup(message.data)
+            }
+            // 그룹 알림 (한도 초과 · 제안/결과 · 가입/탈퇴/로그아웃) → 종류별 채널로 알림 표시, 누르면 그 그룹 상세로
             in com.example.short_cut.GroupNotifications.KNOWN_TYPES ->
                 com.example.short_cut.GroupNotifications.show(applicationContext, type!!, message.data)
             else -> Log.w(TAG, "알 수 없는 FCM type: $type")

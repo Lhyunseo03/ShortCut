@@ -683,6 +683,11 @@ private fun GroupDetailScreen(
                         Text(g.description, fontSize = 15.sp, color = SubInk)
                     }
                     InfoRow("현재 한도", "일 ${g.dailyLimit} / 시 ${g.hourlyLimit}")
+                    // 투표로 통과한 한도 — 월요일 0시에 서버가 적용 (G9)
+                    if (g.pendingDaily != null || g.pendingHourly != null) {
+                        val from = g.pendingEffectiveAt?.let { " (${LAST_SCROLL_FMT.format(Date(it)).substringBefore(' ')}부터)" } ?: ""
+                        InfoRow("다음 주 한도", "일 ${g.pendingDaily ?: g.dailyLimit} / 시 ${g.pendingHourly ?: g.hourlyLimit}$from")
+                    }
                     InfoRow("찬성률", "${g.voteThreshold}%")
                     InfoRow("인원", "${g.memberCount}/${g.maxMembers}")
 
@@ -705,7 +710,7 @@ private fun GroupDetailScreen(
                         )
                         val isMe = m.userId == myId
                         MemberRow(
-                            rank = i + 1, member = shown, group = g,
+                            rank = i + 1, member = shown, group = g, isMe = isMe,
                             onClick = { onOpenMember(g, shown, isMe) },
                             onNudge = if (isMe) null else {
                                 {
@@ -790,6 +795,7 @@ private fun MemberRow(
     rank: Int,
     member: GroupMember,
     group: GroupSummary,
+    isMe: Boolean = false,
     onClick: () -> Unit = {},
     onNudge: (() -> Unit)? = null    // null = 내 행 (넛지 불가)
 ) {
@@ -806,26 +812,41 @@ private fun MemberRow(
         ) {
             Text(text = "$rank", fontSize = 15.sp, fontWeight = FontWeight.Bold, color = SubInk, modifier = Modifier.width(24.dp))
             Column(modifier = Modifier.weight(1f)) {
-                Text(
-                    text = member.nickname,
-                    fontSize = 16.sp,
-                    fontWeight = FontWeight.SemiBold,
-                    color = Ink,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        text = member.nickname,
+                        fontSize = 16.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = Ink,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f, fill = false)
+                    )
+                    // 상태 배지 — 문제가 있을 때만 (G10 로그아웃 / G11 권한 꺼짐). Devices 화면과 같은 색
+                    if (member.loggedOut) {
+                        Spacer(Modifier.width(6.dp))
+                        SmallBadge("로그아웃", fg = Color(0xFF616161), bg = Color(0xFFE0E0E0))
+                    } else if (member.permissionsOk == false) {
+                        Spacer(Modifier.width(6.dp))
+                        SmallBadge("권한 꺼짐", fg = OverRed, bg = Color(0xFFFFEBEE))
+                    }
+                }
                 Text(
                     text = "접속 ${agoText(member.lastSeenAt)} · 마지막 스크롤 ${lastScrollText(member.lastScrollAt)}",
                     fontSize = 12.sp,
                     color = SubInk
                 )
             }
-            if (overHourly) {
-                // 벨 = 지금 몰아 보는 중. 누르면 넛지 (G7). 내 행은 표시만.
+            if (isMe) {
+                // 내 행 — 벨 자리에 "(나)". 나한테는 넛지를 못 보낸다.
+                Text(text = "(나)", fontSize = 13.sp, color = SubInk)
+                Spacer(Modifier.width(8.dp))
+            } else if (overHourly) {
+                // 벨 = 지금 몰아 보는 중. 누르면 넛지 (G7).
                 IconButton(onClick = { onNudge?.invoke() }, enabled = onNudge != null, modifier = Modifier.size(32.dp)) {
                     Icon(
                         Icons.Filled.Notifications,
-                        contentDescription = if (onNudge != null) "넛지 보내기" else "시간당 한도 초과 중",
+                        contentDescription = "넛지 보내기",
                         tint = OverRed,
                         modifier = Modifier.size(22.dp)
                     )
@@ -839,6 +860,14 @@ private fun MemberRow(
                 color = if (overDaily) OverRed else OkGreen
             )
         }
+    }
+}
+
+@Composable
+private fun SmallBadge(text: String, fg: Color, bg: Color) {
+    Surface(shape = RoundedCornerShape(6.dp), color = bg) {
+        Text(text = text, fontSize = 10.sp, fontWeight = FontWeight.SemiBold, color = fg,
+            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp))
     }
 }
 

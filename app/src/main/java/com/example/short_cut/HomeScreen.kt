@@ -217,7 +217,7 @@ internal fun HomeTabContent() {
     // (전에는 30초 루프 안에서 /sync 응답을 기다린 뒤에 읽어서, 그동안 기본값 100/50 이 보였음)
     LaunchedEffect(userId) {
         if (userId == null) return@LaunchedEffect
-        promoteAndSyncLimit(db, userId)
+        promoteAndSyncLimit(context, db.userLimitDao(), userId)
         db.userLimitDao().getLimit(userId)?.let {
             dailyLimit = it.dailyLimit
             hourlyLimit = it.hourlyLimit
@@ -259,6 +259,7 @@ internal fun HomeTabContent() {
                     TrustedClock.sync(context, j.optLong("serverTime", 0L))
                     applyServerAppMode(context, j)   // 다른 기기에서 바꾼 모드 반영
                     applyServerNickname(context, j)  // 다른 기기에서 바꾼 닉네임 반영
+                    applyServerLimits(context, db.userLimitDao(), userId, j.optJSONObject("limits"))   // 한도·예약
                     val dailyTotal = j.optInt("dailyTotal", -1)
                     if (dailyTotal >= 0) todayCount = maxOf(todayCount, dailyTotal)
                     lastHourCount = localHour + j.optInt("otherDevicesLastHour", 0).coerceAtLeast(0)
@@ -270,7 +271,7 @@ internal fun HomeTabContent() {
                 // 만료된 pending 먼저 promote 해서 오늘 적용되는 값으로 정렬
                 // [변경됨] promoteExpiredPending → promoteAndSyncLimit:
                 //   승격(새 한도 적용)이 일어나는 그 순간 서버에도 새 값을 동기화한다.
-                promoteAndSyncLimit(db, userId)
+                promoteAndSyncLimit(context, db.userLimitDao(), userId)
                 db.userLimitDao().getLimit(userId)?.let {
                     dailyLimit = it.dailyLimit
                     hourlyLimit = it.hourlyLimit

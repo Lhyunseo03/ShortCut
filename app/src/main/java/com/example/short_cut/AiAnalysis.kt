@@ -134,7 +134,7 @@ internal fun AiAnalysisContent(
         }
         try {
             // [변경됨] promoteExpiredPending → promoteAndSyncLimit (승격 시 서버 동기화 포함)
-            promoteAndSyncLimit(db, userId)
+            promoteAndSyncLimit(context, db.userLimitDao(), userId)
             val limit = db.userLimitDao().getLimit(userId)
             val dailyLimit = limit?.dailyLimit ?: 0
             val hourlyLimit = limit?.hourlyLimit ?: 0

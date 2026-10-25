@@ -102,7 +102,7 @@ internal val appScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 // HOME: 로그인됨 + 접근성 권한 켜짐 → 실질 홈 화면
 // LIMIT_SETUP: 로그인됨 + 아직 한도 미설정 → 한도 설정(온보딩) 화면. 설정 전엔 못 넘어감.
 enum class Screen {
-    LOGIN, LIMIT_SETUP, ACCESSIBILITY_GUIDE, HOME
+    LOGIN, NICKNAME_SETUP, LIMIT_SETUP, ACCESSIBILITY_GUIDE, HOME
 }
 
 class MainActivity : ComponentActivity() {
@@ -121,6 +121,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         TrustedClock.init(this)
+        AccountWatch.init(this)
         openWeeklyReport.value = intent?.getBooleanExtra(EXTRA_OPEN_WEEKLY_REPORT, false) == true
         handleInviteLink(intent)
         handleGroupOpen(intent)
@@ -179,6 +180,8 @@ fun AppRoot(openWeeklyReport: MutableState<Boolean> = remember { mutableStateOf(
         return when {
             auth.currentUser == null || uid == null -> Screen.LOGIN
             // 가입 직후(한도 미설정)면 한도 설정 화면으로 — 설정해야만 다음 단계로. 사용자별 플래그로 판단.
+            // 가입 직후 닉네임부터 — 그룹 순위표·알림에 보이는 이름. 기존 사용자는 화면 안에서 서버 닉네임을 확인하고 건너뛴다.
+            !prefs.getBoolean("nicknameSet_$uid", false) -> Screen.NICKNAME_SETUP
             !prefs.getBoolean("limitSet_$uid", false) -> Screen.LIMIT_SETUP
             // 접근성·사용통계·오버레이 셋 중 하나라도 OFF 면 권한 안내로 — 셋 다 켜야 우회 차단 안전망 완성.
             // 오버레이('다른 앱 위에 표시')가 없으면 접근성 OFF 시 가드가 홈으로 못 보냄(백그라운드 액티비티 시작 제한).
@@ -188,6 +191,8 @@ fun AppRoot(openWeeklyReport: MutableState<Boolean> = remember { mutableStateOf(
     }
 
     var currentScreen by remember { mutableStateOf(resolveScreen()) }
+    // 강제 로그아웃(다른 기기에서 탈퇴) 이 일어나면 화면을 다시 고른다 → LOGIN
+    LaunchedEffect(AccountWatch.version.intValue) { currentScreen = resolveScreen() }
 
     // 앱 시작 시 기기 등록 갱신 (lastSeen · FCM 토큰 · 권한 상태 · deviceCount). 미로그인이면 아무것도 안 함.
     LaunchedEffect(Unit) {
@@ -199,6 +204,8 @@ fun AppRoot(openWeeklyReport: MutableState<Boolean> = remember { mutableStateOf(
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
                 currentScreen = resolveScreen()
+                // 다른 기기에서 탈퇴한 계정이면 여기서 걸러 로그인 화면으로 (AccountWatch)
+                if (auth.currentUser != null) appScope.launch { AccountWatch.checkAlive(context) }
                 // 사용 통계 권한이 있으면 GuardForegroundService 시작(이미 실행 중이면 무시)
                 // — 접근성 OFF 우회 차단용. 권한이 없으면 그냥 패스.
                 startGuardServiceIfReady(context)
@@ -215,6 +222,9 @@ fun AppRoot(openWeeklyReport: MutableState<Boolean> = remember { mutableStateOf(
     when (currentScreen) {
         Screen.LOGIN -> LoginScreen(
             onLoginSuccess = { currentScreen = resolveScreen() }
+        )
+        Screen.NICKNAME_SETUP -> NicknameOnboardingScreen(
+            onDone = { currentScreen = resolveScreen() }
         )
         Screen.LIMIT_SETUP -> LimitOnboardingScreen(
             onDone = { currentScreen = resolveScreen() }

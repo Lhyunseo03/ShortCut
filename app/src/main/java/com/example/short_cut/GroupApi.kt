@@ -41,7 +41,11 @@ internal data class GroupSummary(
     val voteThreshold: Int,
     val memberCount: Int,
     val maxMembers: Int,
-    val myTodayCount: Int?      // GET /groups 에서만 옴. 없으면 호출부가 로컬 카운트로 대체
+    val myTodayCount: Int?,     // GET /groups 에서만 옴. 없으면 호출부가 로컬 카운트로 대체
+    // 투표 통과 후 다음 주 월요일 적용 대기 한도 (서버 6-1: pendingGoal { dailyLimit, hourlyLimit, effectiveAt }). 없으면 null
+    val pendingDaily: Int? = null,
+    val pendingHourly: Int? = null,
+    val pendingEffectiveAt: Long? = null
 )
 
 internal data class GroupMember(
@@ -50,7 +54,9 @@ internal data class GroupMember(
     val todayCount: Int,
     val lastHourCount: Int,
     val lastSeenAt: Long?,
-    val lastScrollAt: Long?
+    val lastScrollAt: Long?,
+    val loggedOut: Boolean = false,       // 기기가 전부 로그아웃 (G10)
+    val permissionsOk: Boolean? = null    // 로그인 기기 중 권한 꺼진 게 있으면 false (G11). 모르면 null
 )
 
 internal data class GroupList(val groups: List<GroupSummary>, val maxGroups: Int)
@@ -76,6 +82,10 @@ private fun JSONObject.groupIdOrEmpty(): String {
     return ""
 }
 
+// org.json 의 optString 은 JSON null 을 "null" 글자로 주므로, 문자열은 전부 이걸로 읽는다
+private fun JSONObject.str(key: String): String =
+    if (has(key) && !isNull(key)) optString(key) else ""
+
 private fun JSONObject.optLongOrNull(key: String): Long? =
     if (has(key) && !isNull(key)) optLong(key).takeIf { it > 0 } else null
 
@@ -86,8 +96,8 @@ private fun parseSummary(raw: JSONObject): GroupSummary {
     val goal = o.optJSONObject("goal") ?: o.optJSONObject("limits")
     return GroupSummary(
         groupId = o.groupIdOrEmpty(),
-        name = o.optString("name"),
-        description = o.optString("description"),
+        name = o.str("name"),
+        description = o.str("description"),
         dailyLimit = goal?.optInt("dailyLimit", 0)?.takeIf { it > 0 } ?: o.optInt("dailyLimit", 0),
         hourlyLimit = goal?.optInt("hourlyLimit", 0)?.takeIf { it > 0 } ?: o.optInt("hourlyLimit", 0),
         // 서버는 approvalRate 로 내려줌. 옛 이름(voteThreshold)도 혹시 몰라 같이 읽음
@@ -95,7 +105,10 @@ private fun parseSummary(raw: JSONObject): GroupSummary {
         memberCount = o.optInt("memberCount", 0).takeIf { it > 0 }
             ?: raw.optJSONArray("members")?.length() ?: o.optJSONArray("memberIds")?.length() ?: 0,
         maxMembers = o.optInt("maxMembers", MAX_MEMBERS_DEFAULT),
-        myTodayCount = if (o.has("myTodayCount")) o.optInt("myTodayCount") else null
+        myTodayCount = if (o.has("myTodayCount")) o.optInt("myTodayCount") else null,
+        pendingDaily = o.optJSONObject("pendingGoal")?.optInt("dailyLimit", 0)?.takeIf { it > 0 },
+        pendingHourly = o.optJSONObject("pendingGoal")?.optInt("hourlyLimit", 0)?.takeIf { it > 0 },
+        pendingEffectiveAt = o.optJSONObject("pendingGoal")?.optLongOrNull("effectiveAt")
     )
 }
 
@@ -106,12 +119,14 @@ private fun parseMembers(o: JSONObject): List<GroupMember> {
         GroupMember(
             userId = m.optString("userId"),
             // 서버가 nickname / name / displayName 중 무엇으로 주든 받는다
-            nickname = m.optString("nickname").ifBlank { m.optString("name") }.ifBlank { m.optString("displayName") }
+            nickname = m.str("nickname").ifBlank { m.str("name") }.ifBlank { m.str("displayName") }
                 .ifBlank { "이름 없음" },
             todayCount = m.optInt("todayCount", 0),
             lastHourCount = m.optInt("lastHourCount", 0),
             lastSeenAt = m.optLongOrNull("lastSeenAt"),
-            lastScrollAt = m.optLongOrNull("lastScrollAt")
+            lastScrollAt = m.optLongOrNull("lastScrollAt"),
+            loggedOut = m.optBoolean("loggedOut", false),
+            permissionsOk = if (m.has("permissionsOk") && !m.isNull("permissionsOk")) m.optBoolean("permissionsOk") else null
         )
     }
 }
@@ -303,7 +318,7 @@ internal suspend fun fetchMemberDetail(groupId: String, userId: String): GroupRe
     return GroupResult(
         MemberDetail(
             userId = o.optString("userId", userId),
-            nickname = o.optString("nickname").ifBlank { o.optString("displayName") }.ifBlank { "이름 없음" },
+            nickname = o.str("nickname").ifBlank { o.str("displayName") }.ifBlank { "이름 없음" },
             todayCount = o.optInt("todayCount", 0),
             lastHourCount = o.optInt("lastHourCount", 0),
             todayPopups = o.optInt("todayPopups", 0),
@@ -321,7 +336,7 @@ private fun parseProposal(p: JSONObject?): Proposal? {
     return Proposal(
         proposalId = id,
         proposedBy = p.optString("proposedBy"),
-        proposedByName = p.optString("proposedByName").ifBlank { "구성원" },
+        proposedByName = p.str("proposedByName").ifBlank { "구성원" },
         dailyLimit = goal?.optInt("dailyLimit", 0)?.takeIf { it > 0 } ?: p.optInt("dailyLimit", 0),
         hourlyLimit = goal?.optInt("hourlyLimit", 0)?.takeIf { it > 0 } ?: p.optInt("hourlyLimit", 0),
         createdAt = p.optLong("createdAt", 0L),

@@ -141,14 +141,13 @@ fun LoginScreen(onLoginSuccess: () -> Unit = {}) {
                     appScope.launch {
                         // 다중 기기 — 이 기기를 서버에 등록(FCM 토큰 포함). 실패해도 다음 앱 시작 때 재시도됨.
                         registerDevice(context)
-                        val limits = fetchLimitsFromServer(userId)
+                        val limits = fetchServerLimits(userId)
                         if (limits != null) {
-                            val (h, d) = limits
-                            AppDatabase.getDatabase(context).userLimitDao()
-                                .insert(UserLimit(userId = userId, hourlyLimit = h, dailyLimit = d))
+                            // 현재값 + 다음 주 예약까지 그대로 받는다 (다른 기기에서 건 예약 포함)
+                            applyServerLimits(context, AppDatabase.getDatabase(context).userLimitDao(), userId, limits)
                             // 서버에 이미 한도가 있으면 기존 사용자 → 한도 설정(온보딩) 건너뜀
                             prefs.edit().putBoolean("limitSet_$userId", true).apply()
-                            Log.d("Auth", "서버 limit 동기화 — hourly=$h, daily=$d")
+                            Log.d("Auth", "서버 limit 동기화 — $limits")
                         } else {
                             Log.w("Auth", "서버 limit 동기화 실패 — 신규 사용자면 온보딩에서 설정")
                         }
@@ -224,6 +223,116 @@ fun LoginScreen(onLoginSuccess: () -> Unit = {}) {
     }
 }
 
+// 닉네임 설정(온보딩) 화면 — 가입 직후, 한도 설정보다 먼저.
+// 그룹 순위표·구성원 상세·그룹 알림에 다른 사람에게 보이는 이름이라 처음에 꼭 정하게 한다.
+//   - 이 기기에 닉네임이 있으면(설정에서 저장) 바로 건너뜀
+//   - 없으면 서버에 물어본다(/sync 의 nickname). 다른 기기에서 정한 닉네임이 있으면 받아서 건너뜀
+//   - 둘 다 없으면 입력 화면. 구글 계정 이름을 미리 넣어 두고, 1~20자(서버 규칙)만 받는다
+//   - 저장 → 로컬 저장 + /devices/register 로 서버 업로드 → users/{uid}.nickname
+@Composable
+fun NicknameOnboardingScreen(onDone: () -> Unit = {}) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val prefs = remember { context.getSharedPreferences("short_cut_prefs", Context.MODE_PRIVATE) }
+    val userId = remember { prefs.getString("userId", null) }
+    val user = remember { FirebaseAuth.getInstance().currentUser }
+
+    var checking by remember { mutableStateOf(true) }
+    var saving by remember { mutableStateOf(false) }
+    var draft by remember {
+        mutableStateOf(user?.displayName?.takeIf { it.isNotBlank() } ?: user?.email?.substringBefore('@').orEmpty())
+    }
+
+    fun markDone() {
+        if (userId != null) prefs.edit().putBoolean("nicknameSet_$userId", true).apply()
+        onDone()
+    }
+
+    // 뒤로가기로 빠져나가지 못하게 (한도 설정과 같은 규칙)
+    BackHandler(enabled = true) { }
+
+    LaunchedEffect(userId) {
+        if (userId == null) { onDone(); return@LaunchedEffect }
+        // 1) 이 기기에 이미 있음
+        if (explicitNickname(context).isNotBlank()) { markDone(); return@LaunchedEffect }
+        // 2) 서버에 있음 (다른 기기에서 정함) — 받아서 건너뜀
+        val res = authedRequest("GET", "/sync?deviceId=${DeviceId.get(context)}")
+        res.json?.let { applyServerNickname(context, it) }
+        if (explicitNickname(context).isNotBlank()) { markDone(); return@LaunchedEffect }
+        // 3) 신규 사용자 → 직접 입력
+        checking = false
+    }
+
+    if (checking) {
+        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            CircularProgressIndicator(modifier = Modifier.size(36.dp), strokeWidth = 3.dp, color = Color(0xFF4FC3F7))
+        }
+        return
+    }
+
+    val trimmed = draft.trim()
+    val valid = trimmed.isNotEmpty() && trimmed.length <= 20
+
+    Column(modifier = Modifier.fillMaxSize()) {
+        Column(
+            modifier = Modifier
+                .weight(1f)
+                .fillMaxWidth()
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 24.dp, vertical = 24.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp)
+        ) {
+            Text(
+                text = "닉네임 설정",
+                fontSize = 26.sp,
+                fontWeight = FontWeight.ExtraBold,
+                color = Color(0xFF1A1A1A)
+            )
+            Text(
+                text = "그룹에서 다른 구성원에게 보이는 이름이에요.\n나중에 설정에서 바꿀 수 있어요.",
+                fontSize = 14.sp,
+                color = Color(0xFF888888),
+                lineHeight = 21.sp
+            )
+
+            Spacer(Modifier.height(8.dp))
+
+            SectionTitle("닉네임")
+            OutlinedTextField(
+                value = draft,
+                onValueChange = { if (it.length <= 20) draft = it },
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = true,
+                placeholder = { Text("1~20자") },
+                supportingText = { Text("${trimmed.length}/20", color = Color(0xFF888888)) }
+            )
+        }
+
+        Box(modifier = Modifier.padding(horizontal = 24.dp, vertical = 16.dp)) {
+            Button(
+                onClick = {
+                    if (!valid) return@Button
+                    saving = true
+                    saveNicknameLocally(context, trimmed)   // 로컬 저장 + 서버 업로드 대기(dirty)
+                    scope.launch {
+                        registerDevice(context)             // dirty 닉네임을 /devices/register 로 올린다
+                        saving = false
+                        markDone()
+                    }
+                },
+                enabled = valid && !saving,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(52.dp),
+                shape = RoundedCornerShape(12.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1A1A1A))
+            ) {
+                Text(if (saving) "저장 중..." else "다음", fontWeight = FontWeight.Bold)
+            }
+        }
+    }
+}
+
 // 한도 설정(온보딩) 화면 — 가입 직후 진입. 한도를 정해야만 다음 단계로 넘어갈 수 있다(건너뛰기 불가).
 // 여기서 정한 한도는 "다음 주 월요일부터"가 아니라 즉시 적용된다(pending 없이 현재값으로 저장 + 서버 push).
 // 기존 사용자(다른 기기/재설치)는 로컬 또는 서버에 이미 한도가 있으므로 자동으로 건너뜀.
@@ -252,10 +361,9 @@ fun LimitOnboardingScreen(onDone: () -> Unit = {}) {
             onDone(); return@LaunchedEffect
         }
         // 2) 서버에 한도가 있으면(기존 사용자) 받아와서 건너뜀
-        val server = fetchLimitsFromServer(userId)
+        val server = fetchServerLimits(userId)
         if (server != null) {
-            val (h, d) = server
-            db.userLimitDao().insert(UserLimit(userId = userId, hourlyLimit = h, dailyLimit = d))
+            applyServerLimits(context, db.userLimitDao(), userId, server)
             prefs.edit().putBoolean("limitSet_$userId", true).apply()
             onDone(); return@LaunchedEffect
         }
@@ -325,7 +433,8 @@ fun LimitOnboardingScreen(onDone: () -> Unit = {}) {
                             )
                         )
                         // 이번 주 통계가 새 한도 기준으로 계산되도록 서버에 즉시 반영
-                        pushLimitToServer(userId, draftHourly, draftDaily)
+                        markLimitDirty(context)
+                        pushLocalLimits(context, db.userLimitDao(), userId)
                         prefs.edit().putBoolean("limitSet_$userId", true).apply()
                         onDone()
                     }

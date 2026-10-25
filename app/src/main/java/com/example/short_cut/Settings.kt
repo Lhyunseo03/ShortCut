@@ -407,6 +407,14 @@ internal fun SettingsAccountScreen(onBack: () -> Unit, onAuthChanged: () -> Unit
                         }
                         isDeleting = true
                         scope.launch {
+                            // 서버 DELETE /users 는 그룹 멤버 문서를 지우지 않는다 → 계정만 사라지고 그룹에 유령 구성원이 남아
+                            //   투표 분모에 계속 끼고, 마지막 구성원이면 그룹도 안 사라진다. 그래서 삭제 전에 그룹을 먼저 전부 탈퇴한다.
+                            //   그리고 /logout 으로 이 계정의 기기들을 로그아웃 처리 → 삭제 뒤에도 그룹 알림이 이 폰에 오지 않게.
+                            fetchGroups().value?.groups?.forEach { g ->
+                                val r = leaveGroup(g.groupId)
+                                android.util.Log.d("Settings", "탈퇴 전 그룹 나가기 ${g.name} → ${r.error ?: "ok"}")
+                            }
+                            authedRequest("POST", "/logout", org.json.JSONObject().put("deviceId", DeviceId.get(context)))
                             val ok = deleteAccountOnServer(user.uid)
                             if (ok) {
                                 com.example.short_cut.db.AppDatabase.deleteUserDatabase(context, user.uid)   // 이 계정의 로컬 DB 파일 삭제
@@ -509,9 +517,9 @@ internal fun SettingsLimitScreen(
 
     LaunchedEffect(userId) {
         if (userId != null) {
-            // 만료된 pending 먼저 승격
-            // [변경됨] promoteExpiredPending → promoteAndSyncLimit (승격 시 서버 동기화 포함)
-            promoteAndSyncLimit(db, userId)
+            // 만료된 pending 먼저 승격 (서버 먼저) → 다른 기기에서 건 예약이 있으면 받아서 화면에 보여 준다
+            promoteAndSyncLimit(context, db.userLimitDao(), userId)
+            fetchServerLimits(userId)?.let { applyServerLimits(context, db.userLimitDao(), userId, it) }
             val limit = db.userLimitDao().getLimit(userId)
             if (limit != null) {
                 currentHourly = limit.hourlyLimit
@@ -659,13 +667,16 @@ internal fun SettingsLimitScreen(
                                 pendingEffectiveAt = effectiveAt
                             )
                         )
-                        // [변경됨] 예전엔 여기서 pushLimitToServer(draft...) 로 새 값을 즉시 서버에 보냈다.
-                        //   하지만 새 한도는 다음 주 월요일부터 적용인데 서버가 미리 새 값을 갖게 되어,
-                        //   오늘(이번 주) 통계가 아직 적용 안 된 한도로 계산되는 버그가 있었다.
-                        // → 즉시 push 제거. 서버 동기화는 pending 이 실제로 승격되는 시점에
-                        //   promoteAndSyncLimit() 가 대신 처리한다.
-                        //   (현재 적용값은 서버에 그대로 남아 있으므로 이번 주 통계는 옛 한도 기준으로 정확히 유지됨)
-                        Toast.makeText(context, "다음 주 월요일부터 새 limit 적용 예정", Toast.LENGTH_SHORT).show()
+                        // 예약을 서버에 바로 올린다 (현재값은 그대로, 예약 필드만 추가) → 다른 기기가 /sync 로 받는다.
+                        //   서버가 예약 필드를 받게 된 10/18 이후. 현재 적용값은 안 바뀌므로 이번 주 통계는 옛 한도 그대로.
+                        //   실패하면 dirty 로 남아 다음 /sync 때 다시 올린다.
+                        markLimitDirty(context)
+                        val pushed = pushLocalLimits(context, db.userLimitDao(), userId)
+                        Toast.makeText(
+                            context,
+                            if (pushed) "다음 주 월요일부터 새 limit 적용 예정" else "저장했어요. 연결되면 다른 기기에도 반영돼요",
+                            Toast.LENGTH_SHORT
+                        ).show()
                         showConfirm = false
                         onBack()
                     }
