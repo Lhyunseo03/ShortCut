@@ -175,6 +175,20 @@ internal fun applyServerNickname(context: Context, json: JSONObject): Boolean {
 
 // ── 기기 등록 (API 스펙 §1) ──────────────────────────────────────────────
 internal const val PK_DEVICE_COUNT = "deviceCount"   // 이 계정의 로그인 상태 기기 수 — 2 이상이면 1분 배치(D2)
+internal const val PK_DEVICE_NAME = "deviceName"     // 사용자가 설정 > Devices 에서 붙인 이 기기 이름. 없으면 기기 모델명
+
+// 이 기기의 표시 이름 — 사용자가 정한 이름이 있으면 그것, 없으면 모델명(Build.MODEL).
+// 기기에 붙는 이름이라 계정(uid) 과 무관하게 저장한다. 서버엔 /devices/register 의 deviceName 으로 올라간다.
+internal fun localDeviceName(context: Context): String =
+    context.getSharedPreferences("short_cut_prefs", Context.MODE_PRIVATE)
+        .getString(PK_DEVICE_NAME, null)?.takeIf { it.isNotBlank() } ?: (Build.MODEL ?: "Android")
+
+// 설정 > Devices 의 연필 → 저장. 빈 이름이면 사용자 이름을 지우고 모델명으로 돌아간다.
+internal fun saveDeviceName(context: Context, name: String) {
+    context.getSharedPreferences("short_cut_prefs", Context.MODE_PRIVATE).edit()
+        .apply { if (name.isBlank()) remove(PK_DEVICE_NAME) else putString(PK_DEVICE_NAME, name.trim()) }
+        .apply()
+}
 
 // POST /devices/register — 로그인 성공 시 · 앱 시작 시 · FCM 토큰 갱신 시 호출. 같은 deviceId 면 서버가 갱신한다.
 // 응답의 deviceCount 를 prefs 에 저장 → 접근성 서비스가 배치 주기를 정할 때 읽는다.
@@ -194,7 +208,7 @@ internal suspend fun registerDevice(context: Context): Boolean {
 
     val body = JSONObject()
         .put("deviceId", DeviceId.get(app))
-        .put("deviceName", Build.MODEL ?: "Android")
+        .put("deviceName", localDeviceName(app))
         .put("permissionsOk", permissionsOk)
     if (fcmToken != null) body.put("fcmToken", fcmToken)
     // 닉네임은 이 기기에서 방금 바꿨을 때만 보낸다 (매번 보내면 다른 기기에서 바꾼 값을 덮어씀)

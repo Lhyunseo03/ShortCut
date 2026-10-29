@@ -81,7 +81,15 @@ private fun TopBar(title: String, onBack: () -> Unit) {
         modifier = Modifier.padding(start = 8.dp, end = 24.dp, top = 16.dp, bottom = 16.dp)
     ) {
         IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "뒤로") }
-        Text(title, fontSize = 22.sp, fontWeight = FontWeight.ExtraBold, color = Ink, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        Text(
+            title,
+            fontSize = if (title.length > 12) 18.sp else 22.sp,
+            fontWeight = FontWeight.ExtraBold,
+            color = Ink,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f)
+        )
     }
 }
 
@@ -285,7 +293,9 @@ internal fun ProposalButton(status: ProposalStatus?, onPropose: () -> Unit, onOp
         ProposalState.PASSED -> Quad(
             "한도 변경 제안",
             "다음 주 한도 투표가 이미 완료됐어요" +
-                (if (st.pendingDaily != null) " (월요일부터 일 ${st.pendingDaily} / 시 ${st.pendingHourly ?: "-"})" else ""),
+                (if (st.pendingDaily != null) " (월요일부터 일 ${st.pendingDaily} / 시 ${st.pendingHourly ?: "-"})" else "") +
+                // 결과 표수 — 누가 어디에 찍었는지는 서버도 안 준다 (익명)
+                (st.proposal?.let { " · 찬성 ${it.yes} / 반대 ${it.no}" } ?: ""),
             false, {}
         )
         ProposalState.USED -> Quad("한도 변경 제안", "이번 주 제안을 이미 사용했어요", false, {})

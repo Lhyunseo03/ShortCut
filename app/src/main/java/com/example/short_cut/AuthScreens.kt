@@ -270,6 +270,7 @@ fun NicknameOnboardingScreen(onDone: () -> Unit = {}) {
         return
     }
 
+    var over by remember { mutableStateOf(false) }
     val trimmed = draft.trim()
     val valid = trimmed.isNotEmpty() && trimmed.length <= 20
 
@@ -300,11 +301,13 @@ fun NicknameOnboardingScreen(onDone: () -> Unit = {}) {
             SectionTitle("닉네임")
             OutlinedTextField(
                 value = draft,
-                onValueChange = { if (it.length <= 20) draft = it },
+                onValueChange = { v -> acceptWithin(20, v, { draft = it }, { over = it }) },
                 modifier = Modifier.fillMaxWidth(),
                 singleLine = true,
                 placeholder = { Text("1~20자") },
-                supportingText = { Text("${trimmed.length}/20", color = Color(0xFF888888)) }
+                isError = over,
+                supportingText = overLimitHint(over, "닉네임은 20자까지만 입력할 수 있어요")
+                    ?: { Text("${trimmed.length}/20", color = Color(0xFF888888)) }
             )
         }
 
@@ -376,6 +379,9 @@ fun LimitOnboardingScreen(onDone: () -> Unit = {}) {
         return
     }
 
+    // 그룹 화면과 같은 규칙: 시간당 한도가 일간 한도보다 크면 시간당 한도가 영영 안 걸리므로 저장 막음
+    val hourlyTooHigh = draftHourly > draftDaily
+
     Column(modifier = Modifier.fillMaxSize()) {
         Column(
             modifier = Modifier
@@ -415,6 +421,9 @@ fun LimitOnboardingScreen(onDone: () -> Unit = {}) {
                 minValue = 10,
                 onChange = { draftHourly = it }
             )
+            if (hourlyTooHigh) {
+                Text("Hourly Limit 은 Daily Limit 보다 클 수 없어요", fontSize = 13.sp, color = Color(0xFFC62828))
+            }
         }
 
         // 하단 고정 버튼 — 설정해야만 진행
@@ -439,7 +448,7 @@ fun LimitOnboardingScreen(onDone: () -> Unit = {}) {
                         onDone()
                     }
                 },
-                enabled = !saving,
+                enabled = !saving && !hourlyTooHigh,
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(52.dp),

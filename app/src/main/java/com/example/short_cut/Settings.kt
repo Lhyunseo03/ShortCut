@@ -152,6 +152,7 @@ internal fun SettingsRootScreen(
             ?: ""
     }
     var nicknameDraft by remember { mutableStateOf(initialNickname) }
+    var nicknameOver by remember { mutableStateOf(false) }   // 20자 넘겨 치려 했는지 (서버 규칙 1~20자)
     var savedNickname by remember { mutableStateOf(initialNickname) }
 
     // 모드 — 현재는 "normal" 만 지원. "hard" 선택 시 안내 토스트.
@@ -184,10 +185,12 @@ internal fun SettingsRootScreen(
         ) {
             OutlinedTextField(
                 value = nicknameDraft,
-                onValueChange = { nicknameDraft = it },
+                onValueChange = { v -> acceptWithin(20, v, { nicknameDraft = it }, { nicknameOver = it }) },
                 modifier = Modifier.weight(1f),
                 singleLine = true,
-                placeholder = { Text("닉네임 입력") }
+                placeholder = { Text("닉네임 입력") },
+                isError = nicknameOver,
+                supportingText = overLimitHint(nicknameOver, "닉네임은 20자까지만 입력할 수 있어요")
             )
             Button(
                 onClick = {
@@ -551,7 +554,9 @@ internal fun SettingsLimitScreen(
     // 다음 주 적용 예정 값 (pending 있으면 그 값, 없으면 현재 적용값)
     val nextWeekHourly = pendingHourly ?: currentHourly
     val nextWeekDaily = pendingDaily ?: currentDaily
-    val canCommit = loaded && (draftHourly != nextWeekHourly || draftDaily != nextWeekDaily)
+    // 그룹 화면과 같은 규칙: 시간당 한도가 일간 한도보다 크면 시간당 한도가 영영 안 걸리므로 저장 막음
+    val hourlyTooHigh = draftHourly > draftDaily
+    val canCommit = loaded && !hourlyTooHigh && (draftHourly != nextWeekHourly || draftDaily != nextWeekDaily)
 
     // 헤더 + 스크롤 가능 컨텐츠 + 하단 고정 버튼 구조
     // 컨텐츠가 길어져도 변경하기 버튼이 화면 밖으로 잘리지 않도록
@@ -606,6 +611,9 @@ internal fun SettingsLimitScreen(
                 minValue = 10,
                 onChange = { draftHourly = it }
             )
+            if (hourlyTooHigh) {
+                Text("Hourly Limit 은 Daily Limit 보다 클 수 없어요", fontSize = 13.sp, color = Color(0xFFC62828))
+            }
 
             Spacer(Modifier.height(8.dp))
         }

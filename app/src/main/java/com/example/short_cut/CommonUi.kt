@@ -99,6 +99,18 @@ internal fun SectionTitle(text: String) {
     )
 }
 
+// ── 글자수 제한 입력칸 공통 ─────────────────────────────────────────────
+// 제한까지만 받아들이고, 넘겨서 치려고 하면 over 를 켜서 빨간 안내를 띄운다. 지워서 제한 안으로 오면 꺼진다.
+//   var over by remember { mutableStateOf(false) }
+//   onValueChange = { v -> acceptWithin(20, v, { name = it }, { over = it }) }
+//   isError = over, supportingText = overLimitHint(over, "기기 이름은 20자까지만 입력할 수 있어요")
+internal fun acceptWithin(max: Int, input: String, onAccept: (String) -> Unit, setOver: (Boolean) -> Unit) {
+    if (input.length > max) setOver(true) else { setOver(false); onAccept(input) }
+}
+
+internal fun overLimitHint(over: Boolean, message: String): (@Composable () -> Unit)? =
+    if (over) { { Text(message, fontSize = 12.sp, color = Color(0xFFC62828)) } } else null
+
 // 값을 step 그리드로 내림 정렬 (minValue 하한). 과거 자유 입력으로 저장된 비-배수 값도 자동 보정.
 internal fun snapToStep(v: Int, step: Int, minValue: Int): Int =
     ((v / step) * step).coerceAtLeast(minValue)

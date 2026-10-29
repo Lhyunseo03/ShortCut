@@ -710,7 +710,8 @@ class ShortCutAccessibilityService : AccessibilityService() {
         }
     }
 
-    // 확인 버튼 하나. 차단막 없이 띄워서 뒤 화면 조작은 그대로 되게 한다 ("blocks nothing; it only informs").
+    // 확인 버튼 하나. 차단(5분 진입 금지)은 없지만, 확인을 누르기 전엔 뒤 화면을 못 넘기게 차단막을 깐다 —
+    // 팝업이 떠 있는데 스크롤이 되는 게 어색했음 (10/25). "알리기만 한다"는 그대로: 확인 한 번이면 끝.
     // 넛지 수신 (G7) — FCM 서비스가 호출. 차단 안내처럼 화면 가운데에 확인 버튼 하나로 띄운다.
     // 쇼츠를 보고 있지 않아도(홈 화면 · 다른 앱) 접근성 오버레이라 바로 보인다.
     // 다른 팝업(개인 한도 · 그룹 한도)이 떠 있으면 겹치지 않게 일반 알림으로 보낸다.
@@ -756,7 +757,7 @@ class ShortCutAccessibilityService : AccessibilityService() {
             // 두 번째 버튼(계속보기) 은 숨긴다 — FrameLayout 으로 감싸져 있어 부모를 숨김
             val ignore = view.findViewById<Button>(R.id.btnIgnore)
             (ignore.parent as? View)?.visibility = View.GONE
-            addPopupView(view, standardCenterParams(280), withScrim = false)
+            addPopupView(view, standardCenterParams(280))
             Log.d(TAG, "그룹 한도 팝업 — $groupName $kind $count/$limit")
             true
         }

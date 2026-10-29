@@ -348,10 +348,10 @@ private fun GroupCard(group: GroupSummary, myToday: Int, onClick: () -> Unit) {
             ) {
                 Text(
                     text = group.name,
-                    fontSize = 17.sp,
+                    fontSize = if (group.name.length > 12) 15.sp else 17.sp,
                     fontWeight = FontWeight.Bold,
                     color = Ink,
-                    maxLines = 1,
+                    maxLines = 2,
                     overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.weight(1f)
                 )
@@ -470,7 +470,9 @@ private fun GroupCreateScreen(onBack: () -> Unit, onCreated: (String) -> Unit) {
     val scope = rememberCoroutineScope()
 
     var name by remember { mutableStateOf("") }
+    var nameOver by remember { mutableStateOf(false) }
     var description by remember { mutableStateOf("") }
+    var descOver by remember { mutableStateOf(false) }
     var daily by remember { mutableIntStateOf(200) }
     var hourly by remember { mutableIntStateOf(50) }
     var threshold by remember { mutableIntStateOf(70) }
@@ -496,18 +498,22 @@ private fun GroupCreateScreen(onBack: () -> Unit, onCreated: (String) -> Unit) {
             SectionTitle("그룹 정보")
             OutlinedTextField(
                 value = name,
-                onValueChange = { name = it.take(20); error = null },
+                onValueChange = { v -> acceptWithin(20, v, { name = it; error = null }, { nameOver = it }) },
                 label = { Text("이름") },
                 singleLine = true,
                 enabled = !busy,
+                isError = nameOver,
+                supportingText = overLimitHint(nameOver, "그룹 이름은 20자까지만 입력할 수 있어요"),
                 modifier = Modifier.fillMaxWidth()
             )
             OutlinedTextField(
                 value = description,
-                onValueChange = { description = it.replace("\n", " ").take(50) },
+                onValueChange = { v -> acceptWithin(50, v.replace("\n", " "), { description = it }, { descOver = it }) },
                 label = { Text("소개 한 줄") },
                 singleLine = true,
                 enabled = !busy,
+                isError = descOver,
+                supportingText = overLimitHint(descOver, "소개는 50자까지만 입력할 수 있어요"),
                 modifier = Modifier.fillMaxWidth()
             )
 
@@ -813,12 +819,13 @@ private fun MemberRow(
             Text(text = "$rank", fontSize = 15.sp, fontWeight = FontWeight.Bold, color = SubInk, modifier = Modifier.width(24.dp))
             Column(modifier = Modifier.weight(1f)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
+                    // 닉네임은 최대 20자 — 한 줄에 안 들어가면 글자를 줄이고 두 줄까지 (GroupTopBar 와 같은 규칙)
                     Text(
                         text = member.nickname,
-                        fontSize = 16.sp,
+                        fontSize = if (member.nickname.length > 10) 14.sp else 16.sp,
                         fontWeight = FontWeight.SemiBold,
                         color = Ink,
-                        maxLines = 1,
+                        maxLines = 2,
                         overflow = TextOverflow.Ellipsis,
                         modifier = Modifier.weight(1f, fill = false)
                     )

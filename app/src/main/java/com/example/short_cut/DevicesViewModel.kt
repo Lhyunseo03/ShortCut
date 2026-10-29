@@ -106,6 +106,25 @@ internal class DevicesViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    // 설정 > Devices 의 연필 — 이 기기 이름 바꾸기. 로컬에 저장하고 /devices/register 로 서버에 올린다
+    // (register 는 같은 deviceId 면 갱신이라 새 API 가 필요 없다). 서버가 실패해도 로컬은 남아 다음 앱 시작 때 올라간다.
+    // onDone(null) = 서버까지 반영, onDone(메시지) = 로컬만 저장.
+    fun rename(name: String, onDone: (String?) -> Unit) {
+        val app = getApplication<Application>()
+        saveDeviceName(app, name)
+        val shown = localDeviceName(app)
+        // 서버 응답을 기다리지 않고 카드에 바로 보여 준다
+        _state.value = _state.value.copy(devices = _state.value.devices.map { if (it.isThisDevice) it.copy(deviceName = shown) else it })
+        viewModelScope.launch {
+            if (registerDevice(app)) {
+                refresh()
+                onDone(null)
+            } else {
+                onDone("이 기기에 저장했어요. 연결되면 다른 기기에도 보여요")
+            }
+        }
+    }
+
     fun refresh() {
         _state.value = _state.value.copy(loading = true, error = null)
         viewModelScope.launch {

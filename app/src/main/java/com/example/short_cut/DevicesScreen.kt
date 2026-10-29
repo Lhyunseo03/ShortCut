@@ -8,12 +8,15 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
 import androidx.compose.material3.TextButton
@@ -85,7 +88,27 @@ internal fun SettingsDevicesScreen(onBack: () -> Unit, vm: DevicesViewModel = vi
                     SectionTitle("이 계정으로 로그인한 기기 ${state.devices.size}대")
                     val context = LocalContext.current
                     var pendingRemove by remember { mutableStateOf<DeviceItem?>(null) }
-                    state.devices.forEach { DeviceCard(it, onRemove = if (it.isThisDevice) null else { { pendingRemove = it } }) }
+                    var renaming by remember { mutableStateOf(false) }
+                    state.devices.forEach {
+                        DeviceCard(
+                            it,
+                            onRemove = if (it.isThisDevice) null else { { pendingRemove = it } },
+                            onRename = if (it.isThisDevice) { { renaming = true } } else null
+                        )
+                    }
+                    if (renaming) {
+                        val current = state.devices.firstOrNull { it.isThisDevice }?.deviceName ?: ""
+                        RenameDeviceDialog(
+                            current = current,
+                            onDismiss = { renaming = false },
+                            onSave = { name ->
+                                renaming = false
+                                vm.rename(name) { msg ->
+                                    Toast.makeText(context, msg ?: "기기 이름을 바꿨어요", Toast.LENGTH_SHORT).show()
+                                }
+                            }
+                        )
+                    }
                     pendingRemove?.let { target ->
                         AlertDialog(
                             onDismissRequest = { pendingRemove = null },
@@ -110,8 +133,38 @@ internal fun SettingsDevicesScreen(onBack: () -> Unit, vm: DevicesViewModel = vi
     }
 }
 
+// 이 기기 이름 바꾸기 — 1~20자. 서버 스펙에 deviceName 길이 제한은 없지만 카드 한 줄에 들어가게 20자로 막는다.
 @Composable
-private fun DeviceCard(device: DeviceItem, onRemove: (() -> Unit)? = null) {
+private fun RenameDeviceDialog(current: String, onDismiss: () -> Unit, onSave: (String) -> Unit) {
+    var name by remember { mutableStateOf(current) }
+    var over by remember { mutableStateOf(false) }
+    val trimmed = name.trim()
+    val valid = trimmed.isNotEmpty() && trimmed.length <= 20
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("이 기기 이름", fontWeight = FontWeight.Bold) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                OutlinedTextField(
+                    value = name,
+                    onValueChange = { v -> acceptWithin(20, v, { name = it }, { over = it }) },
+                    singleLine = true,
+                    placeholder = { Text("예: 내 폰, 거실 태블릿") },
+                    isError = over,
+                    supportingText = overLimitHint(over, "기기 이름은 20자까지만 입력할 수 있어요"),
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Text("다른 기기와 그룹원 화면에도 이 이름으로 보여요 (1~20자)", fontSize = 12.sp, color = Color(0xFF888888))
+            }
+        },
+        // 버튼 순서: 저장(왼쪽) / 취소(오른쪽)
+        dismissButton = { TextButton(onClick = { onSave(trimmed) }, enabled = valid && trimmed != current) { Text("저장") } },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("취소") } }
+    )
+}
+
+@Composable
+private fun DeviceCard(device: DeviceItem, onRemove: (() -> Unit)? = null, onRename: (() -> Unit)? = null) {
     Surface(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(16.dp),
@@ -131,6 +184,13 @@ private fun DeviceCard(device: DeviceItem, onRemove: (() -> Unit)? = null) {
                 if (device.isThisDevice) {
                     Spacer(Modifier.width(8.dp))
                     StatusBadge(text = "이 기기", fg = Color(0xFF1565C0), bg = Color(0xFFE3F2FD))
+                }
+                // 이 기기만 이름 변경 가능 (다른 기기 이름은 그 기기에서)
+                if (onRename != null) {
+                    Spacer(Modifier.width(4.dp))
+                    IconButton(onClick = onRename, modifier = Modifier.size(32.dp)) {
+                        Icon(Icons.Filled.Edit, contentDescription = "이름 바꾸기", tint = Color(0xFF888888), modifier = Modifier.size(18.dp))
+                    }
                 }
             }
 
