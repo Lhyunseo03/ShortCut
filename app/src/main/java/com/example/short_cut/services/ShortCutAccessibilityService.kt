@@ -480,7 +480,7 @@ class ShortCutAccessibilityService : AccessibilityService() {
         localAnsweredDaily = -1
         // 어제 날짜의 그룹 한도 알림 표시 기록 정리 (키가 계속 쌓이지 않게)
         getSharedPreferences(PREFS, MODE_PRIVATE).let { p ->
-            val stale = p.all.keys.filter { it.startsWith("groupAlert:") }
+            val stale = p.all.keys.filter { it.startsWith("groupAlert:") || it.startsWith("groupDailyMs:") }
             if (stale.isNotEmpty()) p.edit().apply { stale.forEach { remove(it) } }.apply()
         }
 
@@ -667,47 +667,91 @@ class ShortCutAccessibilityService : AccessibilityService() {
             Log.d(TAG, "스크롤 카운트 — hourly: $hourlyCount/$hourlyLimit (다른 기기 $otherDevicesLastHour), daily: $dailyCount/$dailyLimit")
 
             // 한도 검사 — 스크롤 직후. (3주차: 서버 /sync 값을 반영한 직후에도 같은 함수를 호출)
-            val personalPopup = checkLimits(hourlyCount, dailyCount)
-            // 그룹 한도 (G2) — 개인 팝업이 떴으면 이번엔 건너뛴다 (팝업 두 개가 겹치지 않게). 다음 스크롤에서 다시 검사.
-            if (!personalPopup) checkGroupLimits(hourlyCount, dailyCount)
+            // 그룹 한도(G2)는 먼저 "이번 스크롤에 단계를 넘은 그룹" 만 모아 두고 (저장·전송은 아직),
+            //   개인 팝업이 뜨면 그 팝업 본문에 그룹 벌금 줄을 붙이고, 개인 팝업이 없으면 그룹 팝업 하나로 모아 띄운다.
+            //   (전엔 개인 50 · 그룹A 51 · 그룹B 52 … 로 스크롤마다 팝업이 연달아 떴음 — 11/3 합침)
+            val groupHits = collectGroupHits(hourlyCount, dailyCount)
+            val personalPopup = checkLimits(hourlyCount, dailyCount, groupHits)
+            if (!personalPopup && groupHits.isNotEmpty()) {
+                if (showGroupAckPopup(groupHits)) commitGroupHits(groupHits)
+                // 못 띄웠으면(다른 팝업 표시 중) 저장하지 않아 다음 스크롤에 다시 모인다
+            }
         }
     }
 
-    // ── 그룹 한도 확인 팝업 (G2) ─────────────────────────────────────────
-    // 그룹 한도는 차단하지 않는다. 넘는 순간 확인 버튼 하나짜리 팝업으로 알리고 서버에 알림(G8)을 보낸다.
-    // 일간은 그룹당 하루 1번, 시간당은 그룹당 같은 시(hour) 에 1번. 표시 여부는 prefs 키로 기억한다.
-    private suspend fun checkGroupLimits(hourlyNow: Int, dailyNow: Int) {
-        val groups = try { groupLimitDao.getAll() } catch (_: Exception) { return }
-        if (groups.isEmpty()) return
+    // ── 그룹 한도 (G2) ───────────────────────────────────────────────────
+    // 그룹 한도는 차단하지 않는다. 단계마다 알리고(개인 팝업에 합치거나 그룹 팝업 하나) 서버에 alert(G8 = 포인트 벌금)를 보낸다.
+    // 그룹 한도 검사 — 개인 한도와 같은 단계 방식 (한도, +10 / +100 …). 단계마다 확인 팝업 + /alerts 한 건 (= 포인트 벌금,
+    // 시간당 −10 · 일간 −100, POINTS_API.md §1). 전엔 일간 하루 1번 · 시간당 시(時)마다 1번이었다 (11/1 변경).
+    //   - 단계는 그룹별로 prefs 에 둔다. 일간(groupDailyMs:)은 자정에 지우고, 시간당(groupHourlyMs:)은 슬라이딩 창이라
+    //     카운트가 한도 밑으로 내려가면 -1, 단계보다 낮아지면 그 단계로 내린다 (checkLimits 와 같은 규칙).
+    //   - 한 번에 팝업 하나. 못 띄웠으면(다른 팝업 표시 중) 단계를 저장하지 않아 다음 스크롤에 다시 시도한다.
+    //   - 기기가 두 대면 각자 단계를 세서 같은 단계 alert 가 두 번 갈 수 있다 → 서버가 (그룹·종류·단계·시간) 으로 한 번 더 거른다.
+    // 이번 스크롤에 단계를 넘은 그룹 한도 — 팝업은 안 띄우고 모아만 둔다. 저장·전송은 commitGroupHits 에서.
+    private data class GroupHit(
+        val groupId: String, val name: String, val type: String, val stage: Int, val count: Int,
+        val delta: Int,          // 이 팝업으로 깎이는 점수 (시간당 10 · 일간 100)
+        val waiting: Boolean,    // 대기 중인 그룹 — 서버가 안 깎는다. 문구만 다르게
+        val prefKey: String      // 단계 저장 키
+    )
+
+    private suspend fun collectGroupHits(hourlyNow: Int, dailyNow: Int): List<GroupHit> {
+        val groups = try { groupLimitDao.getAll() } catch (_: Exception) { return emptyList() }
+        if (groups.isEmpty()) return emptyList()
         val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
-        val kst = java.util.TimeZone.getTimeZone("Asia/Seoul")
-        val dateKey = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US).apply { timeZone = kst }
-            .format(java.util.Date(todayStartMs))
-        val hourKey = java.text.SimpleDateFormat("HH", java.util.Locale.US).apply { timeZone = kst }
-            .format(java.util.Date(com.example.short_cut.TrustedClock.now()))
+        val hits = ArrayList<GroupHit>()
         for (g in groups) {
-            // 일간
-            if (g.dailyLimit > 0 && dailyNow >= g.dailyLimit) {
-                val key = "groupAlert:${g.groupId}:$dateKey:daily"
-                if (!prefs.getBoolean(key, false)) {
-                    // 띄우지 못했으면(다른 팝업이 떠 있음) 기록하지 않는다 → 다음 스크롤에 다시 시도
-                    if (!showGroupAckPopup(g.name, "일간", g.dailyLimit, dailyNow)) return
-                    prefs.edit().putBoolean(key, true).apply()
-                    serviceScope.launch { com.example.short_cut.postGroupAlert(g.groupId, "daily", dailyNow) }
-                    return   // 한 번에 하나만
+            val waiting = com.example.short_cut.isWaitingGroup(this, g.groupId)
+            // 일간 — 단계는 자정에 지운다
+            if (g.dailyLimit > 0) {
+                val key = "groupDailyMs:${g.groupId}"
+                reachedMilestone(dailyNow, g.dailyLimit, prefs.getInt(key, -1), DAILY_STEP)?.let { stage ->
+                    hits += GroupHit(g.groupId, g.name, "daily", stage, dailyNow, 100, waiting, key)
                 }
             }
-            // 시간당
-            if (g.hourlyLimit > 0 && hourlyNow >= g.hourlyLimit) {
-                val key = "groupAlert:${g.groupId}:$dateKey:hourly:$hourKey"
-                if (!prefs.getBoolean(key, false)) {
-                    if (!showGroupAckPopup(g.name, "시간당", g.hourlyLimit, hourlyNow)) return
-                    prefs.edit().putBoolean(key, true).apply()
-                    serviceScope.launch { com.example.short_cut.postGroupAlert(g.groupId, "hourly", hourlyNow) }
-                    return
+            // 시간당 — 슬라이딩 창이라 카운트가 내려가면 단계도 따라 내린다 (checkLimits 와 같은 규칙). 내리는 건 바로 저장
+            if (g.hourlyLimit > 0) {
+                val key = "groupHourlyMs:${g.groupId}"
+                var ms = prefs.getInt(key, -1)
+                if (ms >= 0) {
+                    if (hourlyNow < g.hourlyLimit) {
+                        ms = -1
+                        prefs.edit().putInt(key, -1).apply()
+                    } else if (hourlyNow < ms) {
+                        val level = stageOf(hourlyNow, g.hourlyLimit, HOURLY_STEP)
+                        if (level < ms) { ms = level; prefs.edit().putInt(key, level).apply() }
+                    }
+                }
+                reachedMilestone(hourlyNow, g.hourlyLimit, ms, HOURLY_STEP)?.let { stage ->
+                    hits += GroupHit(g.groupId, g.name, "hourly", stage, hourlyNow, 10, waiting, key)
                 }
             }
         }
+        return hits
+    }
+
+    // 팝업을 실제로 띄운 뒤 호출 — 단계 저장 + /alerts (= 포인트 벌금) 전송
+    private fun commitGroupHits(hits: List<GroupHit>) {
+        if (hits.isEmpty()) return
+        val editor = getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+        hits.forEach { editor.putInt(it.prefKey, it.stage) }
+        editor.apply()
+        hits.forEach { sendGroupAlertAsync(it.groupId, it.type, it.count, it.stage) }
+    }
+
+    // 개인 팝업 본문 밑에 붙는 한 줄 — "그룹 벌금: 테스트 그룹 −10점 · 친구들 −110점"
+    private fun groupNote(hits: List<GroupHit>): String? {
+        if (hits.isEmpty()) return null
+        val parts = hits.groupBy { it.groupId }.values.map { hs ->
+            val name = hs.first().name
+            if (hs.first().waiting) "$name (대기 중 · 안 깎임)" else "$name −${hs.sumOf { it.delta }}점"
+        }
+        return "그룹 벌금: " + parts.joinToString(" · ")
+    }
+
+    private fun sendGroupAlertAsync(groupId: String, type: String, count: Int, stage: Int) {
+        val at = com.example.short_cut.TrustedClock.now()
+        serviceScope.launch { com.example.short_cut.sendGroupAlert(this@ShortCutAccessibilityService, groupId, type, count, stage, at) }
     }
 
     // 확인 버튼 하나. 차단(5분 진입 금지)은 없지만, 확인을 누르기 전엔 뒤 화면을 못 넘기게 차단막을 깐다 —
@@ -740,16 +784,24 @@ class ShortCutAccessibilityService : AccessibilityService() {
     }
 
     // 띄웠으면 true. 다른 팝업(개인 한도 · 차단 안내)이 떠 있으면 false — 호출부가 다음 스크롤에 다시 시도한다.
-    private suspend fun showGroupAckPopup(groupName: String, kind: String, limit: Int, count: Int): Boolean =
+    // 개인 팝업이 없을 때 — 이번 스크롤에 단계를 넘은 그룹들을 한 팝업에. 띄웠으면 true.
+    // 다른 팝업(개인 한도 · 차단 안내)이 떠 있으면 false — 호출부가 저장하지 않아 다음 스크롤에 다시 시도한다.
+    private suspend fun showGroupAckPopup(hits: List<GroupHit>): Boolean =
         withContext(Dispatchers.Main) {
             if (popupViews.isNotEmpty()) {
-                Log.d(TAG, "그룹 한도 팝업 보류 — 다른 팝업 표시 중 ($groupName $kind $count/$limit)")
+                Log.d(TAG, "그룹 한도 팝업 보류 — 다른 팝업 표시 중 (${hits.size}건)")
                 return@withContext false
             }
             val view = LayoutInflater.from(this@ShortCutAccessibilityService).inflate(R.layout.overlay_popup, null)
-            view.findViewById<TextView>(R.id.popupTitle).text = "그룹 한도를 넘었어요"
-            view.findViewById<TextView>(R.id.popupMessage).text =
-                "'$groupName' 의 $kind 한도 ${limit}회를 넘었어요 (지금 ${count}회).\n그룹에 알렸어요."
+            val total = hits.filter { !it.waiting }.sumOf { it.delta }
+            view.findViewById<TextView>(R.id.popupTitle).text =
+                if (total > 0) "그룹 한도를 넘었어요 · −${total}점" else "그룹 한도를 넘었어요"
+            val lines = hits.map { h ->
+                val kind = if (h.type == "daily") "일간" else "시간당"
+                "'${h.name}' $kind 한도를 넘었어요 (지금 ${h.count}회)" +
+                    (if (h.waiting) " · 대기 중이라 안 깎여요" else " · −${h.delta}점")
+            }
+            view.findViewById<TextView>(R.id.popupMessage).text = lines.joinToString("\n") + "\n그룹에 알렸어요"
             view.findViewById<Button>(R.id.btnStop).apply {
                 text = "확인"
                 setOnClickListener { dismissAllPopups() }
@@ -758,14 +810,15 @@ class ShortCutAccessibilityService : AccessibilityService() {
             val ignore = view.findViewById<Button>(R.id.btnIgnore)
             (ignore.parent as? View)?.visibility = View.GONE
             addPopupView(view, standardCenterParams(280))
-            Log.d(TAG, "그룹 한도 팝업 — $groupName $kind $count/$limit")
+            Log.d(TAG, "그룹 한도 팝업 — " + hits.joinToString(", ") { "${it.name} ${it.type} ${it.count}(단계 ${it.stage})" })
             true
         }
 
     // 한도 검사 — 현재 카운트를 한도와 비교(≥)해서 필요하면 팝업을 띄운다. 팝업을 띄웠으면 true.
     // 스크롤할 때마다 호출되고, 카운트가 다른 경로(서버 동기화 등)로 바뀐 직후에도 그대로 호출할 수 있다.
     // hourly 팝업이 뜨면 daily 는 이번에 검사하지 않는다(팝업은 한 번에 하나) — 기존 동작 그대로.
-    private suspend fun checkLimits(hourlyNow: Int, dailyNow: Int): Boolean {
+    // groupHits = 이번 스크롤에 단계를 넘은 그룹들 (collectGroupHits). 개인 팝업이 뜨면 본문에 같이 적고 그 자리에서 commit 한다.
+    private suspend fun checkLimits(hourlyNow: Int, dailyNow: Int, groupHits: List<GroupHit> = emptyList()): Boolean {
         // hourly milestone 하향 조정 — 슬라이딩 윈도우로 카운트가 줄면 milestone 도 따라 낮춘다.
         //  (예전엔 "한도 미만으로 떨어졌을 때만" 리셋해서, 한도 위에서 카운트가 줄었다 다시 오르는
         //   binge 중에는 milestone 이 높은 값에 stuck 돼 재경고가 안 뜨던 문제가 있었음.)
@@ -797,7 +850,10 @@ class ShortCutAccessibilityService : AccessibilityService() {
             hourlyMilestone = hourlyTrigger
             val overage = hourlyTrigger - hourlyLimit
             setPendingPopup("hourly", overage)
+            popupGroupNote = groupNote(groupHits)
             withContext(Dispatchers.Main) { showLimitPopup("hourly", overage) }
+            popupGroupNote = null
+            commitGroupHits(groupHits)
             postMilestone(answered = false)   // 다른 기기가 같은 단계 팝업을 건너뛰게 (D6)
             return true
         }
@@ -808,7 +864,10 @@ class ShortCutAccessibilityService : AccessibilityService() {
             dailyMilestone = dailyTrigger
             val overage = dailyTrigger - dailyLimit
             setPendingPopup("daily", overage)
+            popupGroupNote = groupNote(groupHits)
             withContext(Dispatchers.Main) { showLimitPopup("daily", overage) }
+            popupGroupNote = null
+            commitGroupHits(groupHits)
             postMilestone(answered = false)   // 다른 기기가 같은 단계 팝업을 건너뛰게 (D6)
             return true
         }
@@ -879,8 +938,18 @@ class ShortCutAccessibilityService : AccessibilityService() {
 
     // ── Popup 빌더 ────────────────────────────────────────────
 
-    // overage(=초과 분) 에 따라 popup 의 제목/본문 결정
+    // 개인 팝업 본문 밑에 붙일 그룹 벌금 줄 — checkLimits 가 showLimitPopup 직전에 넣고 직후에 비운다.
+    // buildPopupTexts 는 showLimitPopup 안에서 (mainHandler.post 전에) 동기로 불리므로 그 사이에만 살아 있으면 된다.
+    @Volatile private var popupGroupNote: String? = null
+
+    // overage(=초과 분) 에 따라 popup 의 제목/본문 결정 (+ 그룹 벌금 줄)
     private fun buildPopupTexts(type: String, overage: Int): Pair<String, String> {
+        val (title, body) = buildPopupTextsBase(type, overage)
+        val note = popupGroupNote
+        return if (note.isNullOrBlank()) title to body else title to (body + "\n" + note)
+    }
+
+    private fun buildPopupTextsBase(type: String, overage: Int): Pair<String, String> {
         return when (type) {
             "daily" -> {
                 val title = "Daily Limit 초과"
@@ -1974,6 +2043,7 @@ class ShortCutAccessibilityService : AccessibilityService() {
             // 1) 미전송분 먼저 — 서버 합계에 이 기기 분이 빠진 채로 읽지 않게
             persistBatchToQueue()
             sendPendingUserLogs()
+            com.example.short_cut.flushPendingGroupAlerts(this)   // 밀린 그룹 한도 alert (= 포인트 벌금) 재전송
 
             // 2) GET /sync
             val deviceId = com.example.short_cut.DeviceId.get(this)

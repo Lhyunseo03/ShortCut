@@ -1,6 +1,10 @@
 package com.example.short_cut
 
+import android.content.Context
+import android.util.Log
+import org.json.JSONArray
 import org.json.JSONObject
+import java.util.UUID
 
 // ─────────────────────────────────────────────────────────────────────────
 // 그룹 API — 서버 API_SPEC_groups.md 와 맞춘 JSON 계약. (1단계 9/27 배포: POST /groups, GET /groups, GET /groups/{gid})
@@ -45,8 +49,19 @@ internal data class GroupSummary(
     // 투표 통과 후 다음 주 월요일 적용 대기 한도 (서버 6-1: pendingGoal { dailyLimit, hourlyLimit, effectiveAt }). 없으면 null
     val pendingDaily: Int? = null,
     val pendingHourly: Int? = null,
-    val pendingEffectiveAt: Long? = null
+    val pendingEffectiveAt: Long? = null,
+    // 포인트 (서버 미구현이면 전부 null/false → 화면에 안 그림)
+    val myPoints: Int? = null,          // GET /groups: 이번 주 내 점수
+    val myWaiting: Boolean = false,     // GET /groups: myPoints 키가 있는데 null = 대기 중
+    val pot: GroupPot? = null,
+    val lastWeek: LastWeek? = null,
+    val weekStart: String? = null
 )
+
+internal data class GroupPot(val today: Int, val carried: Int, val settlesAt: Long?)
+internal data class LastWeekRank(val userId: String, val nickname: String, val points: Int, val streak: Int?)
+internal data class LastWeek(val weekStart: String, val ranking: List<LastWeekRank>)
+internal data class GroupStatus(val members: List<GroupMember>, val pot: GroupPot?)
 
 internal data class GroupMember(
     val userId: String,
@@ -56,7 +71,10 @@ internal data class GroupMember(
     val lastSeenAt: Long?,
     val lastScrollAt: Long?,
     val loggedOut: Boolean = false,       // 기기가 전부 로그아웃 (G10)
-    val permissionsOk: Boolean? = null    // 로그인 기기 중 권한 꺼진 게 있으면 false (G11). 모르면 null
+    val permissionsOk: Boolean? = null,   // 로그인 기기 중 권한 꺼진 게 있으면 false (G11). 모르면 null
+    val points: Int? = null,              // 이번 주 점수. 대기 중이거나 서버 미구현이면 null
+    val waiting: Boolean = false,         // 주중 가입 → 다음 월요일부터 참가
+    val eligible: Boolean? = null         // 오늘 수상 가능한지 (false = 로그아웃·권한 꺼짐·heartbeat 공백). 모르면 null
 )
 
 internal data class GroupList(val groups: List<GroupSummary>, val maxGroups: Int)
@@ -108,8 +126,31 @@ private fun parseSummary(raw: JSONObject): GroupSummary {
         myTodayCount = if (o.has("myTodayCount")) o.optInt("myTodayCount") else null,
         pendingDaily = o.optJSONObject("pendingGoal")?.optInt("dailyLimit", 0)?.takeIf { it > 0 },
         pendingHourly = o.optJSONObject("pendingGoal")?.optInt("hourlyLimit", 0)?.takeIf { it > 0 },
-        pendingEffectiveAt = o.optJSONObject("pendingGoal")?.optLongOrNull("effectiveAt")
+        pendingEffectiveAt = o.optJSONObject("pendingGoal")?.optLongOrNull("effectiveAt"),
+        myPoints = if (o.has("myPoints") && !o.isNull("myPoints")) o.optInt("myPoints") else null,
+        myWaiting = o.has("myPoints") && o.isNull("myPoints"),
+        pot = parsePot(raw.optJSONObject("pot") ?: o.optJSONObject("pot")),
+        lastWeek = parseLastWeek(raw.optJSONObject("lastWeek") ?: o.optJSONObject("lastWeek")),
+        weekStart = raw.str("weekStart").ifBlank { o.str("weekStart") }.takeIf { it.isNotBlank() }
     )
+}
+
+private fun parsePot(p: JSONObject?): GroupPot? =
+    p?.let { GroupPot(it.optInt("today", 0), it.optInt("carried", 0), it.optLongOrNull("settlesAt")) }
+
+private fun parseLastWeek(w: JSONObject?): LastWeek? {
+    w ?: return null
+    val arr = w.optJSONArray("ranking") ?: return null
+    val ranking = (0 until arr.length()).mapNotNull { i ->
+        val r = arr.optJSONObject(i) ?: return@mapNotNull null
+        LastWeekRank(
+            userId = r.optString("userId"),
+            nickname = r.str("nickname").ifBlank { "이름 없음" },
+            points = r.optInt("points", 0),
+            streak = r.optInt("streak", -1).takeIf { it > 0 }
+        )
+    }
+    return LastWeek(w.str("weekStart"), ranking)
 }
 
 private fun parseMembers(o: JSONObject): List<GroupMember> {
@@ -126,7 +167,10 @@ private fun parseMembers(o: JSONObject): List<GroupMember> {
             lastSeenAt = m.optLongOrNull("lastSeenAt"),
             lastScrollAt = m.optLongOrNull("lastScrollAt"),
             loggedOut = m.optBoolean("loggedOut", false),
-            permissionsOk = if (m.has("permissionsOk") && !m.isNull("permissionsOk")) m.optBoolean("permissionsOk") else null
+            permissionsOk = if (m.has("permissionsOk") && !m.isNull("permissionsOk")) m.optBoolean("permissionsOk") else null,
+            points = if (m.has("points") && !m.isNull("points")) m.optInt("points") else null,
+            waiting = m.optBoolean("waiting", false),
+            eligible = if (m.has("eligible") && !m.isNull("eligible")) m.optBoolean("eligible") else null
         )
     }
 }
@@ -167,10 +211,10 @@ internal suspend fun fetchGroupDetail(groupId: String): GroupResult<GroupDetail>
 }
 
 // 카운트만 가볍게 새로고침 (30초 주기). 실패하면 null — 화면은 직전 값을 유지.
-internal suspend fun fetchGroupStatus(groupId: String): List<GroupMember>? {
+internal suspend fun fetchGroupStatus(groupId: String): GroupStatus? {
     val res = authedRequest("GET", "/groups/$groupId/status")
     val json = res.json
-    return if (res.ok && json != null) parseMembers(json) else null
+    return if (res.ok && json != null) GroupStatus(parseMembers(json), parsePot(json.optJSONObject("pot"))) else null
 }
 
 // 성공 시 6자리 초대 코드.
@@ -231,6 +275,19 @@ internal suspend fun leaveGroup(groupId: String): GroupResult<Unit> {
 //         | MEMBER_JOINED | MEMBER_LEFT | MEMBER_LOGOUT
 // ─────────────────────────────────────────────────────────────────────────
 
+// ─────────────────────────────────────────────────────────────────────────
+// 10~11주차 — 그룹 포인트 (POINTS_API.md, 11/1 현서 합의)
+//
+//  POST /groups/{gid}/alerts  ← { alertId, type: "daily"|"hourly", count, stage, at }   → { status, points, delta }
+//       alertId = 앱 UUID (재전송에도 같은 값 → 서버가 중복 제거). stage = 팝업 단계값(한도, +10/+100 …). at = 팝업 시각 ms
+//       실패(네트워크·5xx)하면 prefs 큐에 두고 다음 /sync 때 재전송 (flushPendingGroupAlerts)
+//  GET  /groups          각 그룹에 myPoints (null = 대기 중 → 다음 월요일부터 참가)
+//  GET  /groups/{gid}    members[].points|waiting|eligible, pot { today, carried, settlesAt },
+//                        lastWeek { weekStart, ranking: [ { userId, nickname, points, streak? } ] } | null, weekStart
+//  GET  /groups/{gid}/status  members[].points (+ pot.today 있으면 사용)
+//  FCM  POINTS_AWARDED (수상자) · WEEK_RESULT (전원)
+// ─────────────────────────────────────────────────────────────────────────
+
 internal data class MemberDevice(
     val deviceName: String,
     val lastSeenAt: Long?,
@@ -279,11 +336,75 @@ internal data class ProposalStatus(
     val pendingHourly: Int?
 )
 
-// 그룹 한도 초과 알림 (G2·G8). 서버 미구현이면 404 — 실패해도 앱 동작엔 영향 없음.
-internal suspend fun postGroupAlert(groupId: String, type: String, count: Int): Boolean {
-    val res = authedRequest("POST", "/groups/$groupId/alerts", JSONObject().put("type", type).put("count", count))
-    return res.ok
+// ── 그룹 한도 초과 알림 (G2·G8) = 포인트 벌금 (POINTS_API.md §1) ─────────────────
+// 팝업 한 번 = alert 한 건 (hourly −10 · daily −100 은 서버가 계산). alertId 로 서버가 재전송 중복을 걸러 주므로,
+// 네트워크 실패·5xx 면 prefs 큐에 넣고 다음 /sync 때 그대로 다시 보낸다. 4xx 는 서버가 거절한 것이라 버린다.
+internal data class PendingGroupAlert(val alertId: String, val groupId: String, val type: String, val count: Int, val stage: Int, val at: Long)
+
+private const val PK_PENDING_GROUP_ALERTS = "pendingGroupAlerts"
+private const val GROUP_ALERT_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000L   // 이보다 오래 밀린 건 버린다
+private val groupAlertLock = Any()
+
+private fun readPendingGroupAlerts(ctx: Context): List<PendingGroupAlert> {
+    val raw = ctx.getSharedPreferences("short_cut_prefs", Context.MODE_PRIVATE).getString(PK_PENDING_GROUP_ALERTS, "[]") ?: "[]"
+    return try {
+        val arr = JSONArray(raw)
+        (0 until arr.length()).mapNotNull { i ->
+            arr.optJSONObject(i)?.let { o ->
+                PendingGroupAlert(o.optString("alertId"), o.optString("groupId"), o.optString("type"), o.optInt("count"), o.optInt("stage"), o.optLong("at"))
+            }
+        }.filter { it.alertId.isNotEmpty() && it.groupId.isNotEmpty() }
+    } catch (_: Exception) { emptyList() }
 }
+
+private fun writePendingGroupAlerts(ctx: Context, list: List<PendingGroupAlert>) {
+    val arr = JSONArray()
+    list.forEach { a ->
+        arr.put(JSONObject().put("alertId", a.alertId).put("groupId", a.groupId).put("type", a.type)
+            .put("count", a.count).put("stage", a.stage).put("at", a.at))
+    }
+    ctx.getSharedPreferences("short_cut_prefs", Context.MODE_PRIVATE).edit().putString(PK_PENDING_GROUP_ALERTS, arr.toString()).apply()
+}
+
+private suspend fun postGroupAlertOnce(a: PendingGroupAlert): ApiResult =
+    authedRequest("POST", "/groups/${a.groupId}/alerts",
+        JSONObject().put("alertId", a.alertId).put("type", a.type).put("count", a.count).put("stage", a.stage).put("at", a.at))
+
+// 팝업을 띄운 직후 호출 (접근성 서비스). stage = 이번 팝업의 단계값, at = 팝업 시각.
+internal suspend fun sendGroupAlert(context: Context, groupId: String, type: String, count: Int, stage: Int, at: Long) {
+    val a = PendingGroupAlert(UUID.randomUUID().toString(), groupId, type, count, stage, at)
+    val res = postGroupAlertOnce(a)
+    Log.d("GroupApi", "POST /alerts $type count=$count stage=$stage → ${res.code} delta=${res.json?.optInt("delta", 0)}")
+    if (res.ok || res.code in 400..499) return
+    synchronized(groupAlertLock) { writePendingGroupAlerts(context, readPendingGroupAlerts(context) + a) }
+}
+
+// /sync 직전에 호출 — 밀린 alert 를 순서대로 재전송. 보내는 동안 새로 쌓인 건 남긴다.
+internal suspend fun flushPendingGroupAlerts(context: Context) {
+    val list = synchronized(groupAlertLock) { readPendingGroupAlerts(context) }
+    if (list.isEmpty()) return
+    val now = TrustedClock.now()
+    val remain = ArrayList<PendingGroupAlert>()
+    for (a in list) {
+        if (now - a.at > GROUP_ALERT_MAX_AGE_MS) continue
+        val res = postGroupAlertOnce(a)
+        if (!res.ok && res.code !in 400..499) remain += a
+    }
+    synchronized(groupAlertLock) {
+        val sent = list.map { it.alertId }.toSet()
+        val added = readPendingGroupAlerts(context).filter { it.alertId !in sent }
+        writePendingGroupAlerts(context, remain + added)
+    }
+    Log.d("GroupApi", "밀린 그룹 alert 재전송 — ${list.size}건 중 ${list.size - remain.size}건 성공")
+}
+
+// ── 대기 중인 그룹 (주중 가입 → 다음 월요일부터 참가) — 팝업 문구용. 그룹 목록을 받을 때 갱신 ──
+private const val PK_WAITING_GROUPS = "waitingGroupIds"
+internal fun saveWaitingGroups(context: Context, ids: Set<String>) {
+    context.getSharedPreferences("short_cut_prefs", Context.MODE_PRIVATE).edit().putStringSet(PK_WAITING_GROUPS, ids).apply()
+}
+internal fun isWaitingGroup(context: Context, groupId: String): Boolean =
+    context.getSharedPreferences("short_cut_prefs", Context.MODE_PRIVATE).getStringSet(PK_WAITING_GROUPS, emptySet())?.contains(groupId) == true
 
 // 넛지 (G7). 429 면 서버가 준 "잠시 후에" 문구를 그대로.
 internal suspend fun sendNudge(groupId: String, targetId: String): GroupResult<Unit> {

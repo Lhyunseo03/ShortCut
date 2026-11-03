@@ -25,11 +25,13 @@ internal object GroupNotifications {
     private const val CH_NUDGE = "shortcut_group_nudge"      // 넛지
     private const val CH_VOTE = "shortcut_group_vote"        // 제안 · 투표 결과 · 한도 적용
     private const val CH_MEMBER = "shortcut_group_member"    // 가입 · 탈퇴 · 로그아웃
+    private const val CH_POINTS = "shortcut_group_points"    // 포인트 — 일일 정산 수상 · 주간 결과
 
     // 이 앱이 아는 FCM type. 서버와 이름을 맞춰야 한다 (GroupApi.kt 상단 계약)
     val KNOWN_TYPES = setOf(
         "GROUP_ALERT", "NUDGE", "PROPOSAL", "VOTE_RESULT", "LIMIT_APPLIED",
-        "MEMBER_JOINED", "MEMBER_LEFT", "MEMBER_LOGOUT"
+        "MEMBER_JOINED", "MEMBER_LEFT", "MEMBER_LOGOUT",
+        "POINTS_AWARDED", "WEEK_RESULT"
     )
 
     fun show(ctx: Context, type: String, data: Map<String, String>) {
@@ -44,6 +46,7 @@ internal object GroupNotifications {
             "GROUP_ALERT" -> CH_ALERT to "$groupName · 한도 초과"
             "NUDGE" -> CH_NUDGE to "넛지가 왔어요"
             "PROPOSAL", "VOTE_RESULT", "LIMIT_APPLIED" -> CH_VOTE to "$groupName · 한도 투표"
+            "POINTS_AWARDED", "WEEK_RESULT" -> CH_POINTS to "$groupName · 포인트"
             else -> CH_MEMBER to groupName
         }
         val title = data["title"].orEmpty().ifBlank { defaultTitle }
@@ -57,6 +60,11 @@ internal object GroupNotifications {
                 "MEMBER_JOINED" -> "새 구성원이 들어왔어요"
                 "MEMBER_LEFT" -> "구성원이 나갔어요"
                 "MEMBER_LOGOUT" -> "구성원이 로그아웃했어요"
+                // 서버가 delta / myRank / myPoints 를 data 로 주면 숫자까지 (POINTS_API.md §5)
+                "POINTS_AWARDED" -> "어제 가장 적게 봤어요" + (data["delta"]?.toIntOrNull()?.let { " · +${it}점" } ?: ". 벌금통을 받았어요")
+                "WEEK_RESULT" -> "지난주 결과가 나왔어요" +
+                    (data["myRank"]?.toIntOrNull()?.let { r -> " · 나 ${r}위" + (data["myPoints"]?.toIntOrNull()?.let { " ${it}점" } ?: "") } ?: "") +
+                    ". 새 주는 1,000점에서 시작해요"
                 else -> ""
             }
         }
@@ -95,5 +103,6 @@ internal object GroupNotifications {
         ensure(CH_NUDGE, "넛지", "구성원이 보낸 넛지", NotificationManager.IMPORTANCE_HIGH)
         ensure(CH_VOTE, "한도 투표", "제안 등록 · 투표 결과 · 새 한도 적용", NotificationManager.IMPORTANCE_DEFAULT)
         ensure(CH_MEMBER, "구성원 변동", "가입 · 탈퇴 · 로그아웃", NotificationManager.IMPORTANCE_LOW)
+        ensure(CH_POINTS, "포인트", "일일 정산 수상 · 주간 결과", NotificationManager.IMPORTANCE_DEFAULT)
     }
 }

@@ -159,6 +159,43 @@ internal suspend fun authedGetJson(url: String): org.json.JSONObject? = withCont
 internal suspend fun fetchDailyStats(userId: String, date: String): DailyStatsRemote? {
     val json = authedGetJson("$SERVER_BASE_URL/stats/$userId/daily?date=$date") ?: return null
     Log.d("StatsApi", "daily $date ← total=${json.optInt("totalScroll", -1)} byPlatform=${json.optJSONObject("byPlatform")}")
+    return parseDailyStats(json)
+}
+
+// ── 그룹원 일간 통계 (POINTS_API.md §10) — /stats 와 같은 모양을 그룹 경로로. 404(서버 미구현)면 null ──
+//   GET /groups/{gid}/members/{uid}/daily?date=YYYY-MM-DD   → /stats daily 와 같음 + dailyLimit/hourlyLimit(그날 그룹 한도)
+//                                                           + alerts: [{ type, stage, at }] (그룹 팝업 시각 → violations 로 읽음)
+//   GET /groups/{gid}/members/{uid}/monthly?date=YYYY-MM   → { days: [{ date, count, dailyLimit? }] }
+internal suspend fun fetchMemberDailyStats(groupId: String, userId: String, date: String): DailyStatsRemote? {
+    val json = authedGetJson("$SERVER_BASE_URL/groups/$groupId/members/$userId/daily?date=$date") ?: return null
+    // 서버에 같은 경로의 옛 API(6주차 `?month=`, 일별 합계 목록)가 있어 200 이 와도 모양이 다를 수 있다.
+    // §10 모양(hourlyGraph 또는 totalScroll)이 아니면 "아직 없음" 으로 보고 호출부가 대체 데이터를 쓰게 한다.
+    if (!json.has("hourlyGraph") && !json.has("totalScroll")) {
+        Log.w("StatsApi", "member daily $date ← §10 모양 아님 (keys=${json.keys().asSequence().joinToString()}) → 없음 취급")
+        return null
+    }
+    Log.d("StatsApi", "member daily $date ← total=${json.optInt("totalScroll", -1)} alerts=${json.optJSONArray("alerts")?.length() ?: 0}")
+    return parseDailyStats(json)
+}
+
+internal data class MemberMonthDay(val date: String, val count: Int, val dailyLimit: Int?)
+
+internal suspend fun fetchMemberMonthDays(groupId: String, userId: String, month: String): List<MemberMonthDay>? {
+    val json = authedGetJson("$SERVER_BASE_URL/groups/$groupId/members/$userId/monthly?date=$month") ?: return null
+    val arr = json.optJSONArray("days") ?: run {
+        Log.w("StatsApi", "member monthly $month ← days 없음 → 없음 취급")
+        return null
+    }
+    Log.d("StatsApi", "member monthly $month ← ${arr.length()}일")
+    return (0 until arr.length()).mapNotNull { i ->
+        val o = arr.optJSONObject(i) ?: return@mapNotNull null
+        val date = o.optString("date").takeIf { it.length == 10 } ?: return@mapNotNull null
+        MemberMonthDay(date, o.optInt("count", 0), o.optInt("dailyLimit", -1).takeIf { it > 0 })
+    }
+}
+
+// /stats/{uid}/daily · /groups/{gid}/members/{uid}/daily 공통 파서
+private fun parseDailyStats(json: org.json.JSONObject): DailyStatsRemote {
     val hourly = IntArray(24)
     json.optJSONArray("hourlyGraph")?.let { arr ->
         for (i in 0 until arr.length()) {
@@ -184,6 +221,14 @@ internal suspend fun fetchDailyStats(userId: String, date: String): DailyStatsRe
                 action = o.optString("action", ""),
                 hour = o.optInt("hour", -1).takeIf { it in 0..23 } ?: 0
             )
+        }
+    } ?: json.optJSONArray("alerts")?.let { arr ->
+        // 그룹원 경로: 그룹 팝업(alert) 시각 — { type, stage, at } 를 같은 모양으로
+        (0 until arr.length()).mapNotNull { i ->
+            val o = arr.optJSONObject(i) ?: return@mapNotNull null
+            val at = o.optLong("at", 0L).takeIf { it > 0 } ?: return@mapNotNull null
+            val hour = java.util.Calendar.getInstance().apply { timeInMillis = at }.get(java.util.Calendar.HOUR_OF_DAY)
+            ViolationRecord(timestamp = at, limitType = o.optString("type", ""), action = "alert", hour = hour)
         }
     }
     return DailyStatsRemote(

@@ -258,6 +258,8 @@ private fun GroupListScreen(onCreate: () -> Unit, onOpen: (String) -> Unit) {
             db.groupLimitDao().replaceAll(list.groups.map {
                 GroupLimit(groupId = it.groupId, name = it.name, dailyLimit = it.dailyLimit, hourlyLimit = it.hourlyLimit)
             })
+            // 대기 중인 그룹(주중 가입) — 접근성 서비스가 그룹 팝업 문구("점수 안 깎여요")에 쓴다
+            saveWaitingGroups(context, list.groups.filter { it.myWaiting }.map { it.groupId }.toSet())
         } else {
             error = res.error
         }
@@ -365,11 +367,18 @@ private fun GroupCard(group: GroupSummary, myToday: Int, onClick: () -> Unit) {
                 trackColor = Color(0xFFE0E0E0)
             )
             Spacer(Modifier.height(6.dp))
-            Text(
-                text = "오늘 ${myToday}회 / 그룹 일간 한도 ${group.dailyLimit}회",
-                fontSize = 13.sp,
-                color = if (over) OverRed else SubInk
-            )
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                Text(
+                    text = "오늘 ${myToday}회 / 그룹 일간 한도 ${group.dailyLimit}회",
+                    fontSize = 13.sp,
+                    color = if (over) OverRed else SubInk
+                )
+                // 이번 주 포인트 — 서버가 myPoints 를 주면. null 이면서 키가 있으면 대기 중
+                when {
+                    group.myWaiting -> Text("다음 주부터 참가", fontSize = 12.sp, color = Color(0xFF1565C0))
+                    group.myPoints != null -> Text("${group.myPoints}점", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = Ink)
+                }
+            }
         }
     }
 }
@@ -648,7 +657,8 @@ private fun GroupDetailScreen(
         while (true) {
             delay(30_000)
             val current = detail ?: continue
-            val fresh = fetchGroupStatus(groupId)
+            val status = fetchGroupStatus(groupId)
+            val fresh = status?.members
             if (fresh == null) {
                 // /status 가 없거나(서버 6주차 전) 실패 — 전체를 다시 받아 구성원·카운트를 갱신
                 fetchGroupDetail(groupId).value?.let { detail = it }
@@ -661,10 +671,16 @@ private fun GroupDetailScreen(
                 continue
             }
             val byId = fresh.associateBy { it.userId }
-            detail = current.copy(members = current.members.map { m ->
-                // status 응답엔 닉네임이 없을 수 있으므로 기존 닉네임 유지
-                byId[m.userId]?.copy(nickname = m.nickname) ?: m
-            })
+            detail = current.copy(
+                // status 가 벌금통을 주면 홈 카드도 30초마다 갱신
+                summary = status.pot?.let { current.summary.copy(pot = it) } ?: current.summary,
+                members = current.members.map { m ->
+                    // status 응답엔 닉네임·대기·수상 여부가 없을 수 있으므로 기존 값 유지
+                    byId[m.userId]?.let { f ->
+                        f.copy(nickname = m.nickname, points = f.points ?: m.points, waiting = f.waiting || m.waiting, eligible = f.eligible ?: m.eligible)
+                    } ?: m
+                }
+            )
         }
     }
 
@@ -697,11 +713,14 @@ private fun GroupDetailScreen(
                     InfoRow("찬성률", "${g.voteThreshold}%")
                     InfoRow("인원", "${g.memberCount}/${g.maxMembers}")
 
+                    // 내 행은 서버가 이름을 안 줘도 설정의 닉네임으로 보이게
+                    val myId = context.getSharedPreferences("short_cut_prefs", Context.MODE_PRIVATE).getString("userId", null)
+                    // 이번 주 포인트 · 벌금통 · 지난주 결과 — 서버가 주기 전엔 안 그린다
+                    PointsCard(g, d.members, myId)
+
                     HorizontalDivider(color = Color(0xFFEEEEEE))
                     SectionTitle("오늘 순위")
                     // 오늘 스크롤 많은 순
-                    // 내 행은 서버가 이름을 안 줘도 설정의 닉네임으로 보이게
-                    val myId = context.getSharedPreferences("short_cut_prefs", Context.MODE_PRIVATE).getString("userId", null)
                     val myName = localNickname(context)
                     d.members.sortedByDescending { it.todayCount }.forEachIndexed { i, m ->
                         val shown = if (m.userId == myId) m.copy(
@@ -836,6 +855,10 @@ private fun MemberRow(
                     } else if (member.permissionsOk == false) {
                         Spacer(Modifier.width(6.dp))
                         SmallBadge("권한 꺼짐", fg = OverRed, bg = Color(0xFFFFEBEE))
+                    } else if (member.eligible == false) {
+                        // 오늘 벌금통 수상 제외 (로그아웃·권한 꺼짐·heartbeat 공백 기록) — 위 둘이 아닌데 제외면 heartbeat 공백
+                        Spacer(Modifier.width(6.dp))
+                        SmallBadge("오늘 제외", fg = Color(0xFF616161), bg = Color(0xFFE0E0E0))
                     }
                 }
                 Text(
@@ -860,12 +883,66 @@ private fun MemberRow(
                 }
                 Spacer(Modifier.width(4.dp))
             }
-            Text(
-                text = "${member.todayCount}회",
-                fontSize = 16.sp,
-                fontWeight = FontWeight.Bold,
-                color = if (overDaily) OverRed else OkGreen
-            )
+            Column(horizontalAlignment = Alignment.End) {
+                Text(
+                    text = "${member.todayCount}회",
+                    fontSize = 16.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = if (overDaily) OverRed else OkGreen
+                )
+                // 이번 주 점수 — 대기 중이면 "다음 주부터", 서버가 안 주면 빈 줄 없이
+                when {
+                    member.waiting -> Text("다음 주부터", fontSize = 11.sp, color = Color(0xFF1565C0))
+                    member.points != null -> Text("${member.points}점", fontSize = 12.sp, color = SubInk)
+                }
+            }
+        }
+    }
+}
+
+// ── 이번 주 포인트 카드 (POINTS_API.md §2-1) ─────────────────────────────────
+// 벌금통(오늘 · 이월) · 내 점수와 순위 · 지난주 1등(연속 주) · 지난주 내 순위. 서버가 아무것도 안 주면 그리지 않는다.
+@Composable
+private fun PointsCard(g: GroupSummary, members: List<GroupMember>, myId: String?) {
+    val pot = g.pot
+    val last = g.lastWeek
+    val ranked = members.filter { it.points != null }.sortedByDescending { it.points }
+    if (pot == null && last == null && ranked.isEmpty()) return
+    val me = members.firstOrNull { it.userId == myId }
+    Surface(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp), color = CardBg) {
+        Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                Text("이번 주 포인트", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = Ink)
+                Text("월요일 1,000점 시작", fontSize = 12.sp, color = SubInk)
+            }
+            if (pot != null) {
+                Row(verticalAlignment = Alignment.Bottom) {
+                    Text("벌금통 ${pot.today}점", fontSize = 20.sp, fontWeight = FontWeight.ExtraBold, color = Ink)
+                    if (pot.carried > 0) Text(" (이월 ${pot.carried})", fontSize = 12.sp, color = SubInk, modifier = Modifier.padding(bottom = 3.dp))
+                }
+                Text("자정에 오늘 가장 적게 본 사람이 가져가요", fontSize = 12.sp, color = SubInk)
+            }
+            when {
+                me?.waiting == true -> Text("다음 주 월요일부터 참가해요. 그때까지는 점수가 없어요", fontSize = 12.sp, color = Color(0xFF1565C0))
+                me?.points != null -> {
+                    val rank = ranked.indexOfFirst { it.userId == me.userId } + 1
+                    Text("내 점수 ${me.points}점" + (if (rank > 0) " · ${rank}위 / ${ranked.size}명" else ""), fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = Ink)
+                }
+            }
+            if (last != null) {
+                HorizontalDivider(color = Color(0xFFE0E0E0))
+                val first = last.ranking.firstOrNull()
+                if (first != null) {
+                    Text(
+                        "지난주 1등 ${first.nickname} ${first.points}점" + (first.streak?.takeIf { it >= 2 }?.let { " · ${it}주째" } ?: ""),
+                        fontSize = 13.sp, color = Ink
+                    )
+                }
+                val myIdx = last.ranking.indexOfFirst { it.userId == myId }
+                if (myIdx >= 0) Text("지난주 나 ${myIdx + 1}위 ${last.ranking[myIdx].points}점", fontSize = 12.sp, color = SubInk)
+            } else if (pot != null) {
+                Text("첫 주 결과는 월요일에 나와요", fontSize = 12.sp, color = SubInk)
+            }
         }
     }
 }

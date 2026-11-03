@@ -515,20 +515,7 @@ internal fun StatsDaily(monthOffset: Int, onMonthOffsetChange: (Int) -> Unit) {
         }
     }
 
-    // 누적값 — cumulative[i] = counts[0..i-1] 합. 길이 25
-    val cumulative = remember(counts) {
-        IntArray(25).also { arr ->
-            var sum = 0
-            for (i in 0 until 24) {
-                arr[i] = sum
-                sum += counts[i]
-            }
-            arr[24] = sum
-        }
-    }
-    val total = maxOf(cumulative[24], selectedDayTotal)
-    val peakHour = counts.indices.maxByOrNull { counts[it] } ?: 0
-    val peakCount = counts.getOrNull(peakHour) ?: 0
+    val total = maxOf(counts.sum(), selectedDayTotal)
 
     // 그 날의 daily limit — 과거: 서버값(finalizeStats 스냅샷) 우선, 오늘: 로컬 current.
     // [중요] 오늘에 서버값을 쓰면 안 됨 — limit-sync 가 다음 주 월요일 promote 때까지 안 일어나서
@@ -782,115 +769,138 @@ internal fun StatsDaily(monthOffset: Int, onMonthOffsetChange: (Int) -> Unit) {
             AppShareDonut(dayAppCounts)
         }
 
-        // Canvas 차트 영역 — 누적 라인 + 그날 한도 점선
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(240.dp)
-                .padding(start = 8.dp, end = 16.dp)
-        ) {
-            Canvas(modifier = Modifier.fillMaxSize()) {
-                val w = size.width
-                val h = size.height
-                val leftPad = 40f
-                val bottomPad = 24f
-                val topPad = 8f
-                val plotW = w - leftPad - 8f
-                val plotH = h - topPad - bottomPad
-                // 한도 점선이 항상 보이도록 총합과 한도 중 큰 값을 y축 최대치로
-                val maxY = maxOf(total, dailyLimit).coerceAtLeast(1)
+        CumulativeDayChart(counts = counts, total = total, dailyLimit = dailyLimit)
 
-                // y축 가이드 라인 (4분할)
-                val gridColor = Color(0xFFEEEEEE)
-                for (i in 0..4) {
-                    val y = topPad + plotH * (1f - i / 4f)
-                    drawLine(
-                        color = gridColor,
-                        start = Offset(leftPad, y),
-                        end = Offset(leftPad + plotW, y),
-                        strokeWidth = 1f
-                    )
-                }
-
-                // 피크 시간 빨강 강조 배경
-                if (peakCount > 0) {
-                    val x1 = leftPad + plotW * (peakHour / 24f)
-                    val x2 = leftPad + plotW * ((peakHour + 1) / 24f)
-                    drawRect(
-                        color = Color(0xFFC62828).copy(alpha = 0.18f),
-                        topLeft = Offset(x1, topPad),
-                        size = androidx.compose.ui.geometry.Size(x2 - x1, plotH)
-                    )
-                }
-
-                // 그날 daily limit — 주황 점선 가로선
-                if (dailyLimit > 0) {
-                    val limitY = topPad + plotH * (1f - dailyLimit.toFloat() / maxY)
-                    drawLine(
-                        color = Color(0xFFFF8F00),
-                        start = Offset(leftPad, limitY),
-                        end = Offset(leftPad + plotW, limitY),
-                        strokeWidth = 3f,
-                        pathEffect = PathEffect.dashPathEffect(floatArrayOf(14f, 10f))
-                    )
-                }
-
-                // 누적 라인
-                val path = Path()
-                for (i in 0..24) {
-                    val x = leftPad + plotW * (i / 24f)
-                    val y = topPad + plotH * (1f - cumulative[i].toFloat() / maxY)
-                    if (i == 0) path.moveTo(x, y) else path.lineTo(x, y)
-                }
-                drawPath(
-                    path = path,
-                    color = Color(0xFF1A1A1A),
-                    style = Stroke(width = 3f)
-                )
-
-                // 피크 구간 라인은 빨강으로 덧칠
-                if (peakCount > 0) {
-                    val redPath = Path()
-                    val x1 = leftPad + plotW * (peakHour / 24f)
-                    val y1 = topPad + plotH * (1f - cumulative[peakHour].toFloat() / maxY)
-                    val x2 = leftPad + plotW * ((peakHour + 1) / 24f)
-                    val y2 = topPad + plotH * (1f - cumulative[peakHour + 1].toFloat() / maxY)
-                    redPath.moveTo(x1, y1)
-                    redPath.lineTo(x2, y2)
-                    drawPath(
-                        path = redPath,
-                        color = Color(0xFFC62828),
-                        style = Stroke(width = 4f)
-                    )
-                }
-            }
-        }
-
-        // x축 라벨
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(start = 48.dp, end = 16.dp, top = 4.dp),
-            horizontalArrangement = Arrangement.SpaceBetween
-        ) {
-            listOf(0, 6, 12, 18, 24).forEach { h ->
-                Text(text = "${h}시", fontSize = 11.sp, color = Color(0xFF888888))
-            }
-        }
-
-        // 한도 점선 범례
-        if (dailyLimit > 0) {
-            Row(
-                modifier = Modifier.fillMaxWidth().padding(start = 8.dp, top = 12.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Box(modifier = Modifier.size(width = 18.dp, height = 3.dp).background(Color(0xFFFF8F00)))
-                Spacer(Modifier.width(6.dp))
-                Text("daily limit (${dailyLimit}회)", fontSize = 11.sp, color = Color(0xFF888888))
-            }
-        }
         } // end else — 로딩 아닐 때만 상세 표시
 
         Spacer(Modifier.height(24.dp))
+    }
+}
+
+// ── 하루 누적 스크롤 그래프 (개인 일간 · 그룹원 일간 공용) ─────────────────────
+// counts = 0..23 시간대별 카운트, total = 그날 합계(그래프 합과 다를 수 있어 따로 받음), dailyLimit = 주황 점선(0 이면 없음).
+@Composable
+internal fun CumulativeDayChart(counts: IntArray, total: Int, dailyLimit: Int) {
+    // 누적값 — cumulative[i] = counts[0..i-1] 합. 길이 25
+    val cumulative = remember(counts) {
+        IntArray(25).also { arr ->
+            var sum = 0
+            for (i in 0 until 24) {
+                arr[i] = sum
+                sum += counts[i]
+            }
+            arr[24] = sum
+        }
+    }
+    val peakHour = counts.indices.maxByOrNull { counts[it] } ?: 0
+    val peakCount = counts.getOrNull(peakHour) ?: 0
+    Column {
+    // Canvas 차트 영역 — 누적 라인 + 그날 한도 점선
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(240.dp)
+            .padding(start = 8.dp, end = 16.dp)
+    ) {
+        Canvas(modifier = Modifier.fillMaxSize()) {
+            val w = size.width
+            val h = size.height
+            val leftPad = 40f
+            val bottomPad = 24f
+            val topPad = 8f
+            val plotW = w - leftPad - 8f
+            val plotH = h - topPad - bottomPad
+            // 한도 점선이 항상 보이도록 총합과 한도 중 큰 값을 y축 최대치로
+            val maxY = maxOf(total, dailyLimit).coerceAtLeast(1)
+
+            // y축 가이드 라인 (4분할)
+            val gridColor = Color(0xFFEEEEEE)
+            for (i in 0..4) {
+                val y = topPad + plotH * (1f - i / 4f)
+                drawLine(
+                    color = gridColor,
+                    start = Offset(leftPad, y),
+                    end = Offset(leftPad + plotW, y),
+                    strokeWidth = 1f
+                )
+            }
+
+            // 피크 시간 빨강 강조 배경
+            if (peakCount > 0) {
+                val x1 = leftPad + plotW * (peakHour / 24f)
+                val x2 = leftPad + plotW * ((peakHour + 1) / 24f)
+                drawRect(
+                    color = Color(0xFFC62828).copy(alpha = 0.18f),
+                    topLeft = Offset(x1, topPad),
+                    size = androidx.compose.ui.geometry.Size(x2 - x1, plotH)
+                )
+            }
+
+            // 그날 daily limit — 주황 점선 가로선
+            if (dailyLimit > 0) {
+                val limitY = topPad + plotH * (1f - dailyLimit.toFloat() / maxY)
+                drawLine(
+                    color = Color(0xFFFF8F00),
+                    start = Offset(leftPad, limitY),
+                    end = Offset(leftPad + plotW, limitY),
+                    strokeWidth = 3f,
+                    pathEffect = PathEffect.dashPathEffect(floatArrayOf(14f, 10f))
+                )
+            }
+
+            // 누적 라인
+            val path = Path()
+            for (i in 0..24) {
+                val x = leftPad + plotW * (i / 24f)
+                val y = topPad + plotH * (1f - cumulative[i].toFloat() / maxY)
+                if (i == 0) path.moveTo(x, y) else path.lineTo(x, y)
+            }
+            drawPath(
+                path = path,
+                color = Color(0xFF1A1A1A),
+                style = Stroke(width = 3f)
+            )
+
+            // 피크 구간 라인은 빨강으로 덧칠
+            if (peakCount > 0) {
+                val redPath = Path()
+                val x1 = leftPad + plotW * (peakHour / 24f)
+                val y1 = topPad + plotH * (1f - cumulative[peakHour].toFloat() / maxY)
+                val x2 = leftPad + plotW * ((peakHour + 1) / 24f)
+                val y2 = topPad + plotH * (1f - cumulative[peakHour + 1].toFloat() / maxY)
+                redPath.moveTo(x1, y1)
+                redPath.lineTo(x2, y2)
+                drawPath(
+                    path = redPath,
+                    color = Color(0xFFC62828),
+                    style = Stroke(width = 4f)
+                )
+            }
+        }
+    }
+
+    // x축 라벨
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(start = 48.dp, end = 16.dp, top = 4.dp),
+        horizontalArrangement = Arrangement.SpaceBetween
+    ) {
+        listOf(0, 6, 12, 18, 24).forEach { h ->
+            Text(text = "${h}시", fontSize = 11.sp, color = Color(0xFF888888))
+        }
+    }
+
+    // 한도 점선 범례
+    if (dailyLimit > 0) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(start = 8.dp, top = 12.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Box(modifier = Modifier.size(width = 18.dp, height = 3.dp).background(Color(0xFFFF8F00)))
+            Spacer(Modifier.width(6.dp))
+            Text("daily limit (${dailyLimit}회)", fontSize = 11.sp, color = Color(0xFF888888))
+        }
+    }
     }
 }

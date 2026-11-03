@@ -75,7 +75,7 @@ private fun fmtAgo(ms: Long?): String {
 }
 
 @Composable
-private fun TopBar(title: String, onBack: () -> Unit) {
+internal fun TopBar(title: String, onBack: () -> Unit) {
     Row(
         verticalAlignment = Alignment.CenterVertically,
         modifier = Modifier.padding(start = 8.dp, end = 24.dp, top = 16.dp, bottom = 16.dp)
@@ -94,7 +94,7 @@ private fun TopBar(title: String, onBack: () -> Unit) {
 }
 
 @Composable
-private fun Notice(text: String) {
+internal fun Notice(text: String) {
     Surface(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(10.dp), color = CardBg) {
         Text(text, modifier = Modifier.padding(14.dp), fontSize = 13.sp, color = SubInk)
     }
@@ -222,64 +222,7 @@ internal fun MemberDetailScreen(
 }
 
 // ── 그룹 한도 기준 일간 통계 (G6) ───────────────────────────────────────────
-// 최근 7일. 구성원 상세 응답의 last7Days 를 쓰고, 내 것이면 서버 /stats 일간으로 채운다.
-@Composable
-internal fun MemberStatsScreen(group: GroupSummary, row: GroupMember, isMe: Boolean, onBack: () -> Unit) {
-    val context = LocalContext.current
-    var days by remember { mutableStateOf<List<MemberDaily>?>(null) }
-    var note by remember { mutableStateOf<String?>(null) }
-
-    LaunchedEffect(group.groupId, row.userId) {
-        val fmt = SimpleDateFormat("yyyy-MM-dd", Locale.US)
-        val keys = (6 downTo 0).map { fmt.format(Date(startOfDayMs(-it))) }
-        val fromServer = fetchMemberDetail(group.groupId, row.userId).value?.last7Days?.takeIf { it.isNotEmpty() }
-        days = when {
-            fromServer != null -> keys.map { k -> MemberDaily(k, fromServer.firstOrNull { it.date == k }?.count ?: 0) }
-            isMe -> {
-                val uid = context.getSharedPreferences("short_cut_prefs", Context.MODE_PRIVATE).getString("userId", null)
-                val server = if (uid != null) fetchDailyStatsForDays(uid, keys) else emptyMap()
-                val local = com.example.short_cut.db.AppDatabase.getDatabase(context).scrollHistoryDao().countByDay().associate { it.day to it.count }
-                keys.map { k -> MemberDaily(k, maxOf(server[k]?.totalScroll ?: 0, local[k] ?: 0)) }
-            }
-            else -> { note = "구성원별 일간 통계는 서버 6주차 작업이라 아직 비어 있어요"; keys.map { MemberDaily(it, 0) } }
-        }
-    }
-
-    Column(modifier = Modifier.fillMaxSize()) {
-        TopBar(title = "${row.nickname} · 일간", onBack = onBack)
-        Column(
-            modifier = Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState()).padding(horizontal = 24.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp)
-        ) {
-            Text("그룹 일간 한도 ${group.dailyLimit}회 기준 · 넘은 날은 빨강", fontSize = 13.sp, color = SubInk)
-            note?.let { Notice(it) }
-            val list = days
-            if (list == null) { StatsLoadingSpinner(); return@Column }
-            val maxCount = (list.maxOfOrNull { it.count } ?: 0).coerceAtLeast(group.dailyLimit).coerceAtLeast(1)
-            val labelFmt = SimpleDateFormat("M/d (E)", Locale.KOREAN)
-            val parse = SimpleDateFormat("yyyy-MM-dd", Locale.US)
-            list.forEach { d ->
-                val over = group.dailyLimit > 0 && d.count > group.dailyLimit
-                val label = try { labelFmt.format(parse.parse(d.date)!!) } catch (_: Exception) { d.date }
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(label, fontSize = 13.sp, color = Ink, modifier = Modifier.width(72.dp))
-                    Box(modifier = Modifier.weight(1f).height(18.dp).background(Color(0xFFEEEEEE), RoundedCornerShape(4.dp))) {
-                        Box(
-                            modifier = Modifier
-                                .fillMaxWidth(fraction = (d.count.toFloat() / maxCount).coerceIn(0f, 1f))
-                                .height(18.dp)
-                                .background(if (over) OverRed else OkGreen, RoundedCornerShape(4.dp))
-                        )
-                    }
-                    Spacer(Modifier.width(8.dp))
-                    Text("${d.count}", fontSize = 13.sp, fontWeight = FontWeight.SemiBold,
-                        color = if (over) OverRed else Ink, modifier = Modifier.width(36.dp))
-                }
-            }
-            Spacer(Modifier.height(8.dp))
-        }
-    }
-}
+// 그룹원 일간 통계 화면은 MemberStatsDaily.kt (달력 + 시간대 그래프, 그룹 한도 기준)
 
 // ── 제안 버튼 (그룹 상세 하단) — 스펙 G9 표의 네 상태 ─────────────────────────
 @Composable
@@ -395,6 +338,21 @@ internal fun VoteScreen(group: GroupSummary, onBack: () -> Unit) {
                 st == null && error == null -> StatsLoadingSpinner()
                 st == null -> Text(error ?: "", fontSize = 14.sp, color = OverRed)
                 p == null -> Text("진행 중인 투표가 없어요", fontSize = 15.sp, color = SubInk, modifier = Modifier.padding(vertical = 24.dp))
+                // 마감된 투표 — 서버가 state=passed 여도 통과한 제안(표수 포함)을 준다 (11/1). 화면을 열어 둔 채 마감돼도 여기로 온다.
+                st.state != ProposalState.OPEN -> {
+                    Surface(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp), color = CardBg) {
+                        Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            Text("${p.proposedByName} 님의 제안 · 마감", fontSize = 13.sp, color = SubInk)
+                            Text("일 ${p.dailyLimit} / 시 ${p.hourlyLimit}", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = Ink)
+                            Text(
+                                if (st.state == ProposalState.PASSED) "통과했어요 · 다음 주 월요일 0시부터 적용돼요" else "부결됐어요",
+                                fontSize = 13.sp, color = if (st.state == ProposalState.PASSED) OkGreen else OverRed, fontWeight = FontWeight.SemiBold
+                            )
+                        }
+                    }
+                    InfoRow("찬성", "${p.yes}명")
+                    InfoRow("반대", "${p.no}명")
+                }
                 else -> {
                     Surface(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp), color = CardBg) {
                         Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
