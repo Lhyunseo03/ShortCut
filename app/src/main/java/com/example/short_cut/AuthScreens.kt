@@ -408,21 +408,21 @@ fun LimitOnboardingScreen(onDone: () -> Unit = {}) {
 
             SectionTitle("한도 설정")
             LimitRow(
-                label = "Daily Limit",
+                label = "일간 한도",
                 value = draftDaily,
                 step = 100,
                 minValue = 100,
                 onChange = { draftDaily = it }
             )
             LimitRow(
-                label = "Hourly Limit",
+                label = "시간당 한도",
                 value = draftHourly,
                 step = 10,
                 minValue = 10,
                 onChange = { draftHourly = it }
             )
             if (hourlyTooHigh) {
-                Text("Hourly Limit 은 Daily Limit 보다 클 수 없어요", fontSize = 13.sp, color = Color(0xFFC62828))
+                Text("시간당 한도는 일간 한도보다 클 수 없어요", fontSize = 13.sp, color = Color(0xFFC62828))
             }
         }
 

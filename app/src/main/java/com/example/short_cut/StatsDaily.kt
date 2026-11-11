@@ -175,7 +175,7 @@ internal fun DailyGoalProgressBox(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
-                    "일일 목표 진행률" + if (source == "local") " (로컬)" else "",
+                    "일간 한도 진행률" + if (source == "local") " (로컬)" else "",
                     fontSize = 13.sp,
                     fontWeight = FontWeight.SemiBold,
                     color = Color(0xFF1A1A1A)
@@ -228,7 +228,7 @@ internal fun DailyGoalProgressBox(
                     }
                 } else {
                     Text(
-                        "목표 ${dailyLimit}회 이내 ✓",
+                        "한도 ${dailyLimit}회 이내 ✓",
                         fontSize = 12.sp,
                         color = Color(0xFF2E7D32),
                         fontWeight = FontWeight.SemiBold
@@ -254,8 +254,8 @@ internal fun HourlyGoalBox(
         Column(modifier = Modifier.padding(14.dp)) {
             Text(
                 // 한도 처음 도달 시 1번 + 그 이후 10회씩 더 볼 때마다(=한도+10, +20, ...). "0부터 10마다" 가 아님.
-                "hourly 한도 초과 팝업" +
-                    if (hourlyLimit > 0) " (한도 ${hourlyLimit}회, 이후 +10회마다)" else "",
+                "시간당 한도 초과 팝업" +
+                    if (hourlyLimit > 0) " (${hourlyLimit}회, 이후 +10회마다)" else "",
                 fontSize = 13.sp,
                 fontWeight = FontWeight.SemiBold,
                 color = Color(0xFF1A1A1A)
@@ -899,7 +899,7 @@ internal fun CumulativeDayChart(counts: IntArray, total: Int, dailyLimit: Int) {
         ) {
             Box(modifier = Modifier.size(width = 18.dp, height = 3.dp).background(Color(0xFFFF8F00)))
             Spacer(Modifier.width(6.dp))
-            Text("daily limit (${dailyLimit}회)", fontSize = 11.sp, color = Color(0xFF888888))
+            Text("일간 한도 (${dailyLimit}회)", fontSize = 11.sp, color = Color(0xFF888888))
         }
     }
     }

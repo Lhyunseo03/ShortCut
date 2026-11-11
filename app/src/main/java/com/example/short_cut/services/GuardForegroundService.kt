@@ -70,6 +70,14 @@ class GuardForegroundService : Service() {
             com.example.short_cut.hasOverlayPermission(app)
     }
 
+    // 이 서비스가 뜬 시각 — heartbeat 가 절전으로 밀려도 "그동안 살아 있었다" 를 서버가 알 수 있게 (POINTS_API.md §4-1 공백 규칙)
+    private val aliveSinceMs = System.currentTimeMillis()
+
+    // 앱 최초 설치 시각 — 지우고 다시 깔면 바뀐다. 서버는 "직전 heartbeat 이후 재설치가 없었으면 그 사이는 공백 아님" 으로 판단
+    private fun installedAtMs(): Long = try {
+        packageManager.getPackageInfo(packageName, 0).firstInstallTime
+    } catch (_: Exception) { 0L }
+
     private fun sendHeartbeat() {
         val app = applicationContext
         val ok = currentPermissionsOk()
@@ -78,6 +86,8 @@ class GuardForegroundService : Service() {
             val body = org.json.JSONObject()
                 .put("deviceId", com.example.short_cut.DeviceId.get(app))
                 .put("permissionsOk", ok)
+                .put("installedAt", installedAtMs())   // 포인트 공백 판정용 (11/6)
+                .put("aliveSince", aliveSinceMs)
             val res = com.example.short_cut.authedRequest("POST", "/heartbeat", body)   // 미로그인이면 요청 없이 code 0
             Log.d(TAG, "heartbeat permissionsOk=$ok → ${res.code}")
         }

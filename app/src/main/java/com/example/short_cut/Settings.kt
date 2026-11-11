@@ -242,7 +242,7 @@ internal fun SettingsRootScreen(
                 onClick = {
                     appMode = "hard"
                     appScope.launch { setAppMode(context, "hard") }   // 로컬 저장 + 다른 기기에도 반영
-                    Toast.makeText(context, "하드 모드 — Hourly 초과 시 까다로운 팝업이 뜹니다", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(context, "하드 모드 — 시간당 한도를 넘으면 까다로운 팝업이 떠요", Toast.LENGTH_SHORT).show()
                 }
             )
         }
@@ -250,7 +250,7 @@ internal fun SettingsRootScreen(
         // ── 스크롤 한도 ────────────────────────
         SectionTitle("스크롤 한도")
         SettingsRow(
-            label = "Limit 설정",
+            label = "한도 설정",
             value = "변경하기 →",
             onClick = onOpenLimit
         )
@@ -268,7 +268,7 @@ internal fun SettingsRootScreen(
         )
         // 이 계정으로 로그인한 기기 목록 (다중 기기 동기화)
         SettingsRow(
-            label = "Devices",
+            label = "기기 관리",
             value = "열기 →",
             onClick = onOpenDevices
         )
@@ -415,7 +415,7 @@ internal fun SettingsAccountScreen(onBack: () -> Unit, onAuthChanged: () -> Unit
                             //   그리고 /logout 으로 이 계정의 기기들을 로그아웃 처리 → 삭제 뒤에도 그룹 알림이 이 폰에 오지 않게.
                             fetchGroups().value?.groups?.forEach { g ->
                                 val r = leaveGroup(g.groupId)
-                                android.util.Log.d("Settings", "탈퇴 전 그룹 나가기 ${g.name} → ${r.error ?: "ok"}")
+                                android.util.Log.d("설정", "탈퇴 전 그룹 나가기 ${g.name} → ${r.error ?: "ok"}")
                             }
                             authedRequest("POST", "/logout", org.json.JSONObject().put("deviceId", DeviceId.get(context)))
                             val ok = deleteAccountOnServer(user.uid)
@@ -570,7 +570,7 @@ internal fun SettingsLimitScreen(
                 Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "뒤로")
             }
             Text(
-                text = "Limit 설정",
+                text = "한도 설정",
                 fontSize = 22.sp,
                 fontWeight = FontWeight.ExtraBold,
                 color = Color(0xFF1A1A1A)
@@ -589,30 +589,30 @@ internal fun SettingsLimitScreen(
             // 다음 주 월요일 적용 예정 — pending 이 있을 때만 표시
             if (pendingHourly != null || pendingDaily != null) {
                 SectionTitle("다음 주 월요일부터 적용 예정")
-                InfoRow("Daily Limit", "${pendingDaily ?: currentDaily}회")
-                InfoRow("Hourly Limit", "${pendingHourly ?: currentHourly}회")
+                InfoRow("일간 한도", "${pendingDaily ?: currentDaily}회")
+                InfoRow("시간당 한도", "${pendingHourly ?: currentHourly}회")
                 Spacer(Modifier.height(4.dp))
                 HorizontalDivider(color = Color(0xFFEEEEEE))
             }
 
             // 새 값 편집
-            SectionTitle("새 Limit 설정")
+            SectionTitle("새 한도 설정")
             LimitRow(
-                label = "Daily Limit",
+                label = "일간 한도",
                 value = draftDaily,
                 step = 100,
                 minValue = 100,
                 onChange = { draftDaily = it }
             )
             LimitRow(
-                label = "Hourly Limit",
+                label = "시간당 한도",
                 value = draftHourly,
                 step = 10,
                 minValue = 10,
                 onChange = { draftHourly = it }
             )
             if (hourlyTooHigh) {
-                Text("Hourly Limit 은 Daily Limit 보다 클 수 없어요", fontSize = 13.sp, color = Color(0xFFC62828))
+                Text("시간당 한도는 일간 한도보다 클 수 없어요", fontSize = 13.sp, color = Color(0xFFC62828))
             }
 
             Spacer(Modifier.height(8.dp))
@@ -645,9 +645,9 @@ internal fun SettingsLimitScreen(
     if (showConfirm) {
         AlertDialog(
             onDismissRequest = { showConfirm = false },
-            title = { Text("Limit 변경") },
+            title = { Text("한도 변경") },
             text = {
-                Text("Daily ${draftDaily}회, Hourly ${draftHourly}회로 변경하시겠습니까?\n다음 주 월요일부터 한 주 동안 적용됩니다.")
+                Text("일간 ${draftDaily}회, 시간당 ${draftHourly}회로 바꿀까요?\n다음 주 월요일부터 한 주 동안 적용돼요.")
             },
             // 버튼 순서: 예(왼쪽) / 아니요(오른쪽). AlertDialog 는 dismissButton 을 왼쪽, confirmButton 을 오른쪽에 그리므로
             // "예" 를 dismissButton 자리에, "아니요" 를 confirmButton 자리에 둔다.
@@ -682,7 +682,7 @@ internal fun SettingsLimitScreen(
                         val pushed = pushLocalLimits(context, db.userLimitDao(), userId)
                         Toast.makeText(
                             context,
-                            if (pushed) "다음 주 월요일부터 새 limit 적용 예정" else "저장했어요. 연결되면 다른 기기에도 반영돼요",
+                            if (pushed) "다음 주 월요일부터 새 한도 적용 예정" else "저장했어요. 연결되면 다른 기기에도 반영돼요",
                             Toast.LENGTH_SHORT
                         ).show()
                         showConfirm = false

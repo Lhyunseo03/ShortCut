@@ -322,20 +322,20 @@ internal fun HomeTabContent() {
 
         Spacer(Modifier.height(8.dp))
 
-        SectionTitle("오늘의 목표")
-        InfoRow(label = "Daily 목표", value = dailyLimit?.let { "${it}회" } ?: "—")
-        InfoRow(label = "Hourly 목표", value = hourlyLimit?.let { "${it}회" } ?: "—")
+        SectionTitle("내 한도")
+        InfoRow(label = "일간 한도", value = dailyLimit?.let { "${it}회" } ?: "—")
+        InfoRow(label = "시간당 한도", value = hourlyLimit?.let { "${it}회" } ?: "—")
 
         Spacer(Modifier.height(4.dp))
 
         SectionTitle("오늘의 스크롤")
         CountRow(
-            label = "오늘 Daily Scroll",
+            label = "오늘 스크롤",
             value = todayCount,
             isExceeded = dailyLimit != null && todayCount > dailyLimit!!
         )
         CountRow(
-            label = "최근 1시간 Scroll",
+            label = "최근 1시간 스크롤",
             value = lastHourCount,
             isExceeded = hourlyLimit != null && lastHourCount > hourlyLimit!!
         )

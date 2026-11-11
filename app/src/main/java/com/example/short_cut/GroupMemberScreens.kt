@@ -207,14 +207,14 @@ internal fun MemberDetailScreen(
                         scope.launch {
                             val res = sendNudge(group.groupId, row.userId)
                             nudging = false
-                            Toast.makeText(context, res.error ?: "넛지를 보냈어요", Toast.LENGTH_SHORT).show()
+                            Toast.makeText(context, res.error ?: "알림을 보냈어요", Toast.LENGTH_SHORT).show()
                         }
                     },
                     enabled = !nudging,
                     modifier = Modifier.fillMaxWidth().height(48.dp),
                     shape = RoundedCornerShape(12.dp),
                     colors = ButtonDefaults.buttonColors(containerColor = OverRed)
-                ) { Text(if (nudging) "보내는 중…" else "넛지 보내기 (지금 몰아 보는 중)", fontWeight = FontWeight.Bold) }
+                ) { Text(if (nudging) "보내는 중…" else "알림 보내기 (지금 몰아 보는 중)", fontWeight = FontWeight.Bold) }
             }
             Spacer(Modifier.height(8.dp))
         }
@@ -275,9 +275,9 @@ internal fun ProposeScreen(group: GroupSummary, onBack: () -> Unit, onProposed: 
             InfoRow("현재 한도", "일 ${group.dailyLimit} / 시 ${group.hourlyLimit}")
             HorizontalDivider(color = Color(0xFFEEEEEE))
             SectionTitle("새 한도")
-            LimitRow(label = "Daily Limit", value = daily, step = 100, minValue = 100, onChange = { daily = it })
-            LimitRow(label = "Hourly Limit", value = hourly, step = 10, minValue = 10, onChange = { hourly = it })
-            if (hourlyTooHigh) Text("Hourly Limit 은 Daily Limit 보다 클 수 없어요", fontSize = 13.sp, color = OverRed)
+            LimitRow(label = "일간 한도", value = daily, step = 100, minValue = 100, onChange = { daily = it })
+            LimitRow(label = "시간당 한도", value = hourly, step = 10, minValue = 10, onChange = { hourly = it })
+            if (hourlyTooHigh) Text("시간당 한도는 일간 한도보다 클 수 없어요", fontSize = 13.sp, color = OverRed)
             Text(
                 "제안하면 24시간 동안 투표해요. 구성원의 ${group.voteThreshold}% 이상이 찬성하면 다음 주 월요일부터 적용돼요. " +
                     "제안한 사람은 자동으로 찬성이에요. 제안은 한 주에 한 번만 할 수 있어요.",
@@ -397,7 +397,6 @@ internal fun VoteScreen(group: GroupSummary, onBack: () -> Unit) {
                             ) { Text("반대", fontWeight = FontWeight.Bold, color = OverRed) }
                         }
                     }
-                    Text("통과하면 다음 주 월요일 0시부터 적용돼요. 24시간이 지나거나 모두 투표하면 마감돼요.", fontSize = 12.sp, color = SubInk)
                 }
             }
             Spacer(Modifier.height(8.dp))

@@ -74,7 +74,8 @@ internal data class GroupMember(
     val permissionsOk: Boolean? = null,   // 로그인 기기 중 권한 꺼진 게 있으면 false (G11). 모르면 null
     val points: Int? = null,              // 이번 주 점수. 대기 중이거나 서버 미구현이면 null
     val waiting: Boolean = false,         // 주중 가입 → 다음 월요일부터 참가
-    val eligible: Boolean? = null         // 오늘 수상 가능한지 (false = 로그아웃·권한 꺼짐·heartbeat 공백). 모르면 null
+    val eligible: Boolean? = null,        // 오늘 수상 가능한지 (false = 로그아웃·권한 꺼짐·heartbeat 공백). 모르면 null
+    val ineligibleReasons: List<String> = emptyList()   // 서버 11/6: logout / permissions / gap
 )
 
 internal data class GroupList(val groups: List<GroupSummary>, val maxGroups: Int)
@@ -170,7 +171,8 @@ private fun parseMembers(o: JSONObject): List<GroupMember> {
             permissionsOk = if (m.has("permissionsOk") && !m.isNull("permissionsOk")) m.optBoolean("permissionsOk") else null,
             points = if (m.has("points") && !m.isNull("points")) m.optInt("points") else null,
             waiting = m.optBoolean("waiting", false),
-            eligible = if (m.has("eligible") && !m.isNull("eligible")) m.optBoolean("eligible") else null
+            eligible = if (m.has("eligible") && !m.isNull("eligible")) m.optBoolean("eligible") else null,
+            ineligibleReasons = m.optJSONArray("ineligibleReasons")?.let { a -> (0 until a.length()).map { a.optString(it) } } ?: emptyList()
         )
     }
 }
@@ -374,7 +376,8 @@ private suspend fun postGroupAlertOnce(a: PendingGroupAlert): ApiResult =
 internal suspend fun sendGroupAlert(context: Context, groupId: String, type: String, count: Int, stage: Int, at: Long) {
     val a = PendingGroupAlert(UUID.randomUUID().toString(), groupId, type, count, stage, at)
     val res = postGroupAlertOnce(a)
-    Log.d("GroupApi", "POST /alerts $type count=$count stage=$stage → ${res.code} delta=${res.json?.optInt("delta", 0)}")
+    Log.d("GroupApi", "POST /alerts $type count=$count stage=$stage → ${res.code} delta=${res.json?.optInt("delta", 0)}" +
+        (res.json?.optString("reason")?.takeIf { it.isNotBlank() }?.let { " reason=$it" } ?: ""))
     if (res.ok || res.code in 400..499) return
     synchronized(groupAlertLock) { writePendingGroupAlerts(context, readPendingGroupAlerts(context) + a) }
 }
@@ -409,7 +412,7 @@ internal fun isWaitingGroup(context: Context, groupId: String): Boolean =
 // 넛지 (G7). 429 면 서버가 준 "잠시 후에" 문구를 그대로.
 internal suspend fun sendNudge(groupId: String, targetId: String): GroupResult<Unit> {
     val res = authedRequest("POST", "/groups/$groupId/nudge", JSONObject().put("targetId", targetId))
-    return if (res.ok) GroupResult(Unit, null) else fail(res, "넛지를 보내지 못했어요")
+    return if (res.ok) GroupResult(Unit, null) else fail(res, "알림을 보내지 못했어요")
 }
 
 internal suspend fun fetchMemberDetail(groupId: String, userId: String): GroupResult<MemberDetail> {

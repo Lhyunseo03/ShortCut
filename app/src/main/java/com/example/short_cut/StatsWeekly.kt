@@ -481,7 +481,7 @@ internal fun WeekBarChart(counts: List<Int>, dailyLimit: Int) {
             ) {
                 Box(modifier = Modifier.size(width = 18.dp, height = 3.dp).background(Color(0xFFFF8F00)))
                 Spacer(Modifier.width(6.dp))
-                Text("daily limit (${dailyLimit}회)", fontSize = 11.sp, color = Color(0xFF888888))
+                Text("일간 한도 (${dailyLimit}회)", fontSize = 11.sp, color = Color(0xFF888888))
             }
         }
     }

@@ -248,7 +248,7 @@ private fun AiRecommendationCard(daily: Int, hourly: Int, onApply: () -> Unit) {
             Text("AI 추천 한도", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = Color(0xFF1565C0))
             Spacer(Modifier.height(6.dp))
             Text(
-                "Daily ${daily}회 · Hourly ${hourly}회",
+                "일간 ${daily}회 · 시간당 ${hourly}회",
                 fontSize = 18.sp, fontWeight = FontWeight.ExtraBold, color = Color(0xFF1A1A1A)
             )
             Spacer(Modifier.height(12.dp))

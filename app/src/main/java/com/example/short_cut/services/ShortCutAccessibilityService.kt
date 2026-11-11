@@ -767,8 +767,8 @@ class ShortCutAccessibilityService : AccessibilityService() {
                 return@post
             }
             val groupName = data["groupName"].orEmpty().ifBlank { "그룹" }
-            val title = data["title"].orEmpty().ifBlank { "넛지가 왔어요" }
-            val body = data["body"].orEmpty().ifBlank { "구성원이 넛지를 보냈어요" }
+            val title = data["title"].orEmpty().ifBlank { "구성원 알림" }
+            val body = data["body"].orEmpty().ifBlank { "구성원이 그만 보라고 알림을 보냈어요" }
             val view = LayoutInflater.from(this).inflate(R.layout.overlay_popup, null)
             view.findViewById<TextView>(R.id.popupTitle).text = title
             view.findViewById<TextView>(R.id.popupMessage).text = groupName + "\n" + body
@@ -952,20 +952,20 @@ class ShortCutAccessibilityService : AccessibilityService() {
     private fun buildPopupTextsBase(type: String, overage: Int): Pair<String, String> {
         return when (type) {
             "daily" -> {
-                val title = "Daily Limit 초과"
+                val title = "일간 한도 초과"
                 val body = if (overage == 0) {
-                    "Daily limit을 초과했습니다.\n계속 보시겠습니까?"
+                    "오늘 한도를 넘었어요.\n계속 보시겠어요?"
                 } else {
-                    "오늘 목표보다 ${overage}회 더 보셨습니다.\n계속 보시겠습니까?"
+                    "오늘 한도보다 ${overage}회 더 봤어요.\n계속 보시겠어요?"
                 }
                 title to body
             }
             "hourly" -> {
-                val title = "Hourly Limit 초과"
+                val title = "시간당 한도 초과"
                 val body = if (overage == 0) {
-                    "Hourly limit을 초과했습니다.\n계속 보시겠습니까?"
+                    "시간당 한도를 넘었어요.\n계속 보시겠어요?"
                 } else {
-                    "${overage}회 더 보셨습니다.\n계속 보시겠습니까?"
+                    "한도보다 ${overage}회 더 봤어요.\n계속 보시겠어요?"
                 }
                 title to body
             }

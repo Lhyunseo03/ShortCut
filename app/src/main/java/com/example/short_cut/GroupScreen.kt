@@ -530,10 +530,10 @@ private fun GroupCreateScreen(onBack: () -> Unit, onCreated: (String) -> Unit) {
 
             // 개인 한도 설정 화면과 같은 스테퍼 (daily 100 단위 / hourly 10 단위)
             SectionTitle("초기 한도")
-            LimitRow(label = "Daily Limit", value = daily, step = 100, minValue = 100, onChange = { daily = it })
-            LimitRow(label = "Hourly Limit", value = hourly, step = 10, minValue = 10, onChange = { hourly = it })
+            LimitRow(label = "일간 한도", value = daily, step = 100, minValue = 100, onChange = { daily = it })
+            LimitRow(label = "시간당 한도", value = hourly, step = 10, minValue = 10, onChange = { hourly = it })
             if (hourlyTooHigh) {
-                Text("Hourly Limit 은 Daily Limit 보다 클 수 없어요", fontSize = 13.sp, color = OverRed)
+                Text("시간당 한도는 일간 한도보다 클 수 없어요", fontSize = 13.sp, color = OverRed)
             }
 
             HorizontalDivider(color = Color(0xFFEEEEEE))
@@ -677,7 +677,8 @@ private fun GroupDetailScreen(
                 members = current.members.map { m ->
                     // status 응답엔 닉네임·대기·수상 여부가 없을 수 있으므로 기존 값 유지
                     byId[m.userId]?.let { f ->
-                        f.copy(nickname = m.nickname, points = f.points ?: m.points, waiting = f.waiting || m.waiting, eligible = f.eligible ?: m.eligible)
+                        f.copy(nickname = m.nickname, points = f.points ?: m.points, waiting = f.waiting || m.waiting, eligible = f.eligible ?: m.eligible,
+                            ineligibleReasons = f.ineligibleReasons.ifEmpty { m.ineligibleReasons })
                     } ?: m
                 }
             )
@@ -741,7 +742,7 @@ private fun GroupDetailScreen(
                                 {
                                     scope.launch {
                                         val res = sendNudge(g.groupId, m.userId)
-                                        Toast.makeText(context, res.error ?: "${shown.nickname} 님에게 넛지를 보냈어요", Toast.LENGTH_SHORT).show()
+                                        Toast.makeText(context, res.error ?: "${shown.nickname} 님에게 알림을 보냈어요", Toast.LENGTH_SHORT).show()
                                     }
                                 }
                             }
@@ -792,7 +793,7 @@ private fun GroupDetailScreen(
             onDismissRequest = { if (!leaving) showLeave = false },
             title = { Text("그룹에서 탈퇴할까요?", fontWeight = FontWeight.Bold) },
             text = { Text("탈퇴하면 다시 초대를 받아야 들어올 수 있어요. 마지막 구성원이 탈퇴하면 그룹이 사라져요.") },
-            // 버튼 순서: 예(왼쪽) / 아니요(오른쪽) — AlertDialog 는 dismissButton 을 왼쪽에 그리므로 긍정 버튼을 그 자리에 둔다
+            // 버튼 순서: 예(왼쪽) / 아니요(오른쪽) — AlertDialog 는 dismissButton 을 왼쪽에 그리므로 긍정 버튼을 그 자리에 둔다. 질문형 확인창은 전부 예/아니요
             dismissButton = {
                 TextButton(
                     enabled = !leaving,
@@ -806,9 +807,9 @@ private fun GroupDetailScreen(
                             else Toast.makeText(context, res.error, Toast.LENGTH_SHORT).show()
                         }
                     }
-                ) { Text(if (leaving) "탈퇴 중…" else "탈퇴", color = OverRed) }
+                ) { Text(if (leaving) "탈퇴 중…" else "예", color = OverRed) }
             },
-            confirmButton = { TextButton(enabled = !leaving, onClick = { showLeave = false }) { Text("취소") } }
+            confirmButton = { TextButton(enabled = !leaving, onClick = { showLeave = false }) { Text("아니요") } }
         )
     }
 }
@@ -858,7 +859,10 @@ private fun MemberRow(
                     } else if (member.eligible == false) {
                         // 오늘 벌금통 수상 제외 (로그아웃·권한 꺼짐·heartbeat 공백 기록) — 위 둘이 아닌데 제외면 heartbeat 공백
                         Spacer(Modifier.width(6.dp))
-                        SmallBadge("오늘 제외", fg = Color(0xFF616161), bg = Color(0xFFE0E0E0))
+                        val why = member.ineligibleReasons.mapNotNull {
+                            when (it) { "logout" -> "로그아웃"; "permissions" -> "권한 꺼짐"; "gap" -> "신호 끊김"; else -> null }
+                        }.distinct().joinToString("·")
+                        SmallBadge(if (why.isBlank()) "오늘 제외" else "오늘 제외 · $why", fg = Color(0xFF616161), bg = Color(0xFFE0E0E0))
                     }
                 }
                 Text(
@@ -876,7 +880,7 @@ private fun MemberRow(
                 IconButton(onClick = { onNudge?.invoke() }, enabled = onNudge != null, modifier = Modifier.size(32.dp)) {
                     Icon(
                         Icons.Filled.Notifications,
-                        contentDescription = "넛지 보내기",
+                        contentDescription = "알림 보내기",
                         tint = OverRed,
                         modifier = Modifier.size(22.dp)
                     )
@@ -920,10 +924,9 @@ private fun PointsCard(g: GroupSummary, members: List<GroupMember>, myId: String
                     Text("벌금통 ${pot.today}점", fontSize = 20.sp, fontWeight = FontWeight.ExtraBold, color = Ink)
                     if (pot.carried > 0) Text(" (이월 ${pot.carried})", fontSize = 12.sp, color = SubInk, modifier = Modifier.padding(bottom = 3.dp))
                 }
-                Text("자정에 오늘 가장 적게 본 사람이 가져가요", fontSize = 12.sp, color = SubInk)
             }
             when {
-                me?.waiting == true -> Text("다음 주 월요일부터 참가해요. 그때까지는 점수가 없어요", fontSize = 12.sp, color = Color(0xFF1565C0))
+                me?.waiting == true -> Text("다음 주 월요일부터 참가", fontSize = 12.sp, color = Color(0xFF1565C0))
                 me?.points != null -> {
                     val rank = ranked.indexOfFirst { it.userId == me.userId } + 1
                     Text("내 점수 ${me.points}점" + (if (rank > 0) " · ${rank}위 / ${ranked.size}명" else ""), fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = Ink)
@@ -940,8 +943,6 @@ private fun PointsCard(g: GroupSummary, members: List<GroupMember>, myId: String
                 }
                 val myIdx = last.ranking.indexOfFirst { it.userId == myId }
                 if (myIdx >= 0) Text("지난주 나 ${myIdx + 1}위 ${last.ranking[myIdx].points}점", fontSize = 12.sp, color = SubInk)
-            } else if (pot != null) {
-                Text("첫 주 결과는 월요일에 나와요", fontSize = 12.sp, color = SubInk)
             }
         }
     }

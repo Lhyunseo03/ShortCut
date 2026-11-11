@@ -44,7 +44,7 @@ internal object GroupNotifications {
         val groupName = data["groupName"].orEmpty().ifBlank { "그룹" }
         val (channel, defaultTitle) = when (type) {
             "GROUP_ALERT" -> CH_ALERT to "$groupName · 한도 초과"
-            "NUDGE" -> CH_NUDGE to "넛지가 왔어요"
+            "NUDGE" -> CH_NUDGE to "$groupName · 구성원 알림"
             "PROPOSAL", "VOTE_RESULT", "LIMIT_APPLIED" -> CH_VOTE to "$groupName · 한도 투표"
             "POINTS_AWARDED", "WEEK_RESULT" -> CH_POINTS to "$groupName · 포인트"
             else -> CH_MEMBER to groupName
@@ -53,7 +53,7 @@ internal object GroupNotifications {
         val body = data["body"].orEmpty().ifBlank {
             when (type) {
                 "GROUP_ALERT" -> "구성원이 그룹 한도를 넘었어요"
-                "NUDGE" -> "구성원이 넛지를 보냈어요"
+                "NUDGE" -> "구성원이 그만 보라고 알림을 보냈어요"
                 "PROPOSAL" -> "한도 변경 제안이 올라왔어요. 투표해 주세요"
                 "VOTE_RESULT" -> "투표 결과가 나왔어요"
                 "LIMIT_APPLIED" -> "새 한도가 적용됐어요"
@@ -100,7 +100,7 @@ internal object GroupNotifications {
             }
         }
         ensure(CH_ALERT, "그룹 한도 초과", "구성원이 그룹 한도를 넘었을 때", NotificationManager.IMPORTANCE_HIGH)
-        ensure(CH_NUDGE, "넛지", "구성원이 보낸 넛지", NotificationManager.IMPORTANCE_HIGH)
+        ensure(CH_NUDGE, "구성원 알림", "구성원이 보낸 그만 보라는 알림", NotificationManager.IMPORTANCE_HIGH)
         ensure(CH_VOTE, "한도 투표", "제안 등록 · 투표 결과 · 새 한도 적용", NotificationManager.IMPORTANCE_DEFAULT)
         ensure(CH_MEMBER, "구성원 변동", "가입 · 탈퇴 · 로그아웃", NotificationManager.IMPORTANCE_LOW)
         ensure(CH_POINTS, "포인트", "일일 정산 수상 · 주간 결과", NotificationManager.IMPORTANCE_DEFAULT)

@@ -57,7 +57,7 @@ internal fun SettingsDevicesScreen(onBack: () -> Unit, vm: DevicesViewModel = vi
             IconButton(onClick = onBack) {
                 Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "뒤로")
             }
-            Text(text = "Devices", fontSize = 22.sp, fontWeight = FontWeight.ExtraBold, color = Color(0xFF1A1A1A))
+            Text(text = "기기 관리", fontSize = 22.sp, fontWeight = FontWeight.ExtraBold, color = Color(0xFF1A1A1A))
         }
 
         Column(
@@ -114,16 +114,16 @@ internal fun SettingsDevicesScreen(onBack: () -> Unit, vm: DevicesViewModel = vi
                             onDismissRequest = { pendingRemove = null },
                             title = { Text("이 기기를 삭제할까요?", fontWeight = FontWeight.Bold) },
                             text = { Text("${target.deviceName} 을(를) 계정의 기기 목록에서 지워요. 그 기기에서 다시 로그인하면 다시 등록돼요. 기록은 남아요.") },
-                            // 버튼 순서: 삭제(왼쪽) / 취소(오른쪽)
+                            // 버튼 순서: 예(왼쪽) / 아니요(오른쪽) — 질문형 확인창은 전부 예/아니요
                             dismissButton = {
                                 TextButton(onClick = {
                                     vm.remove(target.deviceId) { err ->
                                         Toast.makeText(context, err ?: "기기를 삭제했어요", Toast.LENGTH_SHORT).show()
                                     }
                                     pendingRemove = null
-                                }) { Text("삭제", color = Color(0xFFC62828)) }
+                                }) { Text("예", color = Color(0xFFC62828)) }
                             },
-                            confirmButton = { TextButton(onClick = { pendingRemove = null }) { Text("취소") } }
+                            confirmButton = { TextButton(onClick = { pendingRemove = null }) { Text("아니요") } }
                         )
                     }
                 }
